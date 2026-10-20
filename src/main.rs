@@ -7,7 +7,7 @@ use lusa::error::{render, LusaError};
 use lusa::interp::{Frame, Interp};
 use lusa::parser;
 
-const BANNER: &str = "Lusa 0.1.0 — Lua-like language with optional ownership (made in Rust)\ntype `:quit` to exit, finished blocks with `end` are evaluated as you go";
+const BANNER: &str = concat!("Lusa ", env!("CARGO_PKG_VERSION"), " — Lua-like language with optional ownership (made in Rust)\ntype `:quit` to exit, finished blocks with `end` are evaluated as you go");
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -24,12 +24,13 @@ fn main() {
             println!("  lusalang uninstall <name>      remove an installed package");
             println!("  lusalang where                 show where the runtime is installed");
             println!("  lusalang lsp                   run the language server (editors contact it)");
+            println!("  lusalang self-update [--check] download and install the newest release");
             println!("  lusalang version               runtime version");
             println!();
             println!("  (short aliases: lusa [file.lusa] | lusa -e \"<code>\")");
         }
         Some("-v") | Some("--version") | Some("version") => {
-            println!("lusa 0.1.0 (runtime RC1: release turbo)");
+            println!(concat!("lusa ", env!("CARGO_PKG_VERSION"), " (runtime RC2: json + self-update)"));
         }
         Some("repl") => {
             std::process::exit(repl());
@@ -37,7 +38,7 @@ fn main() {
         Some("where") => {
             let exe = std::env::current_exe().ok();
             println!("runtime: {}", exe.map(|p| p.display().to_string()).unwrap_or_else(|| "?".into()));
-            println!("version: lusa 0.1.0");
+            println!(concat!("version: lusa ", env!("CARGO_PKG_VERSION")));
             println!("docs   : docs/LANGUAGE.md (language) + docs/TOOLCHAIN.md (toolchain)");
         }
         Some("run") => {
@@ -102,6 +103,9 @@ fn main() {
         }
         Some("lsp") => {
             std::process::exit(lusa::lsp::lsp_main());
+        }
+        Some("self-update") => {
+            std::process::exit(lusa::update::cli(&args[2..]));
         }
         Some("-e") => {
             let code = args[2..].join(" ");

@@ -11,6 +11,7 @@ pub mod lsp;
 pub mod parser;
 pub mod scope;
 pub mod tokens;
+pub mod update;
 pub mod value;
 
 use error::LResult;

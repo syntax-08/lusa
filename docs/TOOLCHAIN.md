@@ -44,6 +44,45 @@ cargo build --release   # in the project root (Lang\lusa)
 install-lusa.cmd        # reinstalls the new version to %LOCALAPPDATA%\Lusa\bin
 ```
 
+### Installing and updating without this repo (end users)
+
+You do **not** need the source repo: the CLI can install and update itself
+from the GitHub releases, using only the `curl.exe`/`tar.exe` that ship with
+Windows.
+
+Install from PowerShell (once):
+
+```powershell
+curl.exe -fsSL -o "$env:TEMP\lusa-setup.zip" `
+  https://github.com/syntax-08/lusa/releases/latest/download/lusa-setup.zip
+tar.exe -xf "$env:TEMP\lusa-setup.zip" -C "$env:TEMP"
+mkdir "$env:LOCALAPPDATA\Lusa\bin" -Force
+Copy-Item "$env:TEMP\lusa.exe" "$env:LOCALAPPDATA\Lusa\bin\lusa.exe" -Force
+```
+
+Then add `%LOCALAPPDATA%\Lusa\bin` to your user PATH once:
+
+```powershell
+$p = [Environment]::GetEnvironmentVariable("Path", "User")
+if (-not $p.Contains("%LOCALAPPDATA%\Lusa\bin") -and -not $p.Contains("$env:LOCALAPPDATA\Lusa\bin")) {
+  [Environment]::SetEnvironmentVariable("Path", "$p;$env:LOCALAPPDATA\Lusa\bin", "User")
+}
+```
+
+Open a new terminal afterwards (running terminals keep the old PATH).
+
+Update whenever you like:
+
+```sh
+lusalang self-update          # downloads the latest release + replaces itself
+lusalang self-update --check  # only reports the newest release
+lusalang self-update --force  # reinstall even if versions match
+```
+
+The update never bricks your install: the running exe is first renamed to
+`lusa.exe.old`, the new one takes its place, and the backup is removed on
+success — if something interrupts it, just rename `lusa.exe.old` back.
+
 ---
 
 ## 3. Commands
@@ -56,6 +95,7 @@ install-lusa.cmd        # reinstalls the new version to %LOCALAPPDATA%\Lusa\bin
 | `lusalang new <name>`            | creates `<name>\main.lusa` + `<name>\README.md`  | scaffold ships with a working demo            |
 | `lusalang repl` / `lusa`         | interactive REPL                                 | multi-line, `:quit` to exit                   |
 | `lusalang where`                 | path of the installed runtime                    |                                               |
+| `lusalang self-update`           | updates the runtime from GitHub releases         | `--check` (report only), `--force`            |
 | `lusa <file.lusa>`               | direct shortcut (runs the file)                  |                                               |
 | `lusa -e "<code>"`               | inline code                                      | see the quoting note below                    |
 | `lusalang --help`                | help                                             |                                               |
