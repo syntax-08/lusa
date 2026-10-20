@@ -262,9 +262,8 @@ fn pkg_install(spec: &str) -> i32 {
         Some(t) => format!("refs/tags/{}", t),
         None => "refs/heads/main".to_string(),
     };
-    let name = repo.rsplit('/').next().unwrap_or("pkg").to_string();
-    let dir = packages_dir().join(&name);
-    let tmp = std::env::temp_dir().join(format!("lusa-pkg-{}-{}", name, std::process::id()));
+    let repo_name = repo.rsplit('/').next().unwrap_or("pkg").to_string();
+    let tmp = std::env::temp_dir().join(format!("lusa-pkg-{}-{}", repo_name, std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     if let Err(e) = std::fs::create_dir_all(&tmp) {
         eprintln!("lusa: cannot create temp dir {}: {}", tmp.display(), e);
@@ -321,9 +320,16 @@ fn pkg_install(spec: &str) -> i32 {
         }
     };
 
-    if let Err(e) = std::fs::remove_dir_all(&dir) {
-        eprintln!("lusa: cannot remove old package {}: {}", dir.display(), e);
-        return 1;
+    // The resident package name comes from lusa.toml `name` (require("name")
+    // resolves against package folder names); falls back to the repo name.
+    let name = manifest_value(&top, "name").unwrap_or_else(|| repo_name.clone());
+    let dir = packages_dir().join(&name);
+
+    if dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            eprintln!("lusa: cannot remove old package {}: {}", dir.display(), e);
+            return 1;
+        }
     }
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("lusa: cannot create {}: {}", dir.display(), e);
