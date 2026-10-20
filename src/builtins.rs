@@ -3,6 +3,7 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
 use crate::error::{LResult, LusaError, Span, E_ASSERT, E_CMP, E_ERROR, E_INDEX, E_NUM};
 use crate::interp::Interp;
@@ -118,6 +119,144 @@ fn b_ipairs(_i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>
 
 use std::cell::RefCell;
 
+// ===== package system (`require`) =====
+
+thread_local! {
+    /// Loaded modules by canonical path (survives nested module Interps).
+    static MODULE_CACHE: RefCell<std::collections::HashMap<PathBuf, Value>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// Currently-loading modules, for circular-require detection.
+    static MODULE_STACK: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+}
+
+/// Directories searched by `require`, in priority order.
+fn packages_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(base) = std::env::var("LUSA_PACKAGES") {
+        if !base.is_empty() {
+            roots.push(PathBuf::from(base));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd.join("packages"));
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local).join("Lusa").join("packages"));
+    } else if let Ok(home) = std::env::var("HOME") {
+        roots.push(PathBuf::from(&home).join(".lusa").join("packages"));
+    }
+    roots
+}
+
+/// Reads `entry = "file.lusa"` from a package's `lusa.toml`; defaults to
+/// `init.lusa` when the manifest or key is missing.
+fn package_entry(pkg_dir: &Path) -> String {
+    let txt = match std::fs::read_to_string(pkg_dir.join("lusa.toml")) {
+        Ok(t) => t,
+        Err(_) => return "init.lusa".into(),
+    };
+    for line in txt.lines() {
+        let t = line.trim();
+        if let Some(eq) = t.find('=') {
+            if t[..eq].trim() == "entry" {
+                let val = t[eq + 1..].trim().trim_matches(|c| c == '"' || c == '\'');
+                if !val.is_empty() {
+                    return val.replace('\\', "/");
+                }
+            }
+        }
+    }
+    "init.lusa".into()
+}
+
+/// Resolves a `require("...")` name to a module file. Accepts `"pkg"` (uses the
+/// package entry point) and `"pkg/sub/file.lusa"` (specific file).
+fn resolve_module(name: &str) -> Option<PathBuf> {
+    let name = name.replace('\\', "/");
+    let (pkg, file) = match name.split_once('/') {
+        Some((p, f)) if !f.is_empty() && !p.is_empty() => (p, f),
+        _ => (name.as_str(), ""),
+    };
+    for root in packages_roots() {
+        let pkg_dir = root.join(pkg);
+        if !pkg_dir.is_dir() {
+            continue;
+        }
+        let rel = if file.is_empty() {
+            package_entry(&pkg_dir)
+        } else {
+            file.to_string()
+        };
+        let path = pkg_dir.join(rel);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn b_require(parent: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    let raw = args.first().map(to_str).ok_or_else(|| {
+        LusaError::new(
+            E_ERROR,
+            Some(span),
+            "missing argument `name` for require(\"package\")".to_string(),
+        )
+    })?;
+    let name = raw.replace('\\', "/");
+    let path = resolve_module(&name).ok_or_else(|| {
+        let searched = packages_roots()
+            .iter()
+            .map(|r| format!("{}/<package>{}", r.display(), "/init.lusa"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        LusaError::new(
+            E_ERROR,
+            Some(span),
+            format!(
+                "package \"{}\" not found — install it with `lusalang install <user>/<repo>` (searched: {})",
+                name, searched
+            ),
+        )
+    })?;
+    let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+
+    if let Some(v) = MODULE_CACHE.with(|c| c.borrow().get(&canon).cloned()) {
+        return one(v);
+    }
+    if MODULE_STACK.with(|s| s.borrow().contains(&canon)) {
+        return Err(LusaError::new(
+            E_ERROR,
+            Some(span),
+            format!("circular require of \"{}\"", name),
+        ));
+    }
+
+    let src = std::fs::read_to_string(&path).map_err(|e| {
+        LusaError::new(
+            E_ERROR,
+            Some(span),
+            format!("cannot read module {}: {}", path.display(), e),
+        )
+    })?;
+    let block = crate::parser::parse(&src)?;
+
+    MODULE_STACK.with(|s| s.borrow_mut().push(canon.clone()));
+    let mut module_interp = Interp::new();
+    module_interp.install_stdlib();
+    let result = module_interp.run(&block, &path.display().to_string());
+    MODULE_STACK.with(|s| {
+        s.borrow_mut().pop();
+    });
+    let rets = result?;
+    parent.out.append(&mut module_interp.out);
+
+    let exports = rets.into_iter().next().unwrap_or(Value::Nil);
+    let cached = exports.clone();
+    MODULE_CACHE.with(|c| c.borrow_mut().insert(canon, exports));
+    one(cached)
+}
+
 // ===== modules =====
 
 pub fn all() -> Vec<(&'static str, BF)> {
@@ -130,6 +269,7 @@ pub fn all() -> Vec<(&'static str, BF)> {
         ("assert", Box::new(b_assert)),
         ("pairs", Box::new(b_pairs)),
         ("ipairs", Box::new(b_ipairs)),
+        ("require", Box::new(b_require)),
     ]
 }
 

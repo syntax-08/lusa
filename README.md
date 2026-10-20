@@ -22,9 +22,10 @@ help: `t` no longer holds the value; use `clone t` (copy) or
 
 Installation on Windows — **no cargo in daily use**:
 
-```sh
-install-lusa.cmd        # copies the runtime to %LOCALAPPDATA%\Lusa\bin + user PATH
-```
+- **Easiest:** download [`lusa-setup.zip`](https://github.com/syntax-08/lusa/releases/latest),
+  unzip it, and double-click `install-lusa.cmd`.
+- **From source:** run `install-lusa.cmd` from this repository, or build with
+  cargo (`cargo build --release`, exe lands in `target/release/lusa.exe`).
 
 Then, from any new terminal:
 
@@ -34,6 +35,9 @@ Then, from any new terminal:
 | `lusalang run main.lusa`        | runs a program                             |
 | `lusalang check main.lusa`      | validates (lex+parse) without running      |
 | `lusalang new myproject`        | creates a new project with a ready scaffold |
+| `lusalang install syntax-08/lusa-ui` | install a package (library) from GitHub |
+| `lusalang packages`             | list installed packages                    |
+| `lusalang uninstall <name>`     | remove an installed package                |
 | `lusalang repl`                 | interactive REPL                           |
 | `lusalang where`                | where the runtime is installed             |
 | `lusa main.lusa`                | direct shortcut (same binary)              |

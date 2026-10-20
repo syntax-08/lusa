@@ -186,3 +186,57 @@ Yes — three possible routes:
 3. **JIT**: LuaJIT-style; only worth it in a much more mature MVP.
 
 Route 1 is outlined in the `README.md` roadmap (`compiler.rs` + `vm.rs`).
+
+## Packages: installing libraries with `lusalang install`
+
+Lusa packages are plain GitHub repositories holding `.lusa` files and a tiny
+`lusa.toml` manifest. Installing uses Windows' built-in `curl` and `tar` —
+no external dependency manager.
+
+```cmd
+lusalang install syntax-08/lusa-ui     :: install (optionally: repo#v0.1.0 for a tag)
+lusalang packages                      :: list installed packages
+lusalang uninstall ui                  :: remove one
+```
+
+Packages land in `%LOCALAPPDATA%\Lusa\packages\<name>` and are visible to every
+Lusa program via `require("name")`. Search priority: `$LUSA_PACKAGES`, then
+`<project>/packages`, then the global root above.
+
+### Writing a package
+
+A package is a folder with `lusa.toml`:
+
+```toml
+name = "ui"
+version = "0.1.0"
+description = "Terminal interface (TUI) kit for Lusa"
+entry = "ui.lusa"
+```
+
+and the entry file — functionally, a module that returns its exports:
+
+```lusa
+local function draw() ... end
+
+return {
+    draw = clone draw,
+    version = "0.1.0",
+}
+```
+
+> Tip: export your functions with `clone f`. A bare `f = f` inside the
+> return-table constructor *moves* the local into the table (ownership!), and
+> a module function is usually worth calling more than once. Strings are
+> scalars and can be exported directly.
+
+Usage on the consumer side — bind exports to locals before calling:
+
+```lusa
+local ui = require("ui")
+local text = ui.text
+print(text(1, 1, "hello from a package", 14))
+```
+
+The reference package lives at [syntax-08/lusa-ui](https://github.com/syntax-08/lusa-ui) —
+a full TUI kit (colors, boxes, progress bars) you can crack open as a template.

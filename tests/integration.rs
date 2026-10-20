@@ -190,3 +190,77 @@ fn moved_field_reads_give_nil_after_move() {
     // ...but another *moving* read surfaces E1001-style rigor.
     assert_eq!(err_code("local t = {a = {}} local x = t.a local y = t.a"), "E1001");
 }
+
+// ===== package system (`require`) =====
+
+#[test]
+fn require_loads_package_and_exports() {
+    // build a fake package tree in a temp dir and point LUSA_PACKAGES at it
+    let base = std::env::temp_dir().join(format!("lusa-pkgtest-{}", std::process::id()));
+    let pkg = base.join("fib");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("lusa.toml"),
+        "name = \"fib\"\nversion = \"0.1.0\"\nentry = \"fib.lusa\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("fib.lusa"),
+        r#"-- fib package: exports fib(n)
+local function fib(n)
+    if n < 2 then return n end
+    return fib(n - 1) + fib(n - 2)
+end
+
+return {
+    fib = clone fib,
+    name = "fib",
+}
+"#,
+    )
+    .unwrap();
+
+    std::env::set_var("LUSA_PACKAGES", &base);
+    let result = run_source(
+        r#"local f = require("fib")
+local fib = f.fib
+print(f.name, fib(10))
+"#,
+    );
+    assert_eq!(result.expect("require should succeed").join("\n"), "fib 55");
+
+    // missing package -> E9000 with install hint
+    let miss = run_source("local x = require(\"nope\")");
+    assert_eq!(miss.expect_err("missing package must error").code.to_string(), "E9000");
+
+    std::env::remove_var("LUSA_PACKAGES");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn require_is_cached_across_module_nesting() {
+    let base = std::env::temp_dir().join(format!("lusa-pkgtest2-{}", std::process::id()));
+    let pkg = base.join("counter");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("init.lusa"),
+        r#"-- prints once per LOAD; require() should cache, so this shows up exactly once
+print("load: counter")
+return { tag = "counter" }
+"#,
+    )
+    .unwrap();
+    std::env::set_var("LUSA_PACKAGES", &base);
+    let result = run_source(
+        r#"local a = require("counter")
+local b = require("counter")
+print(a.tag, b.tag)
+"#,
+    );
+    assert_eq!(
+        result.expect("require should succeed").join("\n"),
+        "load: counter\ncounter counter"
+    );
+    std::env::remove_var("LUSA_PACKAGES");
+    let _ = std::fs::remove_dir_all(&base);
+}
