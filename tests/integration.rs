@@ -264,3 +264,70 @@ print(a.tag, b.tag)
     std::env::remove_var("LUSA_PACKAGES");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ===== pcall (protected calls) =====
+
+#[test]
+fn pcall_ok_and_results() {
+    let src = r#"
+local function f(x) return x * 2, x + 1 end
+local ok, a, b = pcall(f, 5)
+print(ok, a, b)
+"#;
+    assert_eq!(out(src), "true 10 6");
+}
+
+#[test]
+fn pcall_catches_user_errors_and_resumes() {
+    let src = r#"
+local function boom(x) error("boom " .. x) end
+local ok, err = pcall(boom, 42)
+print(ok, err)
+print("resumed after the error")
+"#;
+    assert_eq!(out(src), "false E9000: boom 42\nresumed after the error");
+}
+
+#[test]
+fn pcall_catches_runtime_and_ownership_errors() {
+    // runtime type error, inspected via the E-code prefix of the message
+    let t1 = r#"
+local ok, e = pcall(function() return 1 + {} end)
+print(ok, string.sub(e, 1, 5))
+"#;
+    assert_eq!(out(t1), "false E2001");
+
+    // moved-value error inside the protected call is caught too
+    let t2 = r#"
+local ok, e = pcall(function() local t = {a = {}} local x = t.a local y = t.a return y end)
+print(ok, string.sub(e, 1, 5))
+"#;
+    assert_eq!(out(t2), "false E1001");
+}
+
+#[test]
+fn pcall_survives_stack_overflow() {
+    let src = r#"
+local function inf() return inf() end
+local ok, e = pcall(inf)
+print(ok, string.sub(e, 1, 5))
+"#;
+    assert_eq!(out(src), "false E9999");
+}
+
+#[test]
+fn pcall_rejects_uncallable_and_supports_rethrow() {
+    assert_eq!(out("local ok, e = pcall(42) print(ok, string.sub(e, 1, 5))"), "false E2005");
+
+    // catch-then-rethrow: error() inside restores the throw with a new message
+    let src = r#"
+local ok, err = pcall(function() error("disk full") end)
+if not ok then
+    error("critical: " .. err)
+end
+"#;
+    assert_eq!(err_code(src), "E9000");
+
+    // missing callee is a loud programming error (not a protected miss)
+    assert_eq!(err_code("pcall()"), "E9000");
+}

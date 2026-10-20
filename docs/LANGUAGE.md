@@ -139,7 +139,31 @@ local c = t         -- ok: the borrow already ended
 ## 6. stdlib
 
 Base: `print msg...`, `type v`, `tostring v`, `tonumber s (base)`,
-`error msg`, `assert ok, msg`, `pairs t`, `ipairs t`.
+`error msg`, `assert ok, msg`, `pcall f, args...`, `pairs t`, `ipairs t`.
+
+### Protected calls — `pcall`
+
+`pcall(f, ...)` calls `f` and never raises: on success it returns
+`true` plus every value `f` returned; on any failure (user `error()`,
+`assert`, type errors, ownership moves, even call-stack overflow) it
+returns `false` plus one error string shaped `"CODE: message"` so
+programs can inspect the E-code:
+
+```lusa
+local ok, err = pcall(load_file, "data.bin")
+if not ok then
+    print("could not load:", err)   -- e.g. E9999: call stack overflow
+end
+-- the program keeps running from here
+```
+
+Ownership applies to the callee: each `pcall(f, x)` consumes `f` the
+way function calls do; to protect-call the same function twice, pass
+`clone f`. Anonymous wrappers sidestep re-use entirely:
+
+```lusa
+local ok = pcall(function() return risky(a, b) end)
+```
 
 `string`: `len upper lower sub rep reverse char byte find gsub format`.
 `find` and `gsub` are literal-only today (no Lua patterns) and `gsub`
@@ -180,7 +204,7 @@ Codes `E{category}{n}`, like rustc:
 | E2008  | value    | invalid `tonumber`/`format` |
 | E9000  | runtime  | `error(msg)` |
 | E9100  | runtime  | `assert(false, msg)` |
-| E9999  | runtime  | internal error (umbrella; includes stack overflow for calls > 200) |
+| E9999  | runtime  | internal error (umbrella; includes stack overflow for calls > 200 — catchable with `pcall`) |
 
 ### Report format
 

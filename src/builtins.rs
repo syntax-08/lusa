@@ -94,8 +94,39 @@ fn b_tonumber(_i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Valu
 }
 
 fn b_error(_i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
-    let msg = args.first().map(to_str).unwrap_or_else(|| "error".into());
-    Err(LusaError::new(E_ERROR, Some(span), format!("error: {}", msg)))
+    let msg = args.first().map(to_str).unwrap_or_else(|| "unspecified error".into());
+    // no extra prefix here: diagnostics already render `error[E9000]: msg`
+    Err(LusaError::new(E_ERROR, Some(span), msg))
+}
+
+/// `pcall(f, ...)`: protected call — never raises. On success returns
+/// `true` followed by the function's return values; on any error (user-raised,
+/// type, ownership, or stack overflow) returns `false` plus an error string
+/// shaped like `"E9000: boom"` so programs can inspect the E-code.
+fn b_pcall(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    let callee = match args.first() {
+        Some(v) => v.clone(),
+        None => {
+            return Err(LusaError::new(
+                E_ERROR,
+                Some(span),
+                "missing argument `f` for pcall(f, ...)".to_string(),
+            ))
+        }
+    };
+    let rest: Vec<Value> = args.into_iter().skip(1).collect();
+    match i.call_value(&callee, rest, span) {
+        Ok(mut rets) => {
+            let mut out = Vec::with_capacity(rets.len() + 1);
+            out.push(Value::Bool(true));
+            out.append(&mut rets);
+            Ok(out)
+        }
+        Err(e) => Ok(vec![
+            Value::Bool(false),
+            Value::Str(Arc::from(format!("{}: {}", e.code, e.msg).as_str())),
+        ]),
+    }
 }
 
 fn b_assert(_i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
@@ -267,6 +298,7 @@ pub fn all() -> Vec<(&'static str, BF)> {
         ("tonumber", Box::new(b_tonumber)),
         ("error", Box::new(b_error)),
         ("assert", Box::new(b_assert)),
+        ("pcall", Box::new(b_pcall)),
         ("pairs", Box::new(b_pairs)),
         ("ipairs", Box::new(b_ipairs)),
         ("require", Box::new(b_require)),
