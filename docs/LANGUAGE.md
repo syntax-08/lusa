@@ -176,6 +176,26 @@ returns `(new text, count)`.
 `max min fmod modf tointeger random randomseed`.
 `math.pi` and `math.huge` are values (not functions).
 
+`json`: hand-rolled JSON (strict RFC 8259, no external deps).
+
+- `json.encode(v)` — any value to JSON text. Scalars map directly
+  (`nil`→`null`); tables with dense integer keys `1..n` become arrays,
+  everything else becomes objects (numeric keys are stringified).
+  Non-finite numbers, functions and iterators raise `E9000`; cyclic
+  tables are detected and reported.
+- `json.decode(s)` — JSON text back to a Lusa value. Arrays come back
+  with keys `1..n` (so `#` and `ipairs` work), `null` becomes `nil`,
+  `\uXXXX` escapes (including surrogate pairs) are resolved. Raw control
+  characters inside a string and trailing garbage raise `E9000` with the
+  offending position: `json.decode: expected '"', found … (at position 2)`.
+
+```lusa
+local cfg = json.decode('{ "window": { "width": 800, "widgets": ["panel", "log"] } }')
+print(cfg.window.width, cfg.window.widgets[2])   -- 800	log
+local out = json.encode({ name = "game", score = 12.5 })
+-- {"name":"game","score":12.5}
+```
+
 ---
 
 ## 7. Error-code table

@@ -352,3 +352,73 @@ fn lsp_diagnostics_report_positions_and_codes() {
     assert_eq!(diags2.len(), 1);
     assert!(diags2[0].serialize().contains("\"line\":2"), "expected line 2: {}", diags2[0].serialize());
 }
+
+// ===== json =====
+
+#[test]
+fn json_encode_roundtrip() {
+    let src = r#"
+local obj = { name = "lusa", version = 1, tags = {"fast", "rust"}, nested = { ok = true } }
+local enc = json.encode(obj)
+print(enc)
+local back = json.decode(enc)
+print(back.name, back.version, back.tags[2], back.nested.ok)
+"#;
+    assert_eq!(
+        out(src),
+        "{\"name\":\"lusa\",\"version\":1,\"tags\":[\"fast\",\"rust\"],\"nested\":{\"ok\":true}}\nlusa 1 rust true"
+    );
+}
+
+#[test]
+fn json_scalars_and_arrays() {
+    assert_eq!(
+        out("print(json.encode(nil), json.encode(true), json.encode(2.5), json.encode(\"a\\nb\"))"),
+        "null true 2.5 \"a\\nb\""
+    );
+    assert_eq!(out("print(json.encode({10, 20, 30}))"), "[10,20,30]");
+    assert_eq!(out("print(json.encode({}))"), "[]");
+    let src = "local a = json.decode(\"[1, 2.5, -3e2, null, true]\")\nprint(#a, a[2], a[3], a[4], a[5])";
+    assert_eq!(out(src), "5 2.5 -300 nil true");
+}
+
+#[test]
+fn json_escapes() {
+    // quotes live fine inside single-quoted Lusa strings; \n is a real newline
+    assert_eq!(out(r#"print(json.encode('say "hi"\nl3'))"#), "\"say \\\"hi\\\"\\nl3\"");
+    // decode resolves escapes; JSON \\ (two backslashes) becomes a single one
+    let src = r#"local s = json.decode('"a\\\\nb"')
+print(#s, s)"#;
+    assert_eq!(out(src), "4 a\\nb");
+    // raw control characters inside JSON strings are invalid
+    assert_eq!(err_code("json.decode(\"a\\nb\")"), "E9000");
+}
+
+#[test]
+fn json_errors() {
+    assert_eq!(err_code("json.encode(print)"), "E9000");
+    assert_eq!(err_code("json.decode(\"{bad}\")"), "E9000");
+    assert_eq!(err_code("json.decode(\"[1, 2\")"), "E9000");
+    assert_eq!(err_code("json.decode(\"1 2\")"), "E9000");
+    assert_eq!(err_code("json.decode('\"unterminated')"), "E9000");
+    assert_eq!(err_code("json.encode({ f = math.floor })"), "E9000");
+    // ownership: storing the table in itself moves it; encoding the moved slot errors
+    assert_eq!(err_code("local t = {}; t.self = t; json.encode(t)"), "E1001");
+    assert_eq!(err_code("json.encode(math.huge)"), "E9000");
+    let r = out("local ok, e = pcall(function() return json.decode(\"x\") end)\nprint(ok, string.sub(e, 1, 5))");
+    assert_eq!(r, "false E9000");
+}
+
+#[test]
+fn json_object_vs_array_keys() {
+    // dense integer keys 1..n => JSON array
+    assert_eq!(out("print(json.encode({[1] = \"a\", [2] = \"b\"}))"), "[\"a\",\"b\"]");
+    // mixed/string keys => JSON object with stringified numeric keys
+    assert_eq!(
+        out("print(json.encode({[1] = \"a\", [2] = \"b\", x = 1}))"),
+        "{\"1\":\"a\",\"2\":\"b\",\"x\":1}"
+    );
+    // holes break the array shape
+    assert_eq!(out("local t = {10, 20}; t[4] = 40\nprint(json.encode(t))"), "{\"1\":10,\"2\":20,\"4\":40}");
+}
+

@@ -1,5 +1,5 @@
-//! Standard library: base functions plus the `math`, `string` and `table`
-//! modules.
+//! Standard library: base functions plus the `math`, `string`, `table` and
+//! `json` modules.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{LResult, LusaError, Span, E_ASSERT, E_CMP, E_ERROR, E_INDEX, E_NUM};
 use crate::interp::Interp;
-use crate::value::{with_reg, FuncBody, FuncObj, IterState, TableObj, Value};
+use crate::value::{format_number, with_reg, FuncBody, FuncObj, IterState, TableObj, Value};
 
 type BF = Box<dyn Fn(&mut Interp, Vec<Value>, Span) -> LResult<Vec<Value>>>;
 
@@ -311,6 +311,7 @@ pub fn modules() -> Vec<(&'static str, Vec<(String, BF)>)> {
         ("math", math_mod()),
         ("string", map(string_mod())),
         ("table", map(table_mod())),
+        ("json", map(json_mod())),
     ]
 }
 
@@ -928,3 +929,378 @@ fn lua_lt(x: &Value, y: &Value, span: Span) -> LResult<bool> {
 }
 
 // (end of builtins)
+
+// ===== json module =====
+
+/// Quotes a string as a JSON string literal (control chars escaped, UTF-8 raw).
+fn json_quote(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Encodes one value; `seen` holds table identities for cycle detection.
+fn json_encode_value(
+    v: &Value,
+    span: Span,
+    seen: &mut Vec<usize>,
+    depth: usize,
+    out: &mut String,
+) -> LResult<()> {
+    if depth > 128 {
+        return Err(LusaError::new(E_ERROR, Some(span), "json.encode: nesting too deep"));
+    }
+    match v.base_value() {
+        Value::Nil => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => {
+            if !n.is_finite() {
+                return Err(LusaError::new(
+                    E_ERROR,
+                    Some(span),
+                    format!("json.encode: cannot encode non-finite number ({})", n),
+                ));
+            }
+            out.push_str(&format_number(*n));
+        }
+        Value::Str(s) => json_quote(s, out),
+        Value::Table(t) => {
+            let id = Rc::as_ptr(t) as usize;
+            if seen.contains(&id) {
+                return Err(LusaError::new(E_ERROR, Some(span), "json.encode: cyclic table"));
+            }
+            seen.push(id);
+            // tables with dense integer keys 1..=n become arrays; others objects
+            let mut entries: Vec<(Value, Value)> = Vec::new();
+            for i in 0..t.entry_count() {
+                if let Some((k, Some(val))) = t.entry_at(i) {
+                    entries.push((k, val));
+                }
+            }
+            let mut is_array = true;
+            let mut maxk: usize = 0;
+            for (k, _) in &entries {
+                match k.base_value() {
+                    Value::Number(n) if n.fract() == 0.0 && *n >= 1.0 => {
+                        let idx = *n as usize;
+                        if idx > maxk {
+                            maxk = idx;
+                        }
+                    }
+                    _ => is_array = false,
+                }
+            }
+            if is_array && entries.len() != maxk {
+                is_array = false; // holes: {1, 3} is not a JSON array
+            }
+            if is_array {
+                entries.sort_by_key(|(k, _)| match k.base_value() {
+                    Value::Number(n) => *n as usize,
+                    _ => 0,
+                });
+                out.push('[');
+                for (i, (_, val)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    json_encode_value(val, span, seen, depth + 1, out)?;
+                }
+                out.push(']');
+            } else {
+                out.push('{');
+                let mut first = true;
+                for (k, val) in &entries {
+                    let key_str = match k.base_value() {
+                        Value::Str(s) => s.to_string(),
+                        Value::Number(n) => format_number(*n),
+                        other => {
+                            return Err(LusaError::new(
+                                E_ERROR,
+                                Some(span),
+                                format!("json.encode: cannot encode key of type {}", other.type_name()),
+                            ))
+                        }
+                    };
+                    if !first {
+                        out.push(',');
+                    }
+                    first = false;
+                    json_quote(&key_str, out);
+                    out.push(':');
+                    json_encode_value(val, span, seen, depth + 1, out)?;
+                }
+                out.push('}');
+            }
+            seen.pop();
+        }
+        Value::Func(_) | Value::Iter(_) | Value::Alias(_) => {
+            return Err(LusaError::new(
+                E_ERROR,
+                Some(span),
+                format!("json.encode: cannot encode a value of type {}", v.type_name()),
+            ))
+        }
+    }
+    Ok(())
+}
+
+struct JsonParser<'a> {
+    chars: &'a [char],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn err(&self, msg: impl Into<String>) -> LusaError {
+        LusaError::new(
+            E_ERROR,
+            None,
+            format!("json.decode: {} (at position {})", msg.into(), self.pos),
+        )
+    }
+
+    fn skip_ws(&mut self) {
+        while self.pos < self.chars.len() && self.chars[self.pos].is_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek();
+        if c.is_some() {
+            self.pos += 1;
+        }
+        c
+    }
+
+    fn expect(&mut self, c: char) -> LResult<()> {
+        match self.bump() {
+            Some(x) if x == c => Ok(()),
+            other => Err(self.err(format!("expected '{}', found {:?}", c, other))),
+        }
+    }
+
+    fn parse_value(&mut self, depth: usize) -> LResult<Value> {
+        if depth > 128 {
+            return Err(self.err("nesting too deep"));
+        }
+        self.skip_ws();
+        match self.peek() {
+            None => Err(self.err("unexpected end of input")),
+            Some('n') => self.parse_lit("null", Value::Nil),
+            Some('t') => self.parse_lit("true", Value::Bool(true)),
+            Some('f') => self.parse_lit("false", Value::Bool(false)),
+            Some('"') => self.parse_string().map(|s| Value::Str(Arc::from(s.as_str()))),
+            Some('[') => self.parse_array(depth),
+            Some('{') => self.parse_object(depth),
+            Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number(),
+            Some(c) => Err(self.err(format!("unexpected character '{}'", c))),
+        }
+    }
+
+    fn parse_lit(&mut self, lit: &str, v: Value) -> LResult<Value> {
+        for c in lit.chars() {
+            match self.bump() {
+                Some(x) if x == c => {}
+                _ => return Err(self.err(format!("invalid literal, expected '{}'", lit))),
+            }
+        }
+        Ok(v)
+    }
+
+    fn parse_number(&mut self) -> LResult<Value> {
+        let start = self.pos;
+        if self.peek() == Some('-') {
+            self.pos += 1;
+        }
+        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        if self.peek() == Some('.') {
+            self.pos += 1;
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                self.pos += 1;
+            }
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        let text: String = self.chars[start..self.pos].iter().collect();
+        text.parse::<f64>()
+            .map(Value::Number)
+            .map_err(|_| self.err(format!("invalid number '{}'", text)))
+    }
+
+    fn parse_string(&mut self) -> LResult<String> {
+        self.expect('"')?;
+        let mut out = String::new();
+        loop {
+            match self.bump() {
+                None => return Err(self.err("unterminated string")),
+                Some('"') => return Ok(out),
+                Some('\\') => match self.bump() {
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some('/') => out.push('/'),
+                    Some('b') => out.push('\u{08}'),
+                    Some('f') => out.push('\u{0C}'),
+                    Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
+                    Some('t') => out.push('\t'),
+                    Some('u') => {
+                        let hi = self.parse_hex4()?;
+                        let cp = if (0xD800..0xDC00).contains(&hi) {
+                            if self.peek() == Some('\\') {
+                                self.pos += 1;
+                                self.expect('u')?;
+                                let lo = self.parse_hex4()?;
+                                if !(0xDC00..0xE000).contains(&lo) {
+                                    return Err(self.err("invalid low surrogate"));
+                                }
+                                0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                            } else {
+                                return Err(self.err("lone high surrogate"));
+                            }
+                        } else if (0xDC00..0xE000).contains(&hi) {
+                            return Err(self.err("lone low surrogate"));
+                        } else {
+                            hi
+                        };
+                        out.push(
+                            char::from_u32(cp).ok_or_else(|| self.err("invalid unicode escape"))?,
+                        );
+                    }
+                    other => return Err(self.err(format!("invalid escape '\\{:?}'", other))),
+                },
+                Some(c) if (c as u32) < 0x20 => {
+                    return Err(self.err("raw control character inside a JSON string"))
+                }
+                Some(c) => out.push(c),
+            }
+        }
+    }
+
+    fn parse_hex4(&mut self) -> LResult<u32> {
+        let mut v = 0u32;
+        for _ in 0..4 {
+            let c = self
+                .bump()
+                .ok_or_else(|| self.err("unexpected end in \\u escape"))?;
+            let d = c
+                .to_digit(16)
+                .ok_or_else(|| self.err(format!("invalid hex digit '{}'", c)))?;
+            v = v * 16 + d;
+        }
+        Ok(v)
+    }
+
+    fn parse_array(&mut self, depth: usize) -> LResult<Value> {
+        self.expect('[')?;
+        let t = Rc::new(TableObj::new());
+        let mut n = 0usize;
+        self.skip_ws();
+        if self.peek() == Some(']') {
+            self.pos += 1;
+            t.next_arr.set(1);
+            return Ok(Value::Table(t));
+        }
+        loop {
+            let v = self.parse_value(depth + 1)?;
+            n += 1;
+            let _ = t.set(Value::Number(n as f64), v);
+            self.skip_ws();
+            match self.bump() {
+                Some(',') => continue,
+                Some(']') => break,
+                other => return Err(self.err(format!("expected ',' or ']', found {:?}", other))),
+            }
+        }
+        t.next_arr.set(n + 1);
+        Ok(Value::Table(t))
+    }
+
+    fn parse_object(&mut self, depth: usize) -> LResult<Value> {
+        self.expect('{')?;
+        let t = Rc::new(TableObj::new());
+        self.skip_ws();
+        if self.peek() == Some('}') {
+            self.pos += 1;
+            return Ok(Value::Table(t));
+        }
+        loop {
+            self.skip_ws();
+            let key = self.parse_string()?;
+            self.skip_ws();
+            self.expect(':')?;
+            let v = self.parse_value(depth + 1)?;
+            let _ = t.set(Value::Str(Arc::from(key.as_str())), v);
+            self.skip_ws();
+            match self.bump() {
+                Some(',') => continue,
+                Some('}') => break,
+                other => return Err(self.err(format!("expected ',' or '}}', found {:?}", other))),
+            }
+        }
+        Ok(Value::Table(t))
+    }
+}
+
+fn json_mod() -> Vec<(&'static str, BF)> {
+    vec![
+        (
+            "encode",
+            Box::new(|_: &mut Interp, a: Vec<Value>, s: Span| {
+                let v = get(&a, 0, "value", s)?;
+                let mut out = String::new();
+                let mut seen = Vec::new();
+                json_encode_value(v, s, &mut seen, 0, &mut out)?;
+                one(Value::Str(Arc::from(out.as_str())))
+            }),
+        ),
+        (
+            "decode",
+            Box::new(|_: &mut Interp, a: Vec<Value>, s: Span| {
+                let v = get(&a, 0, "text", s)?;
+                let text = match v.base_value() {
+                    Value::Str(t) => t.to_string(),
+                    other => {
+                        return Err(LusaError::new(
+                            E_ERROR,
+                            Some(s),
+                            format!("json.decode: expected a string, got {}", other.type_name()),
+                        ))
+                    }
+                };
+                let chars: Vec<char> = text.chars().collect();
+                let mut p = JsonParser { chars: &chars, pos: 0 };
+                let val = p.parse_value(0)?;
+                p.skip_ws();
+                if p.pos < p.chars.len() {
+                    return Err(p.err("trailing characters after JSON value"));
+                }
+                one(val)
+            }),
+        ),
+    ]
+}
