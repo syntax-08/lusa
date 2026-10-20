@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target/
+
+# Setup package build artifacts (regenerable)
+/setup/lusa-setup.zip
+/setup/lusa.exe
+
+# Local junk
+*.log
