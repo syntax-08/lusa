@@ -256,6 +256,15 @@ impl OrWithSelf for std::io::Result<()> {
     }
 }
 
+/// Removes a leftover `lusa.exe.old` from a previous update. Fails silently
+/// while some process still runs from it; the next run succeeds.
+pub fn clean_stale_backup() {
+    let old = install_dir().join("lusa.exe.old");
+    if old.is_file() {
+        let _ = std::fs::remove_file(&old);
+    }
+}
+
 /// `self-update [--check] [--force]` CLI entry.
 pub fn cli(rest: &[String]) -> i32 {
     let check_only = rest.iter().any(|a| a == "--check");

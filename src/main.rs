@@ -10,6 +10,7 @@ use lusa::parser;
 const BANNER: &str = concat!("Lusa ", env!("CARGO_PKG_VERSION"), " — Lua-like language with optional ownership (made in Rust)\ntype `:quit` to exit, finished blocks with `end` are evaluated as you go");
 
 fn main() {
+    lusa::update::clean_stale_backup();
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("-h") | Some("--help") | Some("help") => {
