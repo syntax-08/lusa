@@ -23,6 +23,7 @@ fn main() {
             println!("  lusalang packages              list installed packages");
             println!("  lusalang uninstall <name>      remove an installed package");
             println!("  lusalang where                 show where the runtime is installed");
+            println!("  lusalang lsp                   run the language server (editors contact it)");
             println!("  lusalang version               runtime version");
             println!();
             println!("  (short aliases: lusa [file.lusa] | lusa -e \"<code>\")");
@@ -98,6 +99,9 @@ fn main() {
                 }
             };
             std::process::exit(pkg_uninstall(name));
+        }
+        Some("lsp") => {
+            std::process::exit(lusa::lsp::lsp_main());
         }
         Some("-e") => {
             let code = args[2..].join(" ");

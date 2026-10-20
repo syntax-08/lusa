@@ -240,3 +240,27 @@ print(text(1, 1, "hello from a package", 14))
 
 The reference package lives at [syntax-08/lusa-ui](https://github.com/syntax-08/lusa-ui) —
 a full TUI kit (colors, boxes, progress bars) you can crack open as a template.
+
+## Language server: `lusalang lsp`
+
+Lusa ships an LSP (Language Server Protocol) implementation over stdio,
+written on `std` only. Editors use it to run the real checker inside the
+editor instead of only highlighting:
+
+- **syntax errors appear live** with the E-code (E0001 lexer, E0101 parser),
+  underlined with the full cargo-style message; they clear as soon as the
+  code is fixed
+- full-document sync; UTF-16 positions per the LSP spec
+
+The [Zed extension](https://github.com/syntax-08/zed-lusa) starts it
+automatically for `.lusa` files. Manually (WSL/Linux/other is possible since
+the binary is pure std):
+
+```cmd
+lusalang lsp
+```
+
+Editors talk to it via `Content-Length` JSON-RPC frames on stdio — a generic
+LSP client configuration works. Diagnostics currently cover lex/parse
+(static); ownership errors (E1xxx) are runtime checks and appear when you
+`run` the program. Completion and hover are on the roadmap.

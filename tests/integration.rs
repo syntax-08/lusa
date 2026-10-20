@@ -331,3 +331,24 @@ end
     // missing callee is a loud programming error (not a protected miss)
     assert_eq!(err_code("pcall()"), "E9000");
 }
+
+// ===== language server (lsp diagnostics) =====
+
+#[test]
+fn lsp_diagnostics_report_positions_and_codes() {
+    let diags = lusa::lsp::diagnostics("local x = (1 +\nprint(x)\n");
+    assert_eq!(diags.len(), 1);
+    let s = diags[0].serialize();
+    assert!(s.contains("\"code\":\"E0101\""), "missing code: {}", s);
+    assert!(s.contains("\"severity\":1"), "missing severity: {}", s);
+    assert!(s.contains("\"line\":1,\"character\":8"), "missing error position: {}", s);
+    assert!(s.contains("\"source\":\"lusa\""), "missing source: {}", s);
+
+    // clean source produces no diagnostics
+    assert_eq!(lusa::lsp::diagnostics("local x = 1\nprint(x)\n").len(), 0);
+
+    // multiline: the line index counts newlines before the error
+    let diags2 = lusa::lsp::diagnostics("local a = 1\nlocal b = 2\nlocal c = (1 +\n");
+    assert_eq!(diags2.len(), 1);
+    assert!(diags2[0].serialize().contains("\"line\":2"), "expected line 2: {}", diags2[0].serialize());
+}

@@ -7,6 +7,7 @@ pub mod error;
 pub mod eval;
 pub mod interp;
 pub mod lexer;
+pub mod lsp;
 pub mod parser;
 pub mod scope;
 pub mod tokens;
