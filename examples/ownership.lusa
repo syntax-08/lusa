@@ -1,0 +1,25 @@
+-- examples/ownership.lusa — the three ways a table flows
+print("== ownership ==")
+
+local conf = {lang = "en", retries = 3}
+
+-- 1) CLONE: deep copy, both values stay independent
+local backup = clone conf
+backup.retries = 99
+print("clone:", conf.retries, backup.retries) -- 3 99
+
+-- 2) BORROW: read-only alias while inside the `do ... end` block
+do
+    local view = borrow conf
+    print("borrow:", view.lang, view.retries)
+end
+-- the borrow ends here: the alias dropped out of scope
+
+-- 3) MOVE: transfers ownership; `conf` becomes a moved-out slot
+local live = conf
+print("live (now owner):", live.lang)
+
+-- scalars never move (they are Copy)
+local n = 7
+local m = n
+print("copies:", n, m)

@@ -1,0 +1,46 @@
+-- examples/basics.lusa — core language tour
+print("== basics ==")
+
+-- values & operators (Lua semantics: / is float, // is floor division)
+print(7 / 2, 7 // 2, 7 % 3, 2 ^ 10)
+
+-- strings: interpolation `\{expr}`, unicode `\u{XXXX}`, literal braces
+print("name: \{"lusa"} version: \{0 + 1} \u{26a1} braces \{1} literal {2} -> \\\{3}")
+
+-- tables: array part and hash part coexist
+local cfg = {10, 20, 30, name = "Lusa", deep = {ok = true}}
+print(#cfg, cfg[2], cfg.name, cfg.deep.ok)
+
+-- control flow
+for i = 1, 3 do
+    if i == 2 then
+        print("middle")
+    else
+        print(i)
+    end
+end
+
+-- while / repeat / break
+local n = 0
+repeat n = n + 1 until n == 3
+while true do
+    n = n - 1
+    if n == 0 then break end
+end
+print("loops done:", n)
+
+-- multiple returns, varargs, table.pack
+local function three(...)
+    local p = table.pack(...)
+    return p.n, p[1] + p[2] + p[3]
+end
+print(three(1, 2, 3))
+
+-- closures capture their enclosing scope
+function counter()
+    local c = 0
+    return function() c = c + 1 return c end
+end
+local tick = counter()
+tick() tick()
+print("closures:", tick())

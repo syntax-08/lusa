@@ -1,0 +1,38 @@
+-- examples/closures.lusa — functions, closures and methods
+print("== closures ==")
+
+-- closures capture the scope they were created in
+makeState = function()
+    local state = 0
+    return function(delta)
+        state = state + delta
+        return state
+    end
+end
+local inc = makeState()
+inc(5); inc(3)
+print("state:", inc(1)) -- 9
+
+-- closures share captures between creators
+function shared()
+    local balance = 100
+    local deposit, withdraw
+    deposit  = function(v) balance = balance + v return balance end
+    withdraw = function(v) balance = balance - v return balance end
+    return deposit, withdraw
+end
+local dep, wdr = shared()
+dep(200); wdr(50)
+print("balance left:", dep(0)) -- 250
+
+-- methods: `o:m()` receives `self` as a mutable borrow
+local account = {owner = "Ana", cents = 0}
+function account:deposit(c)
+    self.cents = self.cents + c
+    return self
+end
+function account:toString()
+    return string.format("%s has $ %.2f", self.owner, self.cents / 100)
+end
+account:deposit(1500):deposit(500)
+print(account:toString())

@@ -1,0 +1,24 @@
+-- examples/ownership-error.lusa — cargo-style diagnostics in action
+--
+-- This file fails ON PURPOSE. Each line below triggers a distinct E-code.
+-- Uncomment one block at a time to explore the reports.
+
+-- E1001 (use of moved-out value):
+--   local t = {1, 2, 3}
+--   local u = t
+--   print(t)             -- error[E1001]: use of moved-out value `t`
+
+-- E1002 (cannot move while borrowed):
+--   local t = {1, 2, 3}
+--   local a = borrow t
+--   local b = t          -- error[E1002] + note: `t` is borrowed by `a` here
+
+-- E1004 (assign through a read-only borrow):
+--   local t = {x = 1}
+--   local a = borrow t
+--   a.x = 5              -- error[E1004]: only method receivers can mutate
+
+-- E2001 (type error):
+--   print("n" + 1)       -- error[E2001]: numbers only
+
+print("(ok - nothing ran; uncomment a block above to trigger an error)")

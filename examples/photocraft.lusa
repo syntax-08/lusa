@@ -1,0 +1,42 @@
+-- photocraft 100% Lusa: image embedded as a 2D table (levels 0..15)
+local img = {
+    {0, 0, 1, 1, 2, 2, 3, 3},
+    {0, 1, 1, 2, 2, 3, 3, 4},
+    {1, 1, 2, 2, 3, 3, 4, 4},
+    {1, 2, 2, 3, 3, 4, 4, 5},
+    {2, 2, 3, 3, 4, 4, 5, 5},
+    {2, 3, 3, 4, 4, 5, 5, 6},
+}
+
+local ART = ".:-=+*#%@"
+
+-- invert filter (ramp 0..9)
+local out = {}
+for i = 1, #img do
+    local lin = {}
+    for j = 1, #img[i] do
+        lin[j] = 9 - img[i][j]
+    end
+    out[i] = lin
+end
+
+-- contrast filter: clamps the extremes
+for i = 1, #out do
+    local lin = out[i]   -- MOVES the row out (ownership!)
+    for j = 1, #lin do
+        if lin[j] <= 1 then lin[j] = 0 end
+        if lin[j] >= 8 then lin[j] = 9 end
+    end
+    out[i] = lin
+end
+
+-- render ASCII
+print("== filtered image ==")
+for i = 1, #out do
+    local lin = out[i]
+    local row = ""
+    for j = 1, #lin do
+        row = row .. string.sub(ART, 1 + lin[j], 1 + lin[j])
+    end
+    print(row)
+end

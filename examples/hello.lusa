@@ -1,0 +1,3 @@
+-- examples/hello.lusa
+print("Hello, Lusa!")
+print("1 + 2 = \{1 + 2}")

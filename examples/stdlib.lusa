@@ -1,0 +1,33 @@
+-- examples/stdlib.lusa — tour of the standard library
+print("== stdlib ==")
+
+-- string
+print(string.upper("!inside!"), string.sub("wiki", 2, 4))
+print(string.find("as quick as possible", "quick"))
+print(string.gsub("banana banana", "na", "NO"))
+print(string.format("%s and %d / %s", "pi", 99, string.rep("-", 3)))
+print(string.char(72, 105), ("205"):byte(nil))
+
+-- table
+local t = {5, 1, 4, 2}
+table.insert(t, 3, 9)
+print("pos", t[2], t[3], table.concat(t, ","))
+table.sort(t)
+print("sort:", table.concat(t, ","))
+print("unpack:", table.unpack({10, 20, 30}))
+local p = table.pack(nil, 2)
+print("pack n:", p.n == 2)
+
+-- math
+print(math.floor(math.sqrt(50)))
+print(math.pi * math.floor(1))
+print(string.format("%.3f, %.3f", math.sin(math.pi/2), math.cos(0)))
+math.randomseed(42)
+print(math.random(6), math.random(6), math.random(6))
+
+-- iterators
+for i, v in ipairs({"alpha", "beta"}) do print(i, v) end
+for k, v in pairs({["color"] = 1, earth = 2}) do print(k, tostring(v)) end
+
+-- type / tostring / tonumber
+print(type(print), type({}), tonumber("0x10"), tostring(10 / 4))

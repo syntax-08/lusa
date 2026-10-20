@@ -1,0 +1,4 @@
+# Builds deste projeto vinculam o CRT estaticamente → o lusa.exe
+# roda em qualquer Windows x64 sem instalar pacote do Visual C++.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
