@@ -139,7 +139,25 @@ local c = t         -- ok: the borrow already ended
 ## 6. stdlib
 
 Base: `print msg...`, `type v`, `tostring v`, `tonumber s (base)`,
-`error msg`, `assert ok, msg`, `pcall f, args...`, `pairs t`, `ipairs t`.
+`error msg`, `assert ok, msg`, `pcall f, args...`, `pairs t`, `ipairs t`,
+`io_read_file path`, `require name`.
+
+### File I/O - `io_read_file(path)`
+
+Reads a UTF-8 text file and returns its contents as a Lusa string. The path
+must be a string; missing, unreadable, or non-UTF-8 files raise `E2009`, which
+can be caught with `pcall`:
+
+```lusa
+local source = io_read_file("src/main.lusa")
+print(#source)
+
+local ok, err = pcall(io_read_file, "missing.lusa")
+-- ok = false, err starts with "E2009: io_read_file: cannot read ..."
+```
+
+The same native function is installed in the global environment used by both
+the tree-walking interpreter and the bytecode VM.
 
 ### Protected calls — `pcall`
 
@@ -222,6 +240,7 @@ Codes `E{category}{n}`, like rustc:
 | E2006  | type     | indexing (`t.x`/`t[k]`) a non-table |
 | E2007  | key      | `nil`/NaN key in `t[k] = v` |
 | E2008  | value    | invalid `tonumber`/`format` |
+| E2009  | I/O      | `io_read_file` cannot read the file (missing, unreadable, or non-UTF-8) |
 | E9000  | runtime  | `error(msg)` |
 | E9100  | runtime  | `assert(false, msg)` |
 | E9999  | runtime  | internal error (umbrella; includes stack overflow for calls > 200 — catchable with `pcall`) |

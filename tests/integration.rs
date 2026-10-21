@@ -11,6 +11,16 @@ fn err_code(src: &str) -> String {
     run_source(src).expect_err("expected an error").code.to_string()
 }
 
+fn temp_fixture(tag: &str, contents: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("lusa_{}_{}.txt", tag, std::process::id()));
+    std::fs::write(&path, contents).expect("write temp fixture");
+    path
+}
+
+fn lusa_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 // ===== basics =====
 
 #[test]
@@ -108,6 +118,24 @@ fn stdlib_basics() {
     assert_eq!(out("local t = {\"b\", \"a\"} table.sort(t) print(table.concat(t, \",\"))"), "a,b");
     assert_eq!(out("print(string.upper(\"ok\"), string.sub(\"wiki\", 1, 2))"), "OK wi");
     assert_eq!(out("print(string.format(\"%.2f\", 1.239))"), "1.24");
+}
+
+#[test]
+fn io_read_file_reads_utf8_text_on_both_engines() {
+    let path = temp_fixture("io_read", "olá\nmundo\n");
+    let src = format!("local s = io_read_file(\"{}\")\nprint(s)", lusa_path(&path));
+    assert_parity(&src, "olá\nmundo\n");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn io_read_file_missing_file_is_e2009_on_both_engines() {
+    let path = std::env::temp_dir().join(format!("lusa_missing_{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let src = format!("io_read_file(\"{}\")", lusa_path(&path));
+    assert_err_parity(&src, "E2009");
+    assert_err_parity("io_read_file(42)", "E2006");
+    assert_err_parity("io_read_file()", "E2006");
 }
 
 #[test]

@@ -51,7 +51,7 @@ See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full toolchain guide
 ```sh
 cargo build             # debug
 cargo build --release   # release turbo (opt-level 3 + LTO) — use this to install
-cargo test              # 53 tests (6 unit + 47 integration)
+cargo test              # 55 tests (6 unit + 49 integration)
 ```
 
 The resulting binary (`target\release\lusa.exe`) is standalone: **running
@@ -104,11 +104,11 @@ cargo run -- examples/basics.lusa
     **E1002**; writing through the immutable alias → **E1004**.
 - **Methods**: `o:m()` passes the receiver as a *mutable borrow* —
   `function o:m() self.x = ... end` works naturally (mutating `self`).
-- **stdlib**: `print type tostring tonumber error assert pairs ipairs`
+- **stdlib**: `print type tostring tonumber error assert pairs ipairs io_read_file`
   + `string` `table` `math` modules.
 - **Errors** in cargo style (`error[E1001]: ...`, `note:` and `help:`),
   E-codes: lexer (E0001), parser (E0101), ownership (E1001–E1005),
-  runtime types (E2001–E2008), `error`/`assert` (E9000/E9100).
+  runtime types and I/O (E2001–E2009), `error`/`assert` (E9000/E9100).
   Full table in [`docs/LANGUAGE.md`](docs/LANGUAGE.md).
 
 ## Code architecture

@@ -137,6 +137,7 @@ pub const E_CALL: &str = "E2005";
 pub const E_INDEX: &str = "E2006";
 pub const E_BAD_KEY: &str = "E2007";
 pub const E_NUM: &str = "E2008";
+pub const E_IO: &str = "E2009"; // native file I/O failure
 
 // user raised
 pub const E_ERROR: &str = "E9000"; // error()

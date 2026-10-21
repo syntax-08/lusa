@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
 
-use crate::error::{LResult, LusaError, Span, E_ASSERT, E_CMP, E_ERROR, E_INDEX, E_NUM};
+use crate::error::{LResult, LusaError, Span, E_ASSERT, E_CMP, E_ERROR, E_INDEX, E_IO, E_NUM};
 use crate::interp::Interp;
 use crate::value::{format_number, with_reg, FuncBody, FuncObj, IterState, TableObj, Value};
 
@@ -62,6 +62,45 @@ fn b_print(i: &mut Interp, args: Vec<Value>, _span: Span) -> LResult<Vec<Value>>
     let line: Vec<String> = args.iter().map(to_str).collect();
     i.out.push(line.join(" "));
     Ok(Vec::new())
+}
+
+/// `io_read_file(path)`: reads a UTF-8 text file and returns its contents.
+///
+/// This is the native I/O primitive used by the self-hosted compiler pipeline.
+/// It is installed in the global environment, so both the tree-walking
+/// interpreter and the bytecode VM see the same function.
+fn b_io_read_file(_i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    let path = match args.first().map(Value::base_value) {
+        Some(Value::Str(s)) => s,
+        Some(other) => {
+            return Err(LusaError::new(
+                E_INDEX,
+                Some(span),
+                format!(
+                    "io_read_file: expected a string path, got {} ({})",
+                    other.type_name(),
+                    other.fmt_value()
+                ),
+            ))
+        }
+        None => {
+            return Err(LusaError::new(
+                E_INDEX,
+                Some(span),
+                "io_read_file: missing argument `path`",
+            ))
+        }
+    };
+
+    let contents = std::fs::read_to_string(path.as_ref()).map_err(|e| {
+        LusaError::new(
+            E_IO,
+            Some(span),
+            format!("io_read_file: cannot read `{}`: {}", path, e),
+        )
+        .help("check that the file exists, is readable, and contains valid UTF-8")
+    })?;
+    Ok(vec![Value::Str(Arc::from(contents.as_str()))])
 }
 
 fn b_type(_i: &mut Interp, args: Vec<Value>, _span: Span) -> LResult<Vec<Value>> {
@@ -301,6 +340,7 @@ pub fn all() -> Vec<(&'static str, BF)> {
         ("pcall", Box::new(b_pcall)),
         ("pairs", Box::new(b_pairs)),
         ("ipairs", Box::new(b_ipairs)),
+        ("io_read_file", Box::new(b_io_read_file)),
         ("require", Box::new(b_require)),
     ]
 }
