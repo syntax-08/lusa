@@ -51,7 +51,7 @@ See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full toolchain guide
 ```sh
 cargo build             # debug
 cargo build --release   # release turbo (opt-level 3 + LTO) — use this to install
-cargo test              # integration suite (42 tests)
+cargo test              # 53 tests (6 unit + 47 integration)
 ```
 
 The resulting binary (`target\release\lusa.exe`) is standalone: **running
@@ -120,16 +120,53 @@ src/
   value.rs                # values, tables, ownership/borrow registry
   scope.rs   interp.rs    # scopes, frames, execution, move rules
   eval.rs     builtins.rs # expression evaluation; stdlib
+  compiler.rs vm.rs       # AST → bytecode compiler; register-based VM
   error.rs    main.rs     # LusaError + cargo-style render; CLI/REPL
   lib.rs                  # public API (used by tests/integration.rs)
 ```
 
-Pipeline: lexer → parser → AST → tree-walking interpreter
-(`interp.rs` runs statements; `eval.rs` evaluates expressions).
+Pipeline:
+
+```text
+lexer → parser → AST → tree-walking interpreter (default)
+                    └→ compiler → bytecode chunks → VM (`--vm`)
+```
+
+## Bytecode VM: registers and source lines
+
+`compiler.rs` resolves every local binding to a numeric register at compile
+time. `GetLoc`/`SetLoc` carry that slot index, and the VM executes them as
+direct frame-slot indexing — there is no name lookup on the hot path. Registers
+are allocated from a scope-aware free list, so sibling blocks reuse slots and
+`nlocals` is a high-water mark rather than a declaration count (`bench.lusa`
+goes from 13 to 7). Captured locals are promoted to shared cells and detached
+with `ResetSlot` before reuse, so closures from different loop iterations do
+not alias.
+
+Every instruction also records its original source line and local binding name
+in side tables parallel to the instruction stream. This is cold metadata: the
+dispatch loop never reads it. Only ownership/borrow errors call
+`Chunk::span_at`/`Chunk::local_name_at`, which lets the VM report the exact
+source line even though registers are reused:
+
+```text
+error[E1001]: use of moved-out value `t`
+ --> moved.lusa:3:1
+  |
+3 | print(t)
+  | -------^
+```
+
+Enable the bytecode engine with `--vm`:
+
+```sh
+lusalang run main.lusa --vm
+```
 
 ## Roadmap
 
-- Bytecode VM (today it is tree-walking)
+- Expand bytecode VM coverage (`borrow` is interpreter-only today) and make it
+  the default engine
 - pcall / coroutines
 - string patterns (gmatch/find with patterns, today literal-only)
 - explicit `move`/`copy` labels and a complete borrow checker

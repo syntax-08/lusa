@@ -144,7 +144,7 @@ Requires Rust (cargo) ≥ 1.70. Commands, from the project root:
 ```sh
 cargo build             # debug build (fast to compile, slow to run)
 cargo build --release   # release turbo: lto + codegen-units=1 + opt-level=3
-cargo test              # integration suite (42 tests)
+cargo test              # 53 tests (6 unit + 47 integration)
 cargo run               # opens the REPL straight from source
 ```
 
@@ -311,7 +311,7 @@ LSP client configuration works. Diagnostics currently cover lex/parse
 
 ## 8. Two engines: interpreter and bytecode VM
 
-Lusa ships two execution engines that produce **identical results** (42
+Lusa ships two execution engines that produce **identical results** (47
 integration tests assert output and error-code parity between them):
 
 | engine      | how it runs                                       | when to use                            |

@@ -244,7 +244,8 @@ help: `d` no longer holds the value; use `clone d` (copy) or
 
 ## 8. Implementation notes
 
-- Tree-walking interpreter (no bytecode in this MVP — roadmap).
+- Default engine: tree-walking interpreter; optional bytecode VM (`--vm`) with
+  compile-time register allocation (see `compiler.rs` / `vm.rs`).
 - Tables: `Vec<(key, SlotV)>` in insertion order + a hash index
   (`by_hash`) keyed "loose" (number/str/ptr for table×function).
   `#t` = the largest `n` such that keys 1..=n all exist (Lua heuristic).
