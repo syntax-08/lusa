@@ -422,3 +422,306 @@ fn json_object_vs_array_keys() {
     assert_eq!(out("local t = {10, 20}; t[4] = 40\nprint(json.encode(t))"), "{\"1\":10,\"2\":20,\"4\":40}");
 }
 
+
+// ===== bytecode VM parity =====
+//
+// Every program runs through BOTH engines (tree-walking interpreter and the
+// bytecode VM) and must produce identical output — or identical error codes.
+
+fn vm_out(src: &str) -> String {
+    lusa::vm::run_source_vm(src)
+        .expect("vm: expected success")
+        .join("\n")
+}
+
+fn vm_err_code(src: &str) -> String {
+    lusa::vm::run_source_vm(src)
+        .expect_err("vm: expected error")
+        .code
+        .to_string()
+}
+
+/// Runs the same program through both engines and requires identical output.
+fn assert_parity(src: &str, expected: &str) {
+    let a = out(src);
+    let b = vm_out(src);
+    assert_eq!(a, expected, "interpreter output mismatch for:\n{}", src);
+    assert_eq!(b, expected, "vm output mismatch for:\n{}", src);
+}
+
+/// Both engines must fail with the same E-code.
+fn assert_err_parity(src: &str, code: &str) {
+    assert_eq!(err_code(src), code, "interpreter code mismatch for:\n{}", src);
+    assert_eq!(vm_err_code(src), code, "vm code mismatch for:\n{}", src);
+}
+
+#[test]
+fn vm_parity_numbers_strings_interpolation() {
+    assert_parity("print(1 + 2 * 3)", "7");
+    assert_parity("print(7 / 2, 7 // 2, 7 % 3, 2 ^ 3, -(3 + 1))", "3.5 3 1 8 -4");
+    assert_parity("print(#\"abcd\")", "4");
+    assert_parity("print(-10 // 3)", "-4");
+    assert_parity("print(\"x\" .. \"y\" .. 1)", "xy1");
+    assert_parity("print(\"n: \\{1+2} s: \\{\"x\"}\")", "n: 3 s: x");
+}
+
+#[test]
+fn vm_parity_control_flow() {
+    assert_parity(
+        r#"
+if not false and 1 + 1 == 2 then
+    print("branch a")
+elseif 2 > 3 then
+    print("branch b")
+else
+    print("branch c")
+end
+"#,
+        "branch a",
+    );
+    assert_parity(
+        r#"
+local i = 0
+while i < 3 do
+    i = i + 1
+    print(i)
+end
+"#,
+        "1\n2\n3",
+    );
+    assert_parity(
+        r#"
+local n = 0
+repeat
+    n = n + 1
+until n >= 3
+print(n)
+"#,
+        "3",
+    );
+    assert_parity(
+        r#"
+for i = 1, 4 do
+    if i == 3 then
+        break
+    end
+    print(i)
+end
+"#,
+        "1\n2",
+    );
+    // descending numeric loop
+    assert_parity(
+        r#"
+for i = 10, 1, -3 do
+    print(i)
+end
+"#,
+        "10\n7\n4\n1",
+    );
+    // for-in over a literal table (insertion order is deterministic)
+    assert_parity(
+        r#"
+local t = {a = 1, b = 2}
+for k, v in pairs(t) do
+    print(k .. "=" .. v)
+end
+"#,
+        "a=1\nb=2",
+    );
+}
+
+#[test]
+fn vm_parity_functions_closures_recursion() {
+    assert_parity(
+        r#"
+function fib(n)
+    if n < 2 then
+        return n
+    end
+    return fib(n - 1) + fib(n - 2)
+end
+print(fib(12))
+"#,
+        "144",
+    );
+    // multi-value returns + truncation of mid-list expansion
+    assert_parity(
+        r#"
+function multi() return 1, 2, 3 end
+local a = multi()
+print(a)
+local b, c = multi()
+print(b, c)
+print(multi())
+local x, y = multi(), 9
+print(x, y)
+"#,
+        "1\n1 2\n1 2 3\n1 9",
+    );
+    // closure counter: the capture survives across calls
+    assert_parity(
+        r#"
+function counter()
+    local n = 0
+    return function() n = n + 1 return n end
+end
+local c = counter()
+print(c(), c(), c())
+"#,
+        "1 2 3",
+    );
+    // two closures sharing one captured slot
+    assert_parity(
+        r#"
+function mkr()
+    local n = 0
+    local inc = function() n = n + 1 return n end
+    local get = function() return n end
+    return inc, get
+end
+local inc, get = mkr()
+inc()
+inc()
+print(get())
+"#,
+        "2",
+    );
+}
+
+#[test]
+fn vm_parity_tables_fields_methods() {
+    assert_parity(
+        r#"
+local t = {1, 2, 3, name = "ana", ["k"] = 9}
+print(t[2], t.name, t.k, #t)
+t.x = 42
+print(t.x)
+t[10] = "ten"
+print(t[10])
+"#,
+        "2 ana 9 3\n42\nten",
+    );
+    // method call: the receiver arrives as the first parameter (`self`)
+    assert_parity(
+        r#"
+local p = {x = 3}
+function p.add(self, n)
+    return self.x + n
+end
+print(p:add(4))
+"#,
+        "7",
+    );
+}
+
+#[test]
+fn vm_parity_pcall() {
+    assert_parity(
+        r#"
+local function f(x) return x * 2, x + 1 end
+local ok, a, b = pcall(f, 5)
+print(ok, a, b)
+"#,
+        "true 10 6",
+    );
+    assert_parity(
+        r#"
+local function boom(x) error("boom " .. x) end
+local ok, err = pcall(boom, 42)
+print(ok, err)
+print("resumed after the error")
+"#,
+        "false E9000: boom 42\nresumed after the error",
+    );
+    assert_parity(
+        r#"
+local ok, e = pcall(function() return 1 + {} end)
+print(ok, string.sub(e, 1, 5))
+"#,
+        "false E2001",
+    );
+    assert_parity(
+        r#"
+local ok, e = pcall(function() local t = {a = {}} local x = t.a local y = t.a return y end)
+print(ok, string.sub(e, 1, 5))
+"#,
+        "false E1001",
+    );
+    assert_parity(
+        r#"
+local function inf() return inf() end
+local ok, e = pcall(inf)
+print(ok, string.sub(e, 1, 5))
+"#,
+        "false E9999",
+    );
+    assert_parity(
+        "local ok, e = pcall(42) print(ok, string.sub(e, 1, 5))",
+        "false E2005",
+    );
+}
+
+#[test]
+fn vm_parity_json() {
+    assert_parity(
+        r#"
+local obj = { name = "lusa", version = 1, tags = {"fast", "rust"}, nested = { ok = true } }
+local enc = json.encode(obj)
+print(enc)
+local back = json.decode(enc)
+print(back.name, back.version, back.tags[2], back.nested.ok)
+"#,
+        "{\"name\":\"lusa\",\"version\":1,\"tags\":[\"fast\",\"rust\"],\"nested\":{\"ok\":true}}\nlusa 1 rust true",
+    );
+    assert_parity(
+        "print(json.encode(nil), json.encode(true), json.encode(2.5))",
+        "null true 2.5",
+    );
+}
+
+#[test]
+fn vm_parity_varargs() {
+    assert_parity(
+        r#"
+function f(a, ...) return a, ... end
+print(f(1, 2, 3))
+local n1, n2 = f(7, 8, 9)
+print(n1, n2)
+function g(...) return {...} end
+local tt = g(4, 5, 6)
+print(#tt, tt[1])
+function h(...) return 0, ... end
+print(h(1, 2))
+"#,
+        "1 2 3\n7 8\n3 4\n0 1 2",
+    );
+}
+
+#[test]
+fn vm_parity_ownership() {
+    // moved variables are unusable below (E1001 on both engines)
+    assert_err_parity("local t = {1} local u = t print(t)", "E1001");
+    assert_err_parity("local d = {1} local f = print local e = f(d) print(d)", "E1001");
+    assert_err_parity("local t = {a = {}} local x = t.a local y = t.a", "E1001");
+    // clone keeps the source table alive
+    assert_parity("local t = {1} local u = clone t u[1] = 9 print(t[1], u[1])", "1 9");
+    // scalars are copied, no move happens
+    assert_parity("local a = 5 local b = a print(a, b)", "5 5");
+}
+
+#[test]
+fn vm_parity_stdlib() {
+    assert_parity(
+        "print(string.sub(\"hello\", 2, 4) .. \"|\" .. math.floor(2.7))",
+        "ell|2",
+    );
+}
+
+#[test]
+fn vm_parity_error_codes() {
+    assert_err_parity("local x = 1 + {}", "E2001");
+    assert_err_parity("missingfn()", "E2005");
+    assert_err_parity("local t = nil print(t.x)", "E2006");
+    assert_err_parity("local t = {} local x = t.nope.deeper", "E2006");
+}

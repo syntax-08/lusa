@@ -3,6 +3,7 @@
 
 pub mod ast;
 pub mod builtins;
+pub mod compiler;
 pub mod error;
 pub mod eval;
 pub mod interp;
@@ -13,6 +14,7 @@ pub mod scope;
 pub mod tokens;
 pub mod update;
 pub mod value;
+pub mod vm;
 
 use error::LResult;
 

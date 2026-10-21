@@ -488,6 +488,8 @@ impl Default for TableObj {
 pub enum FuncBody {
     Lusa(Rc<crate::ast::FuncLit>),
     Builtin(Builtin),
+    /// compiled bytecode function: prototype + captured upvalue slots
+    Vm(Rc<crate::compiler::Compiled>, Vec<Rc<RefCell<SlotV>>>),
 }
 
 pub type Builtin =

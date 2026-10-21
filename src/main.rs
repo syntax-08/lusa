@@ -16,7 +16,7 @@ fn main() {
         Some("-h") | Some("--help") | Some("help") => {
             println!("lusalang — Lusa runtime manager (no cargo needed for daily use)");
             println!();
-            println!("  lusalang run <file.lusa>       run a program");
+            println!("  lusalang run <file.lusa>       run a program ([--vm] runs it in bytecode mode)");
             println!("  lusalang check <file.lusa>     validate (lex+parse) without running");
             println!("  lusalang repl                  open the interactive REPL");
             println!("  lusalang new <name>            create a new project (scaffold)");
@@ -43,10 +43,19 @@ fn main() {
             println!("docs   : docs/LANGUAGE.md (language) + docs/TOOLCHAIN.md (toolchain)");
         }
         Some("run") => {
-            let path = match args.get(2) {
+            let mut want_vm = false;
+            let mut path: Option<&String> = None;
+            for a in &args[2..] {
+                if a == "--vm" {
+                    want_vm = true;
+                } else {
+                    path = Some(a);
+                }
+            }
+            let path = match path {
                 Some(p) => p,
                 None => {
-                    eprintln!("usage: lusalang run <file.lusa>");
+                    eprintln!("usage: lusalang run <file.lusa> [--vm]");
                     std::process::exit(2);
                 }
             };
@@ -57,6 +66,24 @@ fn main() {
                     std::process::exit(2);
                 }
             };
+            if want_vm {
+                match lusa::vm::run_source_vm(&src) {
+                    Ok(lines) => {
+                        for line in lines {
+                            println!("{}", line);
+                        }
+                        let _ = std::io::stdout().flush();
+                        println!("[bytecode vm] {} finished", path);
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        let _ = std::io::stdout().flush();
+                        let _ = std::io::stderr().flush();
+                        eprint!("{}(bytecode vm)", render(&e, &src, path));
+                        std::process::exit(1);
+                    }
+                }
+            }
             std::process::exit(run_source(&src, path));
         }
         Some("check") => {
@@ -105,7 +132,7 @@ fn main() {
         Some("lsp") => {
             std::process::exit(lusa::lsp::lsp_main());
         }
-        Some("self-update") => {
+        Some("self-update") | Some("update") => {
             std::process::exit(lusa::update::cli(&args[2..]));
         }
         Some("-e") => {
@@ -413,6 +440,24 @@ fn pkg_uninstall(name: &str) -> i32 {
     }
     println!("uninstalled: {}", name);
     0
+}
+
+/// Runs a complete program in bytecode mode; 0 on success, 1 on error.
+pub fn run_vm_source(src: &str, filename: &str) -> i32 {
+    match lusa::vm::run_source_vm(src) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{}", line);
+            }
+            let _ = std::io::stdout().flush();
+            0
+        }
+        Err(e) => {
+            let _ = std::io::stdout().flush();
+            eprint!("{}(bytecode vm)", render(&e, src, filename));
+            1
+        }
+    }
 }
 
 /// Runs a complete program; 0 on success, 1 on error.

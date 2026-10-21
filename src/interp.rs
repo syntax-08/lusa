@@ -26,6 +26,8 @@ pub struct Interp {
     pub globals: ScopeRef,
     pub out: Vec<String>,
     pub depth: usize,
+    /// bytecode VM state (`--vm` runs compile + execute here)
+    pub vm: crate::vm::Vm,
 }
 
 pub struct Frame {
@@ -63,6 +65,7 @@ impl Interp {
             globals: scope::new_scope(true),
             out: Vec::new(),
             depth: 0,
+            vm: crate::vm::Vm::new(),
         }
     }
 
@@ -361,6 +364,12 @@ impl Interp {
                         Ok(std::mem::take(&mut f2.ret))
                     }
                     FuncBody::Builtin(b) => b(self, args, span),
+                    FuncBody::Vm(compiled, upvals) => {
+                        self.depth += 1;
+                        let res = crate::vm::invoke(self, compiled, upvals.clone(), args, span);
+                        self.depth -= 1;
+                        res
+                    }
                 }
             }
             other => Err(LusaError::new(

@@ -101,7 +101,7 @@ fn rename_owner(v: &Value, label: &str, span: Span) {
 // ===== plain evaluation =====
 
 /// Reads a field index-style: mistakes report E_INDEX; moved slots read nil.
-fn read_field(obj: &Value, key: &Value, span: Span) -> LResult<Value> {
+pub(crate) fn read_field(obj: &Value, key: &Value, span: Span) -> LResult<Value> {
     let t = as_table(obj).ok_or_else(|| index_err(obj, span))?;
     let slot = t.get_slot(key);
     match slot {

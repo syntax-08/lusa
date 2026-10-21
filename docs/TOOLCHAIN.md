@@ -91,6 +91,7 @@ success — if something interrupts it, just rename `lusa.exe.old` back.
 |----------------------------------|--------------------------------------------------|-----------------------------------------------|
 | `lusalang version` / `lusa -v`   | runtime version                                  |                                               |
 | `lusalang run <file.lusa>`       | runs a program                                   | path relative to the current directory        |
+| `lusalang run <file.lusa> --vm`  | runs through the **bytecode VM**                 | same program, compiled to instructions first  |
 | `lusalang check <file.lusa>`     | validates **lex+parse** and exits (0 ok, 1 fail) | **does not execute**; only catches code errors |
 | `lusalang new <name>`            | creates `<name>\main.lusa` + `<name>\README.md`  | scaffold ships with a working demo            |
 | `lusalang repl` / `lusa`         | interactive REPL                                 | multi-line, `:quit` to exit                   |
@@ -304,3 +305,25 @@ Editors talk to it via `Content-Length` JSON-RPC frames on stdio — a generic
 LSP client configuration works. Diagnostics currently cover lex/parse
 (static); ownership errors (E1xxx) are runtime checks and appear when you
 `run` the program. Completion and hover are on the roadmap.
+
+
+---
+
+## 8. Two engines: interpreter and bytecode VM
+
+Lusa ships two execution engines that produce **identical results** (42
+integration tests assert output and error-code parity between them):
+
+| engine      | how it runs                                       | when to use                            |
+|-------------|---------------------------------------------------|----------------------------------------|
+| interpreter | walks the AST directly                            | default; best diagnostics with spans   |
+| bytecode VM | compiles to instructions, then runs a stack VM   | `--vm` flag; the base for future speed |
+
+```sh
+lusalang run main.lusa        # interpreter (default)
+lusalang run main.lusa --vm   # compile + run on the bytecode VM
+```
+
+Both speak the same language, including the ownership model (`move` via plain
+assignment, `clone`, `borrow` — note: `borrow` is interpreter-only for now),
+pcall error handling and E-codes.

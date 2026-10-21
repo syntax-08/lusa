@@ -12,7 +12,6 @@ use std::process::Command;
 
 use crate::lsp::Json;
 
-const REPO: &str = "syntax-08/lusa";
 const API_URL: &str = "https://api.github.com/repos/syntax-08/lusa/releases/latest";
 pub const ASSET_NAME: &str = "lusa-setup.zip";
 
