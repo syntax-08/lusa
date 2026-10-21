@@ -15,7 +15,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::ast::*;
-use crate::error::{LResult, LusaError, Span};
+use crate::error::{LResult, LusaError, SourceMap, Span};
 use crate::value::Value;
 
 // ===== compiled units =====
@@ -50,6 +50,50 @@ pub struct Chunk {
     pub upval_labels: Vec<Arc<str>>,
     /// `DeclFromSeg` binding groups, kept out of line so `Instr` stays `Copy`
     pub decl_groups: Vec<Vec<(u16, u16)>>,
+    /// Parallel to `code`: 1-based source line that emitted each instruction.
+    ///
+    /// This is *cold* metadata. The dispatch loop never reads it, so it costs
+    /// address space per instruction but no work in the common path; only the
+    /// error path (`Chunk::span_at`) touches it.
+    pub lines: Vec<u32>,
+    /// Parallel to `code`: local binding referenced by the instruction.
+    ///
+    /// Registers are reused between sibling scopes, so a single per-slot label
+    /// is not enough to describe an ownership error. The compiler snapshots the
+    /// binding name at emission time and the VM reads it only when raising.
+    pub local_names: Vec<Option<Arc<str>>>,
+    /// Shared line index for the whole source file (nested chunks point to the
+    /// same map, so a closure error still resolves to the original line).
+    pub source_map: Option<Arc<SourceMap>>,
+}
+
+impl Chunk {
+    /// Source line of instruction `pc`, or 0 when the chunk has no debug info.
+    #[inline]
+    pub fn line_at(&self, pc: usize) -> u32 {
+        self.lines.get(pc).copied().unwrap_or(0)
+    }
+
+    /// Exact source span of instruction `pc`, reconstructed from its line.
+    /// Called only on the error path.
+    pub fn span_at(&self, pc: usize) -> Span {
+        match &self.source_map {
+            Some(map) => map.span_of_line(self.line_at(pc)),
+            None => Span::new(0, 0),
+        }
+    }
+
+    /// Binding name to show in an ownership diagnostic. Falls back to the
+    /// per-slot label for instructions that do not name a single local
+    /// (parameters, hidden loop slots).
+    #[inline]
+    pub fn local_name_at(&self, pc: usize, slot: usize) -> Arc<str> {
+        self.local_names
+            .get(pc)
+            .and_then(|name| name.clone())
+            .or_else(|| self.slot_labels.get(slot).cloned())
+            .unwrap_or_else(|| Arc::from("(local)"))
+    }
 }
 
 /// Stack-machine instructions. `i32` jump fields hold **absolute instruction
@@ -81,6 +125,10 @@ pub enum Instr {
     // single-value assignment fast path: no segment bookkeeping
     SetLoc(u16), // TOS = value
     SetUp(u16),  // TOS = value
+    /// Detaches a closure-captured cell before its register is handed to a new
+    /// lexical binding. The closure keeps the old `Rc<RefCell<SlotV>>`; the
+    /// register gets a fresh direct cell. Never emitted for uncaptured slots.
+    ResetSlot(u16),
     SetFieldK(u16), // TOS = obj, below = value
     SetIndex,      // TOS = key, under1 = obj, under2 = value
     SetArr,        // TOS = value, under = table (appends via next_arr)
@@ -166,15 +214,50 @@ pub enum Instr {
 
 // ===== compiler state =====
 
+/// One register in a frame. `captured` is the compiler's record that a closure
+/// took this slot as an upvalue; it drives the `ResetSlot` emission.
+#[derive(Clone)]
+struct SlotInfo {
+    name: Arc<str>,
+    captured: bool,
+}
+
+/// One lexical level inside a function.
+///
+/// `names` is only a compile-time resolver (AST name → register). It never
+/// reaches the VM. `slots` records every register opened at this level, so the
+/// allocator can return them to the free list when the block ends.
+struct Scope {
+    names: HashMap<String, u16>,
+    slots: Vec<u16>,
+}
+
+impl Scope {
+    fn new() -> Scope {
+        Scope {
+            names: HashMap::new(),
+            slots: Vec::new(),
+        }
+    }
+}
+
 /// One function-in-progress. Lives in `Compiler.frames`; nesting is expressed
 /// with the parent *index* (no recursive borrows).
 struct Frame {
     name: String,
     parent: Option<usize>,
-    /// shadow levels: name → slot
-    scopes: Vec<HashMap<String, u16>>,
-    /// slot → declared name (ownership labels)
-    slots: Vec<String>,
+    /// lexical levels: name → register
+    scopes: Vec<Scope>,
+    /// register file layout: slot → binding info (high-water mark = `nlocals`)
+    slots: Vec<SlotInfo>,
+    /// registers released by finished blocks, ready for reuse
+    free_slots: Vec<u16>,
+    /// current source line, stamped onto every emitted instruction
+    line: u32,
+    /// parallel to `code` — see `Chunk::lines`
+    lines: Vec<u32>,
+    /// parallel to `code` — see `Chunk::local_names`
+    local_names: Vec<Option<Arc<str>>>,
     consts: Vec<ConstKey>,
     consts_idx: HashMap<ConstKey, u16>,
     protos: Vec<Rc<Compiled>>,
@@ -220,7 +303,8 @@ impl ConstKey {
 
 struct Compiler {
     frames: Vec<Frame>,
-    _dummy: (),
+    /// Shared by every chunk produced from this source file.
+    source: Arc<SourceMap>,
 }
 
 impl Frame {
@@ -228,8 +312,12 @@ impl Frame {
         Frame {
             name: name.into(),
             parent,
-            scopes: vec![HashMap::new()],
+            scopes: vec![Scope::new()],
             slots: Vec::new(),
+            free_slots: Vec::new(),
+            line: 1,
+            lines: Vec::new(),
+            local_names: Vec::new(),
             consts: Vec::new(),
             consts_idx: HashMap::new(),
             protos: Vec::new(),
@@ -244,8 +332,8 @@ impl Frame {
     }
 
     fn find_local(&self, name: &str) -> Option<u16> {
-        for m in self.scopes.iter().rev() {
-            if let Some(&slot) = m.get(name) {
+        for scope in self.scopes.iter().rev() {
+            if let Some(&slot) = scope.names.get(name) {
                 return Some(slot);
             }
         }
@@ -262,13 +350,38 @@ impl Compiler {
         self.frames.len() - 1
     }
 
+    /// Emits one instruction, stamping the current line and binding name into
+    /// the cold debug side-tables in the same step. Keeping all three vectors
+    /// in lockstep here is what makes the parallel mapping reliable.
     fn em(&mut self, i: Instr) -> usize {
-        self.cur().code.push(i);
-        self.cur().code.len() - 1
+        let f = self.cur();
+        let line = f.line;
+        let local = match i {
+            Instr::GetLoc(s)
+            | Instr::SetLoc(s)
+            | Instr::TakeLoc(s, _)
+            | Instr::ArgLoc(s, _)
+            | Instr::StoreLocSeg(s) => f.slots.get(s as usize).map(|info| info.name.clone()),
+            Instr::ForNumInit { var, .. } | Instr::ForNumStep { var, .. } => {
+                f.slots.get(var as usize).map(|info| info.name.clone())
+            }
+            _ => None,
+        };
+        f.code.push(i);
+        f.lines.push(line);
+        f.local_names.push(local);
+        f.code.len() - 1
     }
 
     fn pos(&self) -> usize {
         self.frames.last().map(|f| f.code.len()).unwrap_or(0)
+    }
+
+    /// Sets the line stamped on following instructions. `Span` is char-offset
+    /// based, so this is one binary search over the shared `SourceMap`.
+    fn set_line(&mut self, span: Span) {
+        let line = self.source.line_of(span.start);
+        self.cur().line = line;
     }
 
     fn konst(&mut self, k: &ConstKey) -> u16 {
@@ -286,24 +399,80 @@ impl Compiler {
         self.konst(&ConstKey::Str(s.to_string()))
     }
 
-    /// Declares a fresh local slot in the current shadow level.
+    /// Allocates a register for a new lexical binding.
+    ///
+    /// Registers are handed out from the lowest free index, so a straight-line
+    /// function still gets R0, R1, R2, …; when a block ends its registers go
+    /// back to `free_slots` and the next sibling block reuses them. The chunk's
+    /// `nlocals` is therefore a high-water mark, not a declaration count.
     fn declare(&mut self, name: &str) -> u16 {
-        let f = self.cur();
-        let slot = f.slots.len() as u16;
-        f.slots.push(name.to_string());
-        f.scopes
-            .last_mut()
-            .expect("scope levels are never empty")
-            .insert(name.to_string(), slot);
+        let (slot, needs_reset) = {
+            let f = self.cur();
+            let slot = match f.free_slots.pop() {
+                Some(slot) => slot,
+                None => {
+                    let slot = f.slots.len() as u16;
+                    f.slots.push(SlotInfo {
+                        name: Arc::from(""),
+                        captured: false,
+                    });
+                    slot
+                }
+            };
+            let info = &mut f.slots[slot as usize];
+            // A captured slot still points at the old closure's shared cell.
+            // Detach it before the new binding writes through it.
+            let needs_reset = info.captured;
+            info.name = Arc::from(name);
+            info.captured = false;
+            let scope = f.scopes.last_mut().expect("scope levels are never empty");
+            scope.names.insert(name.to_string(), slot);
+            scope.slots.push(slot);
+            (slot, needs_reset)
+        };
+        if needs_reset {
+            self.em(Instr::ResetSlot(slot));
+        }
         slot
     }
 
     fn push_shadow(&mut self) {
-        self.cur().scopes.push(HashMap::new());
+        self.cur().scopes.push(Scope::new());
+    }
+
+    /// Closes the current lexical level.
+    ///
+    /// Captured registers get a `ResetSlot` at the end of the block. Besides
+    /// making the register safe to reuse, this gives each loop iteration a
+    /// fresh cell for captured locals — closures from different iterations must
+    /// not alias one another. Uncaptured registers need no instruction at all:
+    /// the next declaration simply overwrites the direct cell.
+    fn close_scope(&mut self) {
+        let captured: Vec<u16> = {
+            let f = self.cur();
+            let scope = f.scopes.last().expect("scope levels are never empty");
+            scope
+                .slots
+                .iter()
+                .copied()
+                .filter(|&slot| f.slots[slot as usize].captured)
+                .collect()
+        };
+        for slot in captured {
+            self.em(Instr::ResetSlot(slot));
+        }
     }
 
     fn pop_shadow(&mut self) {
-        self.cur().scopes.pop();
+        self.close_scope();
+        let scope = self
+            .cur()
+            .scopes
+            .pop()
+            .expect("scope levels are never empty");
+        // Reuse the most recently released registers first. This keeps the
+        // allocation pattern stable when blocks are nested.
+        self.cur().free_slots.extend(scope.slots.into_iter().rev());
     }
 
     /// Patches an already-emitted jump to an absolute instruction index.
@@ -349,7 +518,12 @@ fn resolve(c: &mut Compiler, name: &str) -> Resolved {
             let mut j = level + 1;
             while j <= top {
                 let def = if j == level + 1 {
-                    UpDef::Local(c.frames[level].find_local(name).expect("checked above"))
+                    let slot = c.frames[level].find_local(name).expect("checked above");
+                    // Record that this register's cell escapes into a closure.
+                    // `close_scope`/`declare` will emit a detachment before the
+                    // register is reused.
+                    c.frames[level].slots[slot as usize].captured = true;
+                    UpDef::Local(slot)
                 } else {
                     UpDef::Up(cur_idx)
                 };
@@ -399,6 +573,9 @@ fn emit_var_load(c: &mut Compiler, name: &str) {
 /// (builtins restore — they never take ownership; user functions commit).
 /// Returns true when a take op was emitted (call sites count them).
 fn compile_take_value(c: &mut Compiler, e: &Expr, dest: &str, arg: bool) -> LResult<bool> {
+    // Moving reads belong to the source expression, which may be on a
+    // different line from the statement that owns it.
+    c.set_line(e.span);
     match &e.kind {
         ExprKind::Var(name) => {
             let lk = c.konst_str(dest);
@@ -440,6 +617,7 @@ fn compile_take_value(c: &mut Compiler, e: &Expr, dest: &str, arg: bool) -> LRes
             };
             let sk = c.konst_str(&src);
             let lk = c.konst_str(dest);
+            c.set_line(e.span);
             if arg {
                 c.em(Instr::ArgField(k, sk, lk));
             } else {
@@ -458,6 +636,7 @@ fn compile_take_value(c: &mut Compiler, e: &Expr, dest: &str, arg: bool) -> LRes
             };
             let sk = c.konst_str(&src);
             let lk = c.konst_str(dest);
+            c.set_line(e.span);
             if arg {
                 c.em(Instr::ArgIndex(sk, lk));
             } else {
@@ -480,6 +659,7 @@ fn compile_take_value(c: &mut Compiler, e: &Expr, dest: &str, arg: bool) -> LRes
 /// Compiles a value whose results may be multi (calls already push all of
 /// theirs through `CallExp`; `...` must push the whole rest here).
 fn compile_expand_value(c: &mut Compiler, e: &Expr) -> LResult<()> {
+    c.set_line(e.span);
     match &e.kind {
         ExprKind::Vararg => {
             c.em(Instr::VarargLoad);
@@ -504,6 +684,10 @@ fn scalar_of(e: &Expr) -> Value {
 
 /// Compiles an expression in *single-value* position: pushes exactly one value.
 fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
+    // Every instruction emitted below inherits this line unless a nested
+    // expression updates it. Ownership faults point at the variable read/write,
+    // which is exactly the node that sets the line on entry.
+    c.set_line(e.span);
     match &e.kind {
         ExprKind::Nil | ExprKind::True | ExprKind::False | ExprKind::Num(_) => {
             let k = c.konst(&ConstKey::of(&scalar_of(e)));
@@ -514,25 +698,28 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
         ExprKind::Field { obj, name } => {
             compile_expr(c, obj)?;
             let k = c.konst_str(name);
+            c.set_line(e.span);
             c.em(Instr::GetField(k));
         }
         ExprKind::Index { obj, key } => {
             compile_expr(c, obj)?;
             compile_expr(c, key)?;
+            c.set_line(e.span);
             c.em(Instr::GetIndex);
         }
         ExprKind::Paren(inner) => {
             compile_expr(c, inner)?;
+            c.set_line(e.span);
             emit_truncate_one(c);
         }
         ExprKind::Vararg => {
             c.em(Instr::VarargLoadOne);
         }
         ExprKind::Call { callee, args, span_args_end } => {
-            compile_call(c, callee, args, *span_args_end)?;
+            compile_call(c, callee, args, e.span, *span_args_end)?;
         }
         ExprKind::Method { obj, name, args, span_args_end } => {
-            compile_method(c, obj, name, args, *span_args_end)?;
+            compile_method(c, obj, name, args, e.span, *span_args_end)?;
         }
         ExprKind::Table(entries) => compile_table(c, entries)?,
         ExprKind::Func(lit) => {
@@ -543,6 +730,7 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
             truncate_if_expansion(c, l);
             compile_expr(c, r)?;
             truncate_if_expansion(c, r);
+            c.set_line(e.span);
             c.em(match op {
                 BinOp::Add => Instr::Add,
                 BinOp::Sub => Instr::Sub,
@@ -563,6 +751,7 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
         ExprKind::Log { op, l, r } => {
             compile_expr(c, l)?;
             truncate_if_expansion(c, l);
+            c.set_line(e.span);
             let skip = match op {
                 LogOp::And => c.em(Instr::JumpIfFalseKeep(0)),
                 LogOp::Or => c.em(Instr::JumpIfTrueKeep(0)),
@@ -570,12 +759,14 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
             c.em(Instr::Pop);
             compile_expr(c, r)?;
             truncate_if_expansion(c, r);
+            c.set_line(e.span);
             let end = c.pos();
             c.patch(skip, end);
         }
         ExprKind::Un { op, e: inner } => {
             compile_expr(c, inner)?;
             truncate_if_expansion(c, inner);
+            c.set_line(e.span);
             c.em(match op {
                 UnOp::Neg => Instr::Neg,
                 UnOp::Not => Instr::Not,
@@ -588,6 +779,7 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
         ExprKind::Clone { e: inner } => {
             compile_expr(c, inner)?;
             truncate_if_expansion(c, inner);
+            c.set_line(e.span);
             c.em(Instr::CloneV);
         }
     }
@@ -661,7 +853,13 @@ fn compile_interp_str(c: &mut Compiler, segs: &[StrAstSeg]) -> LResult<()> {
 // ===== calls =====
 
 /// Compiles a call: callee first, then args; only the LAST arg keeps expansion.
-fn compile_call(c: &mut Compiler, callee: &Expr, args: &[Expr], _end: Span) -> LResult<()> {
+fn compile_call(
+    c: &mut Compiler,
+    callee: &Expr,
+    args: &[Expr],
+    span: Span,
+    _end: Span,
+) -> LResult<()> {
     compile_expr(c, callee)?;
     truncate_if_expansion(c, callee);
     let n = args.len();
@@ -675,6 +873,7 @@ fn compile_call(c: &mut Compiler, callee: &Expr, args: &[Expr], _end: Span) -> L
             truncate_if_expansion(c, arg);
         }
     }
+    c.set_line(span);
     if n > 0 && is_expansion(&args[n - 1]) {
         c.em(Instr::CallExp((n - 1) as u16, nt as u16));
     } else {
@@ -684,7 +883,14 @@ fn compile_call(c: &mut Compiler, callee: &Expr, args: &[Expr], _end: Span) -> L
 }
 
 /// Compiles `obj:name(args...)`.
-fn compile_method(c: &mut Compiler, obj: &Expr, name: &str, args: &[Expr], _end: Span) -> LResult<()> {
+fn compile_method(
+    c: &mut Compiler,
+    obj: &Expr,
+    name: &str,
+    args: &[Expr],
+    span: Span,
+    _end: Span,
+) -> LResult<()> {
     compile_expr(c, obj)?;
     truncate_if_expansion(c, obj);
     let k = c.konst_str(name);
@@ -699,6 +905,7 @@ fn compile_method(c: &mut Compiler, obj: &Expr, name: &str, args: &[Expr], _end:
             truncate_if_expansion(c, arg);
         }
     }
+    c.set_line(span);
     if n > 0 && is_expansion(&args[n - 1]) {
         c.em(Instr::MethodCallExp(k, (n - 1) as u16, nt as u16));
     } else {
@@ -719,16 +926,19 @@ fn compile_table(c: &mut Compiler, entries: &[TableEntry]) -> LResult<()> {
                 truncate_if_expansion(c, key);
                 let _ = compile_take_value(c, &entry.value, "(into table)", false)?;
                 truncate_if_expansion(c, &entry.value);
+                c.set_line(entry.span);
                 c.em(Instr::SetIndex);
             }
             None => {
                 if is_last && is_expansion(&entry.value) {
                     compile_expand_value(c, &entry.value)?;
+                    c.set_line(entry.span);
                     c.em(Instr::SetArrExp);
                 } else {
                     let dest = format!("item {}", c.pos());
                     let _ = compile_take_value(c, &entry.value, &dest, false)?;
                     truncate_if_expansion(c, &entry.value);
+                    c.set_line(entry.span);
                     c.em(Instr::SetArr);
                 }
             }
@@ -742,6 +952,7 @@ fn compile_nested_fn(c: &mut Compiler, lit: &FuncLit, name: &str) -> LResult<()>
     let parent = c.top();
     let has_vararg = lit.has_vararg;
     c.frames.push(Frame::new(format!("{}::{}", c.frames[parent].name, name), Some(parent)));
+    c.set_line(lit.span_body);
     {
         let f = c.cur();
         f.has_vararg = has_vararg;
@@ -764,9 +975,12 @@ fn compile_nested_fn(c: &mut Compiler, lit: &FuncLit, name: &str) -> LResult<()>
             consts: frame.consts.iter().map(|k| k.to_value()).collect(),
             code: frame.code,
             prototypes: frame.protos,
-            slot_labels: frame.slots.iter().map(|s| Arc::from(s.as_str())).collect(),
+            slot_labels: frame.slots.iter().map(|s| s.name.clone()).collect(),
             upval_labels: frame.upval_labels.iter().map(|s| Arc::from(s.as_str())).collect(),
             decl_groups: frame.decl_groups,
+            lines: frame.lines,
+            local_names: frame.local_names,
+            source_map: Some(c.source.clone()),
         }),
         upvals: frame.upvals,
     });
@@ -787,11 +1001,13 @@ fn compile_block(c: &mut Compiler, block: &Block) -> LResult<()> {
 }
 
 fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
+    c.set_line(st.span);
     match &st.kind {
-        StKind::Local { targets, values } => compile_local(c, targets, values)?,
-        StKind::Assign { targets, values } => compile_assign(c, targets, values)?,
+        StKind::Local { targets, values } => compile_local(c, targets, values, st.span)?,
+        StKind::Assign { targets, values } => compile_assign(c, targets, values, st.span)?,
         StKind::ExprSt(e) => {
             compile_expr(c, e)?;
+            c.set_line(st.span);
             if is_expansion(e) {
                 c.em(Instr::DropValues);
             } else {
@@ -806,13 +1022,16 @@ fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
         StKind::Repeat { body, cond } => compile_repeat(c, body, cond)?,
         StKind::ForNum { var, start, limit, step, body } => {
             let sp = step.as_ref();
-            compile_for_num(c, var, start, limit, sp, body)?
+            compile_for_num(c, var, start, limit, sp, body, st.span)?
         }
-        StKind::ForIter { vars, values, body } => compile_for_iter(c, vars, values, body)?,
+        StKind::ForIter { vars, values, body } => {
+            compile_for_iter(c, vars, values, body, st.span)?
+        }
         StKind::FuncSt { target, func } => compile_func_st(c, target, func)?,
         StKind::Do { body } => compile_block(c, body)?,
-        StKind::Return { values, .. } => compile_return(c, values)?,
+        StKind::Return { values, span } => compile_return(c, values, *span)?,
         StKind::Break => {
+            c.set_line(st.span);
             let at = c.em(Instr::Jump(0));
             // record under the innermost loop
             if let Some(loops) = c.cur().breaks.last_mut() {
@@ -831,7 +1050,8 @@ fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
 
 /// `local a, b = v1, v2`: values first, then fresh slots (Lua rule: the value
 /// expressions see enclosing variables of the same name).
-fn compile_local(c: &mut Compiler, targets: &[String], values: &[Expr]) -> LResult<()> {
+fn compile_local(c: &mut Compiler, targets: &[String], values: &[Expr], span: Span) -> LResult<()> {
+    c.set_line(span);
     c.em(Instr::SegStart);
     // slots pre-declared before their value (`local function f()` recursion)
     let mut pre_slots: Vec<Option<u16>> = vec![None; targets.len()];
@@ -853,6 +1073,7 @@ fn compile_local(c: &mut Compiler, targets: &[String], values: &[Expr]) -> LResu
     }
     // bind targets to slots — fresh for plain locals, reusing the pre-declared
     // slot when the value was a function (recursion capture) — map names to consts
+    c.set_line(span);
     let mut slot_name: Vec<(u16, u16)> = Vec::new();
     for (i, t) in targets.iter().enumerate() {
         let slot = match pre_slots[i] {
@@ -864,12 +1085,13 @@ fn compile_local(c: &mut Compiler, targets: &[String], values: &[Expr]) -> LResu
     }
     let group_idx = c.cur().decl_groups.len() as u16;
     c.cur().decl_groups.push(slot_name);
+    c.set_line(span);
     c.em(Instr::DeclFromSeg(group_idx));
     c.em(Instr::SegEnd);
     Ok(())
 }
 
-fn compile_assign(c: &mut Compiler, targets: &[Expr], values: &[Expr]) -> LResult<()> {
+fn compile_assign(c: &mut Compiler, targets: &[Expr], values: &[Expr], span: Span) -> LResult<()> {
     // Single target, single non-expanding value: the segment machinery exists
     // to account for multi-value groups, but here it only costs three extra
     // instructions. Emit a direct store instead (the hot loop assignment path).
@@ -877,6 +1099,7 @@ fn compile_assign(c: &mut Compiler, targets: &[Expr], values: &[Expr]) -> LResul
         if let ExprKind::Var(name) = &targets[0].kind {
             let dest = format!("`{}`", name);
             let _ = compile_take_value(c, &values[0], &dest, false)?;
+            c.set_line(targets[0].span);
             match resolve(c, name) {
                 Resolved::Local(slot) => {
                     c.em(Instr::SetLoc(slot));
@@ -907,6 +1130,7 @@ fn compile_assign(c: &mut Compiler, targets: &[Expr], values: &[Expr]) -> LResul
         }
     }
     for t in targets {
+        c.set_line(t.span);
         match &t.kind {
             ExprKind::Var(name) => match resolve(c, name) {
                 Resolved::Local(slot) => {
@@ -939,6 +1163,7 @@ fn compile_assign(c: &mut Compiler, targets: &[Expr], values: &[Expr]) -> LResul
             }
         }
     }
+    c.set_line(span);
     c.em(Instr::SegEnd);
     Ok(())
 }
@@ -949,10 +1174,12 @@ fn compile_if(c: &mut Compiler, branches: &[(Expr, Block)], else_block: Option<&
     for (i, (cond, body)) in branches.iter().enumerate() {
         compile_expr(c, cond)?;
         truncate_if_expansion(c, cond);
+        c.set_line(cond.span);
         let jump = c.em(Instr::JumpIfFalse(0));
         compile_block(c, body)?;
         let span = cond.span;
         if i + 1 < n || else_block.is_some() {
+            c.set_line(cond.span);
             end_jumps.push(c.em(Instr::Jump(0)));
         }
         let _ = span;
@@ -973,11 +1200,13 @@ fn compile_while(c: &mut Compiler, cond: &Expr, body: &Block) -> LResult<()> {
     let start = c.pos();
     compile_expr(c, cond)?;
     truncate_if_expansion(c, cond);
+    c.set_line(cond.span);
     let exit = c.em(Instr::JumpIfFalse(0));
     c.cur().breaks.push(Vec::new());
     compile_block(c, body)?;
     let breaks = c.cur().breaks.pop().expect("loop breaks pushed");
     let back = start;
+    c.set_line(cond.span);
     c.em(Instr::Jump(back as i32));
     let end = c.pos();
     for b in breaks {
@@ -998,6 +1227,7 @@ fn compile_repeat(c: &mut Compiler, body: &Block, cond: &Expr) -> LResult<()> {
     compile_expr(c, cond)?;
     c.pop_shadow();
     let breaks = c.cur().breaks.pop().expect("loop breaks pushed");
+    c.set_line(cond.span);
     let _ = c.em(Instr::JumpIfFalse(start as i32));
     let end = c.pos();
     for b in breaks {
@@ -1006,7 +1236,15 @@ fn compile_repeat(c: &mut Compiler, body: &Block, cond: &Expr) -> LResult<()> {
     Ok(())
 }
 
-fn compile_for_num(c: &mut Compiler, var: &str, start: &Expr, limit: &Expr, step: Option<&Expr>, body: &Block) -> LResult<()> {
+fn compile_for_num(
+    c: &mut Compiler,
+    var: &str,
+    start: &Expr,
+    limit: &Expr,
+    step: Option<&Expr>,
+    body: &Block,
+    span: Span,
+) -> LResult<()> {
     // start, limit, step are evaluated BEFORE the loop variable is declared
     compile_expr(c, start)?;
     truncate_if_expansion(c, start);
@@ -1024,12 +1262,15 @@ fn compile_for_num(c: &mut Compiler, var: &str, start: &Expr, limit: &Expr, step
     }
     // hidden slot layout: [var, limit, step]
     c.push_shadow();
+    c.set_line(span);
     let var_slot = c.declare(var);
     let limit_slot = c.declare("(for limit)");
     let step_slot = c.declare("(for step)");
     c.cur().breaks.push(Vec::new());
+    c.set_line(span);
     let init = c.em(Instr::ForNumInit { var: var_slot, limit: limit_slot, step: step_slot, end: 0 });
     compile_block(c, body)?;
+    c.set_line(span);
     let step_at = c.em(Instr::ForNumStep { var: var_slot, limit: limit_slot, step: step_slot, top: (init + 1) as i32, end: 0 });
     let breaks = c.cur().breaks.pop().expect("loop breaks pushed");
     let end = c.pos();
@@ -1041,7 +1282,13 @@ fn compile_for_num(c: &mut Compiler, var: &str, start: &Expr, limit: &Expr, step
     Ok(())
 }
 
-fn compile_for_iter(c: &mut Compiler, vars: &[String], values: &[Expr], body: &Block) -> LResult<()> {
+fn compile_for_iter(
+    c: &mut Compiler,
+    vars: &[String],
+    values: &[Expr],
+    body: &Block,
+    span: Span,
+) -> LResult<()> {
     c.em(Instr::SegStart);
     let n = values.len();
     for (i, v) in values.iter().enumerate() {
@@ -1052,6 +1299,7 @@ fn compile_for_iter(c: &mut Compiler, vars: &[String], values: &[Expr], body: &B
         }
     }
     c.push_shadow();
+    c.set_line(span);
     // hidden iterator slot first, then the loop variables
     let iter_slot = c.declare("(iter)");
     let mut first = iter_slot + 1;
@@ -1061,8 +1309,10 @@ fn compile_for_iter(c: &mut Compiler, vars: &[String], values: &[Expr], body: &B
     }
     let nvars = vars.len() as u16;
     c.cur().breaks.push(Vec::new());
+    c.set_line(span);
     let setup = c.em(Instr::ForInSetup { iter: iter_slot, first, nvars, end: 0 });
     compile_block(c, body)?;
+    c.set_line(span);
     let step_at = c.em(Instr::ForInStep { iter: iter_slot, first, nvars, top: (setup + 1) as i32, end: 0 });
     let breaks = c.cur().breaks.pop().expect("loop breaks pushed");
     let end = c.pos();
@@ -1084,22 +1334,30 @@ fn compile_func_st(c: &mut Compiler, target: &Expr, func: &FuncLit) -> LResult<(
                 Resolved::Local(slot) => {
                     // slot exists already (reuse) or declare fresh then store
                     compile_expr(c, &Expr { kind: ExprKind::Func(func.clone()), span: target.span })?;
+                    c.set_line(target.span);
                     let fall = c.em(Instr::StoreLocSeg(slot));
                     let _ = fall;
                 }
                 Resolved::Upval(i) => {
                     compile_expr(c, &Expr { kind: ExprKind::Func(func.clone()), span: target.span })?;
+                    c.set_line(target.span);
                     c.em(Instr::StoreUpSeg(i));
                 }
                 Resolved::Global => {
                     compile_expr(c, &Expr { kind: ExprKind::Func(func.clone()), span: target.span })?;
+                    c.set_line(target.span);
                     let k = c.konst_str(name);
                     c.em(Instr::StoreGlobSeg(k));
                 }
             };
         }
         ExprKind::Field { .. } | ExprKind::Index { .. } => {
-            compile_assign(c, &[target.clone()], &[Expr { kind: ExprKind::Func(func.clone()), span: target.span }])?;
+            compile_assign(
+                c,
+                &[target.clone()],
+                &[Expr { kind: ExprKind::Func(func.clone()), span: target.span }],
+                target.span,
+            )?;
         }
         _ => {
             return Err(LusaError::new(
@@ -1112,7 +1370,7 @@ fn compile_func_st(c: &mut Compiler, target: &Expr, func: &FuncLit) -> LResult<(
     Ok(())
 }
 
-fn compile_return(c: &mut Compiler, values: &[Expr]) -> LResult<()> {
+fn compile_return(c: &mut Compiler, values: &[Expr], span: Span) -> LResult<()> {
     let n = values.len();
     for (i, v) in values.iter().enumerate() {
         let _ = compile_take_value(c, v, "(return)", false)?;
@@ -1120,6 +1378,7 @@ fn compile_return(c: &mut Compiler, values: &[Expr]) -> LResult<()> {
             truncate_if_expansion(c, v);
         }
     }
+    c.set_line(span);
     if n > 0 && is_expansion(&values[n - 1]) {
         c.em(Instr::RetExp((n - 1) as u16));
     } else {
@@ -1132,8 +1391,12 @@ fn compile_return(c: &mut Compiler, values: &[Expr]) -> LResult<()> {
 /// Compiles a whole source program into a runnable main chunk.
 /// Top-level statements compile as the body of a chunk named "main".
 pub fn compile_program(src: &str) -> LResult<Rc<Compiled>> {
+    let source = Arc::new(SourceMap::new(src));
     let ast = crate::parser::parse(src)?;
-    let c = &mut Compiler { frames: vec![Frame::new("main", None)], _dummy: () };
+    let c = &mut Compiler {
+        frames: vec![Frame::new("main", None)],
+        source,
+    };
     {
         let f = c.cur();
         f.has_vararg = true; // top level may use `...` like the REPL needs
@@ -1155,10 +1418,132 @@ pub fn compile_program(src: &str) -> LResult<Rc<Compiled>> {
             consts: f.consts.iter().map(|k| k.to_value()).collect(),
             code: f.code,
             prototypes: f.protos,
-            slot_labels: f.slots.iter().map(|s| Arc::from(s.as_str())).collect(),
+            slot_labels: f.slots.iter().map(|s| s.name.clone()).collect(),
             upval_labels: f.upval_labels.iter().map(|s| Arc::from(s.as_str())).collect(),
             decl_groups: f.decl_groups,
+            lines: f.lines,
+            local_names: f.local_names,
+            source_map: Some(c.source.clone()),
         }),
         upvals: f.upvals,
     }))
+}
+
+// ===== tests =====
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Registers bound by each `local` statement, in declaration order.
+    fn declared_slots(compiled: &Compiled) -> Vec<u16> {
+        compiled
+            .proto
+            .decl_groups
+            .iter()
+            .map(|group| group[0].0)
+            .collect()
+    }
+
+    #[test]
+    fn straight_line_locals_get_incremental_registers() {
+        let compiled = compile_program("local a = 1\nlocal b = 2\nlocal c = 3\n").unwrap();
+        assert_eq!(declared_slots(&compiled), vec![0, 1, 2]);
+        assert_eq!(compiled.proto.nlocals, 3);
+    }
+
+    #[test]
+    fn sibling_blocks_reuse_the_same_registers() {
+        let compiled =
+            compile_program("do local a = 1 local b = 2 end\ndo local c = 3 local d = 4 end\n")
+                .unwrap();
+        // Both blocks reuse R0/R1: the high-water mark is 2, not 4.
+        assert_eq!(declared_slots(&compiled), vec![0, 1, 0, 1]);
+        assert_eq!(compiled.proto.nlocals, 2);
+    }
+
+    #[test]
+    fn nested_blocks_release_registers_lifo() {
+        let compiled = compile_program(
+            "do local a = 1 do local b = 2 end local c = 3 end\nlocal d = 4\n",
+        )
+        .unwrap();
+        // a -> R0, b -> R1, c reuses R1 after the inner block, d -> R0 again.
+        assert_eq!(declared_slots(&compiled), vec![0, 1, 1, 0]);
+        assert_eq!(compiled.proto.nlocals, 2);
+    }
+
+    #[test]
+    fn line_table_follows_the_expression_that_owns_the_instruction() {
+        // The source spans a line break: the diagnostics must follow `t`, not
+        // the `local` statement that owns it.
+        let src = "local t = {1}\nlocal u =\n    t\nprint(t)\n";
+        let compiled = compile_program(src).unwrap();
+        let take = compiled
+            .proto
+            .code
+            .iter()
+            .position(|i| matches!(i, Instr::TakeLoc(..)))
+            .expect("move of `t`");
+        assert_eq!(compiled.proto.lines[take], 3);
+        // `print(t)` compiles the argument as a deferred moving read.
+        let read = compiled
+            .proto
+            .code
+            .iter()
+            .position(|i| matches!(i, Instr::ArgLoc(..)))
+            .expect("read of `t`");
+        assert_eq!(compiled.proto.lines[read], 4);
+    }
+
+    #[test]
+    fn reused_register_keeps_the_binding_name_of_each_instruction() {
+        let src = "do\n    local x = {1}\n    local y = x\n    print(x)\nend\n\
+                   do\n    local z = 2\n    print(z)\nend\n";
+        let compiled = compile_program(src).unwrap();
+        let args: Vec<usize> = compiled
+            .proto
+            .code
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| matches!(i, Instr::ArgLoc(..)))
+            .map(|(pc, _)| pc)
+            .collect();
+        assert_eq!(args.len(), 2, "one moving read per print");
+        assert_eq!(
+            compiled.proto.local_names[args[0]].as_deref(),
+            Some("x"),
+            "first block must still name R0 as `x`"
+        );
+        assert_eq!(
+            compiled.proto.local_names[args[1]].as_deref(),
+            Some("z"),
+            "second block names the reused R0 as `z`"
+        );
+        let slot = |pc: usize| match compiled.proto.code[pc] {
+            Instr::ArgLoc(slot, _) => slot,
+            _ => unreachable!(),
+        };
+        assert_eq!(slot(args[0]), slot(args[1]), "the register was reused");
+    }
+
+    #[test]
+    fn reset_slot_is_emitted_only_for_captured_registers() {
+        let plain = compile_program("do local a = 1 end do local b = 2 end\n").unwrap();
+        assert!(!plain
+            .proto
+            .code
+            .iter()
+            .any(|i| matches!(i, Instr::ResetSlot(_))));
+
+        let captured = compile_program(
+            "local f\ndo local x = 1 f = function() return x end end\ndo local y = 2 print(y) end\n",
+        )
+        .unwrap();
+        assert!(captured
+            .proto
+            .code
+            .iter()
+            .any(|i| matches!(i, Instr::ResetSlot(_))));
+    }
 }

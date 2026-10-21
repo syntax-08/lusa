@@ -10,6 +10,56 @@ pub struct Span {
     pub end: usize,
 }
 
+/// Precomputed line index for a source string.
+///
+/// Offsets are **char** offsets, the same unit used by [`Span`]. The compiler
+/// uses this once per AST node to fill the per-chunk `lines` vector; the VM
+/// only consults it when an error is raised, so it never enters the hot
+/// dispatch path.
+#[derive(Debug)]
+pub struct SourceMap {
+    line_starts: Vec<usize>,
+    len: usize,
+}
+
+impl SourceMap {
+    pub fn new(src: &str) -> SourceMap {
+        let mut line_starts = Vec::with_capacity(16);
+        line_starts.push(0);
+        let mut len = 0;
+        for (i, ch) in src.chars().enumerate() {
+            len = i + 1;
+            if ch == '\n' {
+                line_starts.push(i + 1);
+            }
+        }
+        SourceMap { line_starts, len }
+    }
+
+    /// 1-based line containing a char offset.
+    #[inline]
+    pub fn line_of(&self, offset: usize) -> u32 {
+        let at = offset.min(self.len);
+        let idx = self.line_starts.partition_point(|&start| start <= at);
+        idx.max(1) as u32
+    }
+
+    /// Span covering `line` (1-based), excluding the trailing newline.
+    pub fn span_of_line(&self, line: u32) -> Span {
+        if line == 0 || self.line_starts.is_empty() {
+            return Span::new(0, 0);
+        }
+        let idx = (line as usize - 1).min(self.line_starts.len() - 1);
+        let start = self.line_starts[idx];
+        let end = self
+            .line_starts
+            .get(idx + 1)
+            .map(|&next| next.saturating_sub(1))
+            .unwrap_or(self.len);
+        Span::new(start, end.max(start))
+    }
+}
+
 impl Span {
     pub fn new(start: usize, end: usize) -> Self {
         Span { start, end }

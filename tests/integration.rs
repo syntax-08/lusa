@@ -711,6 +711,93 @@ fn vm_parity_ownership() {
 }
 
 #[test]
+fn vm_reuses_registers_without_aliasing_closures() {
+    // `x` and `y` share a register (different lexical blocks). The closure must
+    // keep reading its own captured cell, not the register's newest tenant.
+    assert_parity(
+        r#"
+local f
+do
+    local x = 1
+    f = function() return x end
+end
+do
+    local y = 2
+    print(f(), y)
+end
+"#,
+        "1 2",
+    );
+}
+
+#[test]
+fn vm_capture_is_fresh_per_loop_iteration() {
+    // Closing captured registers at the end of each block gives every loop
+    // iteration its own cell, matching the interpreter's scope-per-iteration.
+    assert_parity(
+        r#"
+local fs = {}
+for i = 1, 3 do
+    local x = i
+    fs[i] = function() return x end
+end
+print(fs[1](), fs[2](), fs[3]())
+"#,
+        "1 2 3",
+    );
+}
+
+#[test]
+fn vm_captured_loop_variables_are_fresh_per_iteration() {
+    assert_parity(
+        r#"
+local fs = {}
+for i = 1, 3 do
+    fs[i] = function() return i end
+end
+print(fs[1](), fs[2](), fs[3]())
+"#,
+        "1 2 3",
+    );
+    assert_parity(
+        r#"
+local fs = {}
+for i, v in ipairs({10, 20, 30}) do
+    fs[i] = function() return v end
+end
+print(fs[1](), fs[2](), fs[3]())
+"#,
+        "10 20 30",
+    );
+}
+
+#[test]
+fn vm_ownership_error_reports_the_original_line() {
+    let src = "local t = {1}\nlocal u = t\nprint(t)\n";
+    let err = lusa::vm::run_source_vm(src).expect_err("moving read must fail");
+    assert_eq!(err.code, "E1001");
+    let rendered = lusa::error::render(&err, src, "moved.lusa");
+    assert!(
+        rendered.contains("moved.lusa:3:"),
+        "expected the error on line 3, got:\n{}",
+        rendered
+    );
+}
+
+#[test]
+fn vm_ownership_error_inside_closure_reports_closure_line() {
+    let src = "local t = {1}\nlocal function f()\n    print(t)\nend\nlocal u = t\nf()\n";
+    let err = lusa::vm::run_source_vm(src).expect_err("moved upvalue must fail");
+    assert_eq!(err.code, "E1001");
+    let rendered = lusa::error::render(&err, src, "closure.lusa");
+    assert!(
+        rendered.contains("closure.lusa:3:"),
+        "expected the error on the closure body line 3, got:\n{}",
+        rendered
+    );
+}
+
+#[test]
 fn vm_parity_stdlib() {
     assert_parity(
         "print(string.sub(\"hello\", 2, 4) .. \"|\" .. math.floor(2.7))",
