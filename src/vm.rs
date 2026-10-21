@@ -3,10 +3,11 @@
 //! Frames share one value stack; segments (`SegStart`/`SegEnd`) carve list
 //! regions for multi-value bookkeeping; `last_ret` carries the expansion count
 //! of the last value-producing operation (Lua's "first value" and trailing
-//! expansion rules). Locals live in per-frame slot vecs of shared
-//! `Rc<RefCell<SlotV>>` cells, so closures capture slots the same way the
-//! interpreter captures scopes — including moved-value (E1001) checks, which
-//! come free through the `SlotV` protocol and the ownership registry.
+//! expansion rules). Locals live directly in per-frame slot vecs; a slot is
+//! promoted to a shared `Rc<RefCell<SlotV>>` cell only when a closure captures
+//! it. Closures therefore keep the interpreter's aliasing and moved-value
+//! (E1001) semantics, while the common non-captured local path has no `Rc`
+//! allocation and no `RefCell` borrow check.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -26,6 +27,20 @@ pub struct Vm {
     pub segs: Vec<Seg>,
     /// number of values left by the last expansion (call / `...`)
     pub last_ret: usize,
+    /// `LUSA_TRACE_VM` is read once per VM, never per instruction
+    pub trace: bool,
+    /// Recycled `Vec<SlotCell>` buffers (frame local tables). Captured cells
+    /// are dropped normally; the vector capacity is what is being reused.
+    slot_vec_pool: Vec<Vec<SlotCell>>,
+    /// One-entry read cache for `GetGlob`. The scope version makes stale hits
+    /// impossible even when a builtin or another frame mutates globals.
+    global_cache: Option<GlobalCache>,
+}
+
+struct GlobalCache {
+    name: Arc<str>,
+    version: u64,
+    value: Value,
 }
 
 pub struct Seg {
@@ -33,13 +48,103 @@ pub struct Seg {
     cursor: usize,
 }
 
+/// A local slot. Most locals stay `Direct`; `Shared` is created lazily the
+/// first time a nested closure captures the slot. The enum is the only branch
+/// on the hot local path, and it is perfectly predicted for non-capturing
+/// functions (the overwhelmingly common case).
+pub enum SlotCell {
+    Direct(SlotV),
+    Shared(Rc<RefCell<SlotV>>),
+}
+
+impl SlotCell {
+    #[inline]
+    fn new() -> Self {
+        SlotCell::Direct(SlotV::Set(Value::Nil))
+    }
+
+    /// Replaces the slot contents. A captured slot keeps its identity.
+    #[inline]
+    fn set(&mut self, v: SlotV) {
+        match self {
+            SlotCell::Direct(s) => *s = v,
+            SlotCell::Shared(h) => *h.borrow_mut() = v,
+        }
+    }
+
+    /// Reads a copy of the value, or `None` when the slot was moved out.
+    #[inline]
+    fn read_clone(&self) -> Option<Value> {
+        match self {
+            SlotCell::Direct(SlotV::Set(v)) => Some(v.clone()),
+            SlotCell::Direct(SlotV::Moved(_)) => None,
+            SlotCell::Shared(h) => match &*h.borrow() {
+                SlotV::Set(v) => Some(v.clone()),
+                SlotV::Moved(_) => None,
+            },
+        }
+    }
+
+    /// Fast scalar read. `None` means "not a scalar"; callers then use
+    /// `read_clone`/`inspect` so moved-value errors remain distinct.
+    #[inline]
+    fn scalar(&self) -> Option<Value> {
+        match self {
+            SlotCell::Direct(SlotV::Set(Value::Number(n))) => Some(Value::Number(*n)),
+            SlotCell::Direct(SlotV::Set(Value::Bool(b))) => Some(Value::Bool(*b)),
+            SlotCell::Direct(SlotV::Set(Value::Nil)) => Some(Value::Nil),
+            SlotCell::Shared(h) => {
+                let b = h.borrow();
+                match &*b {
+                    SlotV::Set(Value::Number(n)) => Some(Value::Number(*n)),
+                    SlotV::Set(Value::Bool(v)) => Some(Value::Bool(*v)),
+                    SlotV::Set(Value::Nil) => Some(Value::Nil),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Inspects the slot without cloning. Used by the deferred argument
+    /// journal and by numeric loop checks.
+    #[inline]
+    fn inspect<R>(&self, f: impl FnOnce(&SlotV) -> R) -> R {
+        match self {
+            SlotCell::Direct(s) => f(s),
+            SlotCell::Shared(h) => {
+                let b = h.borrow();
+                f(&b)
+            }
+        }
+    }
+
+    /// Promotes this slot to a shared cell (or returns the existing one).
+    fn make_shared(&mut self) -> Rc<RefCell<SlotV>> {
+        if let SlotCell::Shared(h) = self {
+            return h.clone();
+        }
+        let old = std::mem::replace(self, SlotCell::Direct(SlotV::Set(Value::Nil)));
+        let value = match old {
+            SlotCell::Direct(s) => s,
+            SlotCell::Shared(_) => unreachable!("checked above"),
+        };
+        let handle = Rc::new(RefCell::new(value));
+        *self = SlotCell::Shared(handle.clone());
+        handle
+    }
+}
+
 pub struct VmFrame {
     pub proto: Rc<Compiled>,
-    pub slots: Vec<Rc<RefCell<SlotV>>>,
+    pub slots: Vec<SlotCell>,
     /// instance-captured upvalues, in `proto.upvals` order
-    pub upvals: Vec<Rc<RefCell<SlotV>>>,
+    pub upvals: Rc<[Rc<RefCell<SlotV>>]>,
     pub varargs: Vec<Value>,
     pub pc: usize,
+    /// set by the caller's `CallOne`; the return path keeps only the first
+    /// result (and materializes `nil` for a zero-result call)
+    pub(crate) truncate_return: bool,
     /// deferred call-argument takes pending finalization by the next call op
     pub(crate) undo: Vec<UndoRec>,
 }
@@ -47,17 +152,25 @@ pub struct VmFrame {
 impl Vm {
     pub fn new() -> Vm {
         Vm {
-            frames: Vec::new(),
-            stack: Vec::new(),
-            segs: Vec::new(),
+            // The frame stack is bounded by `MAX_CALL_DEPTH`; reserving it once
+            // removes `Vec` growth from the call path.
+            frames: Vec::with_capacity(MAX_CALL_DEPTH),
+            // Warm the shared value stack so ordinary expression evaluation
+            // never reallocates. Individual frames reserve a small window too.
+            stack: Vec::with_capacity(1024),
+            segs: Vec::with_capacity(16),
             last_ret: 1,
+            trace: std::env::var_os("LUSA_TRACE_VM").is_some(),
+            slot_vec_pool: Vec::new(),
+            global_cache: None,
         }
     }
 }
 
 enum StepOutcome {
     Continue,
-    Returned(Vec<Value>),
+    /// Return values are left on the value stack; the count says how many.
+    Returned(usize),
 }
 
 // ===== driving =====
@@ -68,7 +181,7 @@ enum StepOutcome {
 pub fn invoke(
     interp: &mut Interp,
     compiled: &Rc<Compiled>,
-    upvals: Vec<Rc<RefCell<SlotV>>>,
+    upvals: Rc<[Rc<RefCell<SlotV>>]>,
     args: Vec<Value>,
     span: Span,
 ) -> LResult<Vec<Value>> {
@@ -78,8 +191,10 @@ pub fn invoke(
     match invoke_inner(interp, compiled, upvals, args, span) {
         Ok(vals) => Ok(vals),
         Err(e) => {
-            // unwind the frames that were entered here; intact cleanup
-            interp.vm.frames.truncate(frames_base);
+            // unwind the frames that were entered here, recycling their slots
+            while interp.vm.frames.len() > frames_base {
+                pop_frame_recycling(interp);
+            }
             interp.vm.stack.truncate(stack_base);
             interp.vm.segs.truncate(seg_base);
             interp.vm.last_ret = 1;
@@ -92,7 +207,7 @@ pub fn invoke(
 fn invoke_inner(
     interp: &mut Interp,
     compiled: &Rc<Compiled>,
-    upvals: Vec<Rc<RefCell<SlotV>>>,
+    upvals: Rc<[Rc<RefCell<SlotV>>]>,
     args: Vec<Value>,
     span: Span,
 ) -> LResult<Vec<Value>> {
@@ -107,14 +222,50 @@ fn invoke_inner(
         );
     }
     push_frame(interp, compiled, upvals, args, span)?;
-    run_till_return(interp, interp.vm.frames.len() - 1)
+    let n = run_till_return(interp, interp.vm.frames.len() - 1)?;
+    let sp = interp.vm.stack.len();
+    let take = n.min(sp);
+    Ok(interp.vm.stack.split_off(sp - take))
+}
+
+/// Upper bound for the free list. It is deliberately modest: the point is to
+/// recycle the slots of the current call depth, not to retain unbounded memory
+/// after a program creates a huge number of closures.
+const SLOT_VEC_POOL_MAX: usize = 256;
+
+#[inline]
+fn take_slot_vec(interp: &mut Interp, nlocals: usize) -> Vec<SlotCell> {
+    let mut slots = interp.vm.slot_vec_pool.pop().unwrap_or_default();
+    slots.clear();
+    if slots.capacity() < nlocals {
+        slots.reserve(nlocals - slots.capacity());
+    }
+    slots
+}
+
+/// Pops a frame and recycles its slot vector. Captured cells are dropped (their
+/// closure keeps the `Rc` alive); direct slots are reset to `Nil` so the next
+/// frame starts clean without allocating.
+fn pop_frame_recycling(interp: &mut Interp) {
+    let mut frame = interp.vm.frames.pop().expect("frame");
+    // Drop values first: a closure stored in this frame may be the only extra
+    // owner of another slot in the same frame.
+    frame.varargs.clear();
+    frame.undo.clear();
+    let mut slots = std::mem::take(&mut frame.slots);
+    for cell in &mut slots {
+        *cell = SlotCell::new();
+    }
+    if interp.vm.slot_vec_pool.len() < SLOT_VEC_POOL_MAX {
+        interp.vm.slot_vec_pool.push(slots);
+    }
 }
 
 /// Builds the callee frame: nil-filled slots, renamed params, varargs rest.
 fn push_frame(
     interp: &mut Interp,
     compiled: &Rc<Compiled>,
-    upvals: Vec<Rc<RefCell<SlotV>>>,
+    upvals: Rc<[Rc<RefCell<SlotV>>]>,
     args: Vec<Value>,
     _span: Span,
 ) -> LResult<()> {
@@ -129,13 +280,17 @@ fn push_frame(
             crate::interp::MAX_CALL_DEPTH
         )));
     }
-    let proto = compiled.proto.clone();
+    let proto = &compiled.proto;
     let nparams = proto.nparams;
-    let mut slots: Vec<Rc<RefCell<SlotV>>> = Vec::with_capacity(proto.nlocals);
+    // Reserve the operand window for this frame up front. The shared stack
+    // keeps its capacity across calls, so after warm-up pushes are sequential
+    // writes into already-committed memory.
+    interp.vm.stack.reserve(proto.nlocals + 32);
+    let mut slots = take_slot_vec(interp, proto.nlocals);
     for _ in 0..proto.nlocals {
-        slots.push(Rc::new(RefCell::new(SlotV::Set(Value::Nil))));
+        slots.push(SlotCell::new());
     }
-    for (i, slot) in slots.iter().enumerate() {
+    for (i, slot) in slots.iter_mut().enumerate() {
         if i >= nparams {
             break;
         }
@@ -148,7 +303,7 @@ fn push_frame(
                 .unwrap_or_else(|| Arc::from("(parameter)"));
             crate::value::with_reg(|r| r.rename(vid, name.to_string(), span0()));
         }
-        *slot.borrow_mut() = SlotV::Set(v);
+        slot.set(SlotV::Set(v));
     }
     let varargs: Vec<Value> = if proto.has_vararg {
         args.into_iter().skip(nparams).collect()
@@ -161,33 +316,126 @@ fn push_frame(
         upvals,
         varargs,
         pc: 0,
+        truncate_return: false,
         undo: Vec::new(),
     });
     Ok(())
 }
 
+/// Builds the callee frame directly from a region of the shared value stack.
+///
+/// `arg_start..arg_start+nargs` are the explicit arguments; when `recv_pos` is
+/// set it points at the method receiver (param 0). The source region is
+/// truncated to `base` only after all parameters/varargs have been copied.
+fn push_frame_at(
+    interp: &mut Interp,
+    compiled: Rc<Compiled>,
+    upvals: Rc<[Rc<RefCell<SlotV>>]>,
+    arg_start: usize,
+    nargs: usize,
+    recv_pos: Option<usize>,
+    base: usize,
+    _span: Span,
+) -> LResult<()> {
+    if interp.vm.frames.len() >= MAX_CALL_DEPTH {
+        return Err(LusaError::new(
+            crate::error::E_RUNTIME,
+            Some(span0()),
+            "call stack overflow (too many nested calls)",
+        )
+        .help(format!("Lusa allows {} nested calls", MAX_CALL_DEPTH)));
+    }
+    let proto = &compiled.proto;
+    let nparams = proto.nparams;
+    let recv_off = usize::from(recv_pos.is_some());
+    let total = nargs + recv_off;
+    interp.vm.stack.reserve(proto.nlocals + 32);
+    let mut slots = take_slot_vec(interp, proto.nlocals);
+    for _ in 0..proto.nlocals {
+        slots.push(SlotCell::new());
+    }
+    let value_at = |stack: &[Value], i: usize| -> Value {
+        let idx = if i == 0 && recv_pos.is_some() {
+            recv_pos.unwrap_or(arg_start)
+        } else {
+            arg_start + i - recv_off
+        };
+        stack.get(idx).cloned().unwrap_or(Value::Nil)
+    };
+    for (i, slot) in slots.iter_mut().enumerate().take(nparams.min(total)) {
+        let v = value_at(&interp.vm.stack, i);
+        if let Some(vid) = v.vid() {
+            let name = proto
+                .slot_labels
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| Arc::from("(parameter)"));
+            crate::value::with_reg(|r| r.rename(vid, name.to_string(), span0()));
+        }
+        slot.set(SlotV::Set(v));
+    }
+    let varargs: Vec<Value> = if proto.has_vararg && total > nparams {
+        let mut out = Vec::with_capacity(total - nparams);
+        for i in nparams..total {
+            out.push(value_at(&interp.vm.stack, i));
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    interp.vm.stack.truncate(base.min(interp.vm.stack.len()));
+    interp.vm.frames.push(VmFrame {
+        proto: compiled,
+        slots,
+        upvals,
+        varargs,
+        pc: 0,
+        truncate_return: false,
+        undo: Vec::new(),
+    });
+    Ok(())
+}
+/// Keeps the first of `n` values on the stack, materializing `nil` for a
+/// zero-result call. Shared by `TruncateToOne` and fused single-value calls.
+#[inline]
+fn truncate_results_to_one(interp: &mut Interp, n: usize) {
+    if n == 0 {
+        interp.vm.stack.push(Value::Nil);
+    } else if n > 1 {
+        let sp = interp.vm.stack.len();
+        interp.vm.stack.truncate(sp.saturating_sub(n - 1));
+    }
+    interp.vm.last_ret = 1;
+}
+
 /// Runs instructions until the frame at `base` returns, unwinding nested
-/// frames along the way; returns the return values.
-fn run_till_return(interp: &mut Interp, base: usize) -> LResult<Vec<Value>> {
+/// frames along the way. Return values are already at the top of the shared
+/// value stack; this returns how many there are (no `Vec` is built here).
+fn run_till_return(interp: &mut Interp, base: usize) -> LResult<usize> {
     loop {
         if interp.vm.frames.len() <= base {
-            let vals = Vec::new();
-            return Ok(vals);
+            return Ok(0);
         }
         match step(interp)? {
             StepOutcome::Continue => {}
-            StepOutcome::Returned(vals) => {
-                interp.vm.frames.pop();
-                if interp.vm.frames.len() == base {
-                    interp.vm.last_ret = vals.len().max(1);
-                    return Ok(vals);
+            StepOutcome::Returned(n) => {
+                let truncate = interp
+                    .vm
+                    .frames
+                    .last()
+                    .map(|f| f.truncate_return)
+                    .unwrap_or(false);
+                pop_frame_recycling(interp);
+                if truncate {
+                    truncate_results_to_one(interp, n);
                 } else {
-                    // a nested call's result feeds the caller on the stack
-                    for v in vals.iter() {
-                        interp.vm.stack.push(v.clone());
-                    }
-                    interp.vm.last_ret = vals.len();
+                    interp.vm.last_ret = n;
                 }
+                if interp.vm.frames.len() == base {
+                    return Ok(interp.vm.last_ret);
+                }
+                // Nested return: the values stay exactly where the callee
+                // pushed them, ready to feed the caller's stack expression.
             }
         }
     }
@@ -200,7 +448,7 @@ pub fn run_main(interp: &mut Interp, compiled: Rc<Compiled>) -> LResult<Value> {
     interp.vm.segs.clear();
     interp.vm.last_ret = 1;
     let args: Vec<Value> = Vec::new();
-    invoke(interp, &compiled, Vec::new(), args, span0())?;
+    invoke(interp, &compiled, Rc::from([]), args, span0())?;
     Ok(Value::Nil)
 }
 
@@ -250,24 +498,28 @@ fn err(code: &'static str, msg: impl Into<String>) -> LusaError {
     LusaError::new(code, Some(span0()), msg.into())
 }
 
+#[inline(always)]
 fn step(interp: &mut Interp) -> LResult<StepOutcome> {
-    // copy the cell handles we will touch, then run against `interp`
-    let pc = interp.vm.frames.last().expect("a frame is stepping").pc;
-    let ins: Instr = {
-        let proto = interp.vm.frames.last().unwrap().proto.clone();
-        let max = proto.proto.code.len();
-        if pc >= max {
-            // fell off the end of a chunk without an explicit return
-            return Ok(StepOutcome::Returned(Vec::new()));
-        }
-        clone_instr(&proto.proto.code[pc])
+    // The top frame is the only one we can execute. Use `last()` so the hot
+    // path does not recompute an index and bounds-check the frame vector twice.
+    let frame = interp.vm.frames.last().expect("a frame is stepping");
+    let pc = frame.pc;
+    // `Instr` is Copy and compact: this is a small register/memory copy, not a
+    // heap clone. No `Rc` is touched while decoding.
+    let ins = match frame.proto.proto.code.get(pc).copied() {
+        Some(ins) => ins,
+        // fell off the end of a chunk without an explicit return
+        None => return Ok(StepOutcome::Returned(0)),
     };
-    interp.vm.frames.last_mut().unwrap().pc += 1;
+    interp.vm.frames.last_mut().unwrap().pc = pc + 1;
 
-    if std::env::var("LUSA_TRACE_VM").is_ok() {
+    // Trace flag is cached in `Vm`; checking an env var here would allocate a
+    // `String` and take the environment lock on every single instruction.
+    if interp.vm.trace {
+        let fidx = interp.vm.frames.len() - 1;
         eprintln!(
             "[frame {} pc {:03}] {:?} stack={} segs={:?} last_ret={}",
-            interp.vm.frames.len() - 1,
+            fidx,
             pc,
             &ins,
             interp.vm.stack.len(),
@@ -281,17 +533,16 @@ fn step(interp: &mut Interp) -> LResult<StepOutcome> {
         );
     }
 
-    instr_kind(&ins, interp)
+    exec_instr(&ins, interp)
 }
 
-/// derives the dispatch `Instr` (the enum is big; working with a clone in one shot)
-fn clone_instr(ins: &Instr) -> Instr {
-    // Instr derives Clone in this module (v1 simplicity)
-    ins.clone()
-}
-
-/// the interpreter-loop body: executes one instruction with full access
-fn instr_kind(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
+/// The interpreter-loop body: one dense `match` over the opcode tag.
+///
+/// All instruction payloads are integers, so decoding never allocates. LLVM
+/// lowers this match to a single jump table; the previous version dispatched
+/// twice (common opcodes here, the rest through `instr_ops`).
+#[inline(always)]
+fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
     Ok(match ins {
         Instr::LoadConst(k) => {
             push_const(interp, *k)?;
@@ -302,22 +553,17 @@ fn instr_kind(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             StepOutcome::Continue
         }
         Instr::GetLoc(slot) => {
-            let handle = slot_handle(interp, *slot as usize)?;
-            let label = slot_label(interp, *slot as usize);
-            slot_push(interp, &handle, label)?;
+            push_local(interp, *slot as usize)?;
             StepOutcome::Continue
         }
         Instr::GetUp(idx) => {
-            let handle = upval_handle(interp, *idx as usize)?;
-            let label = upval_label(interp, *idx as usize);
-            slot_push(interp, &handle, label)?;
+            push_upval(interp, *idx as usize)?;
             StepOutcome::Continue
         }
         Instr::TakeLoc(slot, labelk) => {
-            let handle = slot_handle(interp, *slot as usize)?;
             let src_label = slot_label(interp, *slot as usize);
             let dest = const_str(interp, *labelk)?;
-            take_slot_storage(interp, &handle, &src_label, &dest)?;
+            take_local_storage(interp, *slot as usize, &src_label, &dest)?;
             StepOutcome::Continue
         }
         Instr::TakeUp(idx, labelk) => {
@@ -330,7 +576,10 @@ fn instr_kind(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
         Instr::TakeGlob(k, labelk) => {
             let name = const_str(interp, *k)?;
             let dest = const_str(interp, *labelk)?;
-            let v = scope::read_slot(&[interp.globals.clone()], &name, span0())?;
+            let v = match read_global_fast(interp, &name) {
+                Some(v) => v,
+                None => scope::read_slot(std::slice::from_ref(&interp.globals), &name, span0())?,
+            };
             if matches!(v, Value::Table(_) | Value::Func(_)) {
                 let vid = v.vid().expect("heap value has vid");
                 if !interp.borrowed_by(vid).is_empty() {
@@ -339,9 +588,9 @@ fn instr_kind(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
                         format!("cannot move out of `{}` because it is borrowed", name),
                     ));
                 }
-                let note = crate::value::MoveNote { to: dest.clone(), span: span0() };
+                let note = crate::value::MoveNote { to: dest.to_string(), span: span0() };
                 scope::set_slot(&[], &interp.globals, &name, SlotV::Moved(vec![note]));
-                crate::value::with_reg(|r| r.rename(vid, dest, span0()));
+                crate::value::with_reg(|r| r.rename(vid, dest.to_string(), span0()));
             }
             interp.vm.stack.push(v);
             interp.vm.last_ret = 1;
@@ -367,7 +616,32 @@ fn instr_kind(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
         }
         Instr::GetGlob(k) => {
             let name = const_str(interp, *k)?;
-            let v = scope::read_slot(&[interp.globals.clone()], &name, span0())?;
+            let version = interp.globals.borrow().version;
+            let cached = match &interp.vm.global_cache {
+                Some(c) if c.version == version && Arc::ptr_eq(&c.name, &name) => {
+                    Some(c.value.clone())
+                }
+                _ => None,
+            };
+            let v = match cached {
+                Some(v) => v,
+                None => {
+                    let v = match read_global_fast(interp, &name) {
+                        Some(v) => v,
+                        None => scope::read_slot(
+                            std::slice::from_ref(&interp.globals),
+                            &name,
+                            span0(),
+                        )?,
+                    };
+                    interp.vm.global_cache = Some(GlobalCache {
+                        name,
+                        version,
+                        value: v.clone(),
+                    });
+                    v
+                }
+            };
             interp.vm.stack.push(v);
             interp.vm.last_ret = 1;
             StepOutcome::Continue
@@ -400,9 +674,56 @@ fn instr_kind(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             let name = const_str(interp, *k)?;
             let v = pop1(interp);
             if let Some(vid) = v.vid() {
-                crate::value::with_reg(|r| r.rename(vid, name.clone(), span0()));
+                crate::value::with_reg(|r| r.rename(vid, name.to_string(), span0()));
             }
             scope::set_slot(&[], &interp.globals, &name, SlotV::Set(v));
+            interp.vm.last_ret = 1;
+            StepOutcome::Continue
+        }
+        Instr::SetLoc(slot) => {
+            let v = pop1(interp);
+            let frame = interp.vm.frames.last_mut().expect("frame");
+            if let Some(vid) = v.vid() {
+                let label = frame
+                    .proto
+                    .proto
+                    .slot_labels
+                    .get(*slot as usize)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::from("(local)"));
+                crate::value::with_reg(|r| r.rename(vid, label.to_string(), span0()));
+            }
+            let cell = frame.slots.get_mut(*slot as usize).ok_or_else(|| {
+                err(
+                    crate::error::E_RUNTIME,
+                    format!("internal: slot {} out of range", slot),
+                )
+            })?;
+            cell.set(SlotV::Set(v));
+            interp.vm.last_ret = 1;
+            StepOutcome::Continue
+        }
+        Instr::SetUp(idx) => {
+            let v = pop1(interp);
+            let frame = interp.vm.frames.last().expect("frame");
+            let cell = frame.upvals.get(*idx as usize).ok_or_else(|| {
+                err(
+                    crate::error::E_RUNTIME,
+                    format!("internal: upvalue {} out of range", idx),
+                )
+            })?;
+            if let Some(vid) = v.vid() {
+                let label = frame
+                    .proto
+                    .proto
+                    .upval_labels
+                    .get(*idx as usize)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::from("(captured)"));
+                crate::value::with_reg(|r| r.rename(vid, label.to_string(), span0()));
+            }
+            *cell.borrow_mut() = SlotV::Set(v);
+            interp.vm.last_ret = 1;
             StepOutcome::Continue
         }
         Instr::SetFieldK(k) => {
@@ -446,12 +767,8 @@ fn instr_kind(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
                 .cloned()
                 .unwrap_or(Value::Nil);
             let t = expect_table(&obj)?;
-            let vals: Vec<Value> = interp
-                .vm
-                .stack
-                .drain(sp.saturating_sub(n)..)
-                .collect();
-            for v in vals {
+            // Drain in place: no temporary Vec for the expanded values.
+            for v in interp.vm.stack.drain(sp.saturating_sub(n)..) {
                 let idx = t.next_arr.get();
                 t.next_arr.set(idx + 1);
                 let _ = t.set(Value::Number(idx as f64), v);
@@ -529,8 +846,9 @@ fn instr_kind(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             StepOutcome::Continue
         }
         Instr::JumpIfTrueKeep(t) => {
-            let cond = interp.vm.stack.last().cloned().unwrap_or(Value::Nil);
-            if cond.truthy() {
+            // Peek without cloning the heap value: only its truthiness matters.
+            let cond = interp.vm.stack.last().map(|v| v.truthy()).unwrap_or(false);
+            if cond {
                 interp.vm.frames.last_mut().unwrap().pc = *t as usize;
             } else {
                 interp.vm.stack.pop();
@@ -538,8 +856,8 @@ fn instr_kind(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             StepOutcome::Continue
         }
         Instr::JumpIfFalseKeep(t) => {
-            let cond = interp.vm.stack.last().cloned().unwrap_or(Value::Nil);
-            if !cond.truthy() {
+            let cond = interp.vm.stack.last().map(|v| v.truthy()).unwrap_or(false);
+            if !cond {
                 interp.vm.frames.last_mut().unwrap().pc = *t as usize;
             } else {
                 interp.vm.stack.pop();
@@ -548,14 +866,7 @@ fn instr_kind(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
         }
         Instr::TruncateToOne => {
             let lr = interp.vm.last_ret;
-            if lr == 0 {
-                interp.vm.stack.push(Value::Nil);
-                interp.vm.last_ret = 1;
-            } else if lr > 1 {
-                let sp = interp.vm.stack.len();
-                interp.vm.stack.truncate(sp - (lr - 1));
-                interp.vm.last_ret = 1;
-            }
+            truncate_results_to_one(interp, lr);
             StepOutcome::Continue
         }
         Instr::DropValues => {
@@ -570,20 +881,11 @@ fn instr_kind(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             interp.vm.last_ret = 1;
             StepOutcome::Continue
         }
-        _ => instr_ops(ins, interp)?,
-    })
-}
-
-// ===== complex operations =====
-
-fn instr_ops(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
-    Ok(match ins {
         // ===== deferred call-argument takes =====
         Instr::ArgLoc(slot, labelk) => {
-            let handle = slot_handle(interp, *slot as usize)?;
             let src = slot_label(interp, *slot as usize);
             let dest = const_str(interp, *labelk)?;
-            arg_push_slot(interp, &handle, &src, &dest)?;
+            arg_push_local(interp, *slot as usize, &src, &dest)?;
             StepOutcome::Continue
         }
         Instr::ArgUp(idx, labelk) => {
@@ -618,55 +920,50 @@ fn instr_ops(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             StepOutcome::Continue
         }
         Instr::Call(base, nt) => {
-            let (func, args) = call_pop(interp, *base, false);
-            finalize_args(interp, &func, *nt)?;
-            do_call_into(interp, func, args, span0())?
+            call_plain(interp, *base as usize, false, *nt as usize, false, span0())?
         }
         Instr::CallExp(base, nt) => {
-            let (func, args) = call_pop(interp, *base, true);
-            finalize_args(interp, &func, *nt)?;
-            do_call_into(interp, func, args, span0())?
+            call_plain(interp, *base as usize, true, *nt as usize, false, span0())?
+        }
+        Instr::CallOne(base, nt) => {
+            call_plain(interp, *base as usize, false, *nt as usize, true, span0())?
+        }
+        Instr::CallExpOne(base, nt) => {
+            call_plain(interp, *base as usize, true, *nt as usize, true, span0())?
         }
         Instr::MethodCall(k, base, nt) => {
-            // layout: [obj, a1..an] — the receiver sits UNDER the args
-            let args = drain_args(interp, *base, false);
-            let obj = pop1(interp);
-            let name = const_str(interp, *k)?;
-            let key = Value::Str(Arc::from(name.as_str()));
-            let f = crate::eval::read_field(&obj, &key, span0())?;
-            finalize_args(interp, &f, *nt)?;
-            let mut full = vec![obj.clone()];
-            full.extend(args);
-            do_call_into(interp, f, full, span0())?
+            call_method(interp, *k, *base as usize, false, *nt as usize, false, span0())?
         }
         Instr::MethodCallExp(k, base, nt) => {
-            let args = drain_args(interp, *base, true);
-            let obj = pop1(interp);
-            let name = const_str(interp, *k)?;
-            let key = Value::Str(Arc::from(name.as_str()));
-            let f = crate::eval::read_field(&obj, &key, span0())?;
-            finalize_args(interp, &f, *nt)?;
-            let mut full = vec![obj.clone()];
-            full.extend(args);
-            do_call_into(interp, f, full, span0())?
+            call_method(interp, *k, *base as usize, true, *nt as usize, false, span0())?
+        }
+        Instr::MethodCallOne(k, base, nt) => {
+            call_method(interp, *k, *base as usize, false, *nt as usize, true, span0())?
+        }
+        Instr::MethodCallExpOne(k, base, nt) => {
+            call_method(interp, *k, *base as usize, true, *nt as usize, true, span0())?
         }
         Instr::RetFixed(n) => {
-            let vals = drain_top(interp, *n);
-            interp.vm.last_ret = vals.len();
-            StepOutcome::Returned(vals)
+            let n = (*n as usize).min(interp.vm.stack.len());
+            StepOutcome::Returned(n)
         }
         Instr::RetExp(base) => {
-            let count = *base + interp.vm.last_ret;
-            let vals = drain_top(interp, count);
-            interp.vm.last_ret = vals.len();
-            StepOutcome::Returned(vals)
+            let count = *base as usize + interp.vm.last_ret;
+            let n = count.min(interp.vm.stack.len());
+            StepOutcome::Returned(n)
         }
         Instr::VarargLoad => {
-            let varargs = interp.vm.frames.last().map(|f| f.varargs.clone()).unwrap_or_default();
-            for v in &varargs {
-                interp.vm.stack.push(v.clone());
-            }
-            interp.vm.last_ret = varargs.len();
+            // Push all varargs without cloning the frame's `Vec<Value>` first.
+            let n = {
+                let Vm { frames, stack, .. } = &mut interp.vm;
+                let varargs = &frames.last().expect("frame").varargs;
+                stack.reserve(varargs.len());
+                for v in varargs {
+                    stack.push(v.clone());
+                }
+                varargs.len()
+            };
+            interp.vm.last_ret = n;
             StepOutcome::Continue
         }
         Instr::VarargLoadOne => {
@@ -691,49 +988,85 @@ fn instr_ops(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             interp.vm.last_ret = 1;
             StepOutcome::Continue
         }
-        Instr::DeclFromSeg(bindings) => {
-            let frame = interp.vm.frames.last().expect("frame");
-            let mut targets: Vec<(Rc<RefCell<SlotV>>, Arc<str>)> = Vec::new();
-            for (slot, namek) in bindings {
-                let handle = frame.slots.get(*slot as usize).cloned().expect("slot ok");
-                let name = const_str_from_frame(&frame.proto, *namek);
-                targets.push((handle, name));
-            }
-            let _ = frame;
-            for (handle, name) in targets {
+        Instr::DeclFromSeg(group) => {
+            // Borrow the chunk through one `Rc` clone, then bind targets one by
+            // one. The old version built a `Vec<(handle, label)>` per execution
+            // of every `local` statement.
+            let proto = interp.vm.frames.last().expect("frame").proto.clone();
+            let bindings = proto
+                .proto
+                .decl_groups
+                .get(*group as usize)
+                .expect("decl group index");
+            for &(slot, namek) in bindings {
+                let name = const_str_from_frame(&proto, namek);
                 let v = seg_front_or_nil(interp)?;
                 if let Some(vid) = v.vid() {
                     crate::value::with_reg(|r| r.rename(vid, name.to_string(), span0()));
                 }
-                *handle.borrow_mut() = SlotV::Set(v);
+                let cell = interp
+                    .vm
+                    .frames
+                    .last_mut()
+                    .expect("frame")
+                    .slots
+                    .get_mut(slot as usize)
+                    .expect("slot ok");
+                cell.set(SlotV::Set(v));
             }
             StepOutcome::Continue
         }
         Instr::StoreLocSeg(slot) => {
-            let handle = slot_handle(interp, *slot as usize)?;
+            // Read the segment value first, then touch the slot in place. For
+            // numbers (the hot loop case) there is no label clone at all.
             let v = seg_front_or_nil(interp)?;
+            let frame = interp.vm.frames.last_mut().expect("frame");
             if let Some(vid) = v.vid() {
-                let label = slot_label(interp, *slot as usize);
+                let label = frame
+                    .proto
+                    .proto
+                    .slot_labels
+                    .get(*slot as usize)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::from("(local)"));
                 crate::value::with_reg(|r| r.rename(vid, label.to_string(), span0()));
             }
-            *handle.borrow_mut() = SlotV::Set(v);
+            let cell = frame.slots.get_mut(*slot as usize).ok_or_else(|| {
+                err(
+                    crate::error::E_RUNTIME,
+                    format!("internal: slot {} out of range", slot),
+                )
+            })?;
+            cell.set(SlotV::Set(v));
             StepOutcome::Continue
         }
         Instr::StoreUpSeg(idx) => {
-            let handle = upval_handle(interp, *idx as usize)?;
             let v = seg_front_or_nil(interp)?;
+            let frame = interp.vm.frames.last().expect("frame");
+            let cell = frame.upvals.get(*idx as usize).ok_or_else(|| {
+                err(
+                    crate::error::E_RUNTIME,
+                    format!("internal: upvalue {} out of range", idx),
+                )
+            })?;
             if let Some(vid) = v.vid() {
-                let label = upval_label(interp, *idx as usize);
+                let label = frame
+                    .proto
+                    .proto
+                    .upval_labels
+                    .get(*idx as usize)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::from("(captured)"));
                 crate::value::with_reg(|r| r.rename(vid, label.to_string(), span0()));
             }
-            *handle.borrow_mut() = SlotV::Set(v);
+            *cell.borrow_mut() = SlotV::Set(v);
             StepOutcome::Continue
         }
         Instr::StoreGlobSeg(k) => {
             let name = const_str(interp, *k)?;
             let v = seg_front_or_nil(interp)?;
             if let Some(vid) = v.vid() {
-                crate::value::with_reg(|r| r.rename(vid, name.clone(), span0()));
+                crate::value::with_reg(|r| r.rename(vid, name.to_string(), span0()));
             }
             scope::set_slot(&[], &interp.globals, &name, SlotV::Set(v));
             StepOutcome::Continue
@@ -755,22 +1088,24 @@ fn instr_ops(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             StepOutcome::Continue
         }
         Instr::MakeClosure(k) => {
-            let frame = interp.vm.frames.last().expect("frame");
+            let frame = interp.vm.frames.last_mut().expect("frame");
             let compiled = frame.proto.proto.prototypes.get(*k as usize).cloned().expect("proto index");
-            let mut instance: Vec<Rc<RefCell<SlotV>>> = Vec::new();
+            let mut instance: Vec<Rc<RefCell<SlotV>>> = Vec::with_capacity(compiled.upvals.len());
             for def in &compiled.upvals {
                 let handle = match def {
-                    crate::compiler::UpDef::Local(slot) => {
-                        frame.slots.get(*slot as usize).cloned().expect("captured slot")
-                    }
+                    crate::compiler::UpDef::Local(slot) => frame
+                        .slots
+                        .get_mut(*slot as usize)
+                        .expect("captured slot")
+                        .make_shared(),
                     crate::compiler::UpDef::Up(idx) => {
                         frame.upvals.get(*idx as usize).cloned().expect("captured upval")
                     }
                 };
                 instance.push(handle);
             }
-            let _ = frame;
             let vid = crate::value::with_reg(|r| r.alloc_vid());
+            let instance: Rc<[_]> = instance.into();
             let f = Value::Func(Rc::new(crate::value::FuncObj {
                 vid,
                 name: compiled.proto.name.clone(),
@@ -788,48 +1123,67 @@ fn instr_ops(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             let sv = to_num(&s, "for loop step must be a number")?;
             let lv = to_num(&l, "for loop limit must be a number")?;
             let iv = to_num(&start, "for loop start must be a number")?;
-            set_num_slot(interp, *var as usize, iv)?;
-            set_num_slot(interp, *limit as usize, lv)?;
-            set_num_slot(interp, *step as usize, sv)?;
+            let frame = interp.vm.frames.last_mut().expect("frame");
+            frame.slots[*var as usize].set(SlotV::Set(Value::Number(iv)));
+            frame.slots[*limit as usize].set(SlotV::Set(Value::Number(lv)));
+            frame.slots[*step as usize].set(SlotV::Set(Value::Number(sv)));
             let in_range = if sv >= 0.0 { iv <= lv } else { iv >= lv };
             if !in_range {
-                interp.vm.frames.last_mut().unwrap().pc = *end as usize;
+                frame.pc = *end as usize;
             }
             StepOutcome::Continue
         }
         Instr::ForNumStep { var, limit, step, top, end } => {
-            let cur = num_slot_call(interp, *var as usize)?;
-            let lim = num_slot_call(interp, *limit as usize)?;
-            let st = num_slot_call(interp, *step as usize)?;
+            // One mutable frame borrow for all three reads, the write and the
+            // pc update. Control slots are normally direct, so the fast helper
+            // avoids three independent cell dispatches.
+            let frame = interp.vm.frames.last_mut().expect("frame");
+            let (cur, lim, st) = frame_nums3(
+                frame,
+                *var as usize,
+                *limit as usize,
+                *step as usize,
+            )?;
             let next = cur + st;
             let go = if st >= 0.0 { next <= lim } else { next >= lim };
             if go {
-                set_num_slot(interp, *var as usize, next)?;
-                interp.vm.frames.last_mut().unwrap().pc = *top as usize;
+                frame.slots[*var as usize].set(SlotV::Set(Value::Number(next)));
+                frame.pc = *top as usize;
             } else {
-                interp.vm.frames.last_mut().unwrap().pc = *end as usize;
+                frame.pc = *end as usize;
             }
             StepOutcome::Continue
         }
         Instr::ForInSetup { iter, first, nvars, end } => {
             let it = seg_front_or_nil(interp)?;
-            let it_handle = slot_handle(interp, *iter as usize)?;
-            *it_handle.borrow_mut() = SlotV::Set(it.clone());
-            let row = advance_iter(interp, &it, *nvars)?;
-            store_row(interp, *first as usize, *nvars, &row)?;
+            let cell = interp
+                .vm
+                .frames
+                .last_mut()
+                .expect("frame")
+                .slots
+                .get_mut(*iter as usize)
+                .ok_or_else(|| err(E_RUNTIME, "internal: iterator slot out of range"))?;
+            cell.set(SlotV::Set(it.clone()));
+            let row = advance_iter(interp, &it, *nvars as usize)?;
+            store_row(interp, *first as usize, *nvars as usize, &row)?;
             if row.is_empty() {
                 interp.vm.frames.last_mut().unwrap().pc = *end as usize;
             }
             StepOutcome::Continue
         }
         Instr::ForInStep { iter, first, nvars, top, end } => {
-            let handle = slot_handle(interp, *iter as usize)?;
-            let it: Value = match handle.borrow().as_value() {
-                Some(v) => v.clone(),
-                None => return Err(err(E_MOVED, "use of moved value `(iter)`")),
-            };
-            let row = advance_iter(interp, &it, *nvars)?;
-            store_row(interp, *first as usize, *nvars, &row)?;
+            let it = interp
+                .vm
+                .frames
+                .last()
+                .expect("frame")
+                .slots
+                .get(*iter as usize)
+                .and_then(|cell| cell.read_clone())
+                .ok_or_else(|| err(E_MOVED, "use of moved value `(iter)`"))?;
+            let row = advance_iter(interp, &it, *nvars as usize)?;
+            store_row(interp, *first as usize, *nvars as usize, &row)?;
             if row.is_empty() {
                 interp.vm.frames.last_mut().unwrap().pc = *end as usize;
             } else {
@@ -837,50 +1191,176 @@ fn instr_ops(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             }
             StepOutcome::Continue
         }
-        other => {
-            return Err(err(
-                E_RUNTIME,
-                format!("incomplete VM opcode path — please report: {:?}", other_type_name(other)),
-            ))
-        }
     })
 }
-
-fn other_type_name(_i: &Instr) -> &'static str {
-    "unhandled"
-}
-// ===== runtime helpers =====
 
 fn pop1(interp: &mut Interp) -> Value {
     interp.vm.stack.pop().unwrap_or(Value::Nil)
 }
 
-/// pops `n` values keeping their push order
-fn drain_top(interp: &mut Interp, n: usize) -> Vec<Value> {
-    let sp = interp.vm.stack.len();
-    let take = n.min(sp);
-    interp.vm.stack.drain(sp - take..).collect()
+/// Classified callee for the allocation-free VM call path. `Bad` keeps the
+/// old behavior of finalizing the argument journal before reporting the error.
+enum Callee {
+    Vm(Rc<Compiled>, Rc<[Rc<RefCell<SlotV>>]>),
+    Builtin,
+    Lusa,
+    Bad,
 }
 
-/// pops a call: `func` under `base + expansion` args; returns (func, args)
-fn call_pop(interp: &mut Interp, base: usize, exp: bool) -> (Value, Vec<Value>) {
+impl Callee {
+    fn is_builtin(&self) -> bool {
+        matches!(self, Callee::Builtin)
+    }
+}
+
+#[inline]
+fn classify(v: &Value) -> Callee {
+    match v {
+        Value::Func(f) => match &f.body {
+            crate::value::FuncBody::Builtin(_) => Callee::Builtin,
+            crate::value::FuncBody::Lusa(_) => Callee::Lusa,
+            crate::value::FuncBody::Vm(c, u) => Callee::Vm(c.clone(), u.clone()),
+        },
+        _ => Callee::Bad,
+    }
+}
+
+/// Plain call. Arguments stay on the shared stack until the frame is built;
+/// VM→VM calls never allocate a `Vec<Value>` for them.
+fn call_plain(
+    interp: &mut Interp,
+    base: usize,
+    exp: bool,
+    n_takes: usize,
+    want_one: bool,
+    span: Span,
+) -> LResult<StepOutcome> {
     let nargs = if exp { base + interp.vm.last_ret } else { base };
     let sp = interp.vm.stack.len();
-    let take = nargs.min(sp.saturating_sub(1).max(0));
-    let args: Vec<Value> = interp.vm.stack.drain(sp - take..).collect();
-    let func = interp.vm.stack.pop().unwrap_or(Value::Nil);
-    interp.vm.last_ret = 1;
-    (func, args)
+    let func_pos = sp.saturating_sub(nargs + 1);
+    let callee = match interp.vm.stack.get(func_pos) {
+        Some(v) => classify(v),
+        None => Callee::Bad,
+    };
+    if n_takes != 0 {
+        finalize_args(interp, callee.is_builtin(), n_takes)?;
+    }
+    match callee {
+        Callee::Vm(compiled, upvals) => {
+            // Push the callee frame and let the interpreter loop step it. The
+            // caller's `Call` already left the arguments on the shared stack;
+            // no Rust recursion (and no second giant prologue) per VM call.
+            push_frame_at(
+                interp,
+                compiled,
+                upvals,
+                func_pos + 1,
+                nargs,
+                None,
+                func_pos,
+                span,
+            )?;
+            if want_one {
+                interp
+                    .vm
+                    .frames
+                    .last_mut()
+                    .expect("callee frame")
+                    .truncate_return = true;
+            }
+            Ok(StepOutcome::Continue)
+        }
+        _ => {
+            let func = interp.vm.stack.get(func_pos).cloned().unwrap_or(Value::Nil);
+            let start = (func_pos + 1).min(interp.vm.stack.len());
+            let args: Vec<Value> = interp.vm.stack.drain(start..).collect();
+            interp.vm.stack.truncate(func_pos.min(interp.vm.stack.len()));
+            interp.vm.last_ret = 1;
+            invoke_non_vm(interp, func, args, span)?;
+            if want_one {
+                let n = interp.vm.last_ret;
+                truncate_results_to_one(interp, n);
+            }
+            Ok(StepOutcome::Continue)
+        }
+    }
 }
 
-fn do_call_into(interp: &mut Interp, func: Value, mut args: Vec<Value>, span: Span) -> LResult<StepOutcome> {
+/// Method call (`obj:name(...)`). The receiver is read straight from the
+/// stack as parameter 0; the non-VM path drains `[receiver, args...]` in one
+/// operation.
+fn call_method(
+    interp: &mut Interp,
+    key_k: u16,
+    base: usize,
+    exp: bool,
+    n_takes: usize,
+    want_one: bool,
+    span: Span,
+) -> LResult<StepOutcome> {
+    let nargs = if exp { base + interp.vm.last_ret } else { base };
+    let sp = interp.vm.stack.len();
+    let obj_pos = sp.saturating_sub(nargs + 1);
+    let key = const_value(interp, key_k)?;
+    let f = match interp.vm.stack.get(obj_pos) {
+        Some(obj) => crate::eval::read_field(obj, &key, span)?,
+        None => Value::Nil,
+    };
+    let callee = classify(&f);
+    if n_takes != 0 {
+        finalize_args(interp, callee.is_builtin(), n_takes)?;
+    }
+    match callee {
+        Callee::Vm(compiled, upvals) => {
+            push_frame_at(
+                interp,
+                compiled,
+                upvals,
+                obj_pos + 1,
+                nargs,
+                Some(obj_pos),
+                obj_pos,
+                span,
+            )?;
+            if want_one {
+                interp
+                    .vm
+                    .frames
+                    .last_mut()
+                    .expect("callee frame")
+                    .truncate_return = true;
+            }
+            Ok(StepOutcome::Continue)
+        }
+        _ => {
+            let start = obj_pos.min(interp.vm.stack.len());
+            let args: Vec<Value> = interp.vm.stack.drain(start..).collect();
+            interp.vm.last_ret = 1;
+            invoke_non_vm(interp, f, args, span)?;
+            if want_one {
+                let n = interp.vm.last_ret;
+                truncate_results_to_one(interp, n);
+            }
+            Ok(StepOutcome::Continue)
+        }
+    }
+}
+
+/// Calls builtin/interpreted functions and pushes their results by value
+/// (no defensive clone of every result element).
+fn invoke_non_vm(
+    interp: &mut Interp,
+    func: Value,
+    args: Vec<Value>,
+    span: Span,
+) -> LResult<StepOutcome> {
     let results = match &func {
         Value::Func(f) => match &f.body {
-            crate::value::FuncBody::Builtin(b) => b(interp, std::mem::take(&mut args), span)?,
+            crate::value::FuncBody::Builtin(b) => b(interp, args, span)?,
+            crate::value::FuncBody::Lusa(_) => interp.call_value(&func, args, span)?,
             crate::value::FuncBody::Vm(compiled, upvals) => {
                 crate::vm::invoke(interp, compiled, upvals.clone(), args, span)?
             }
-            crate::value::FuncBody::Lusa(_) => interp.call_value(&func, args, span)?,
         },
         Value::Nil => {
             return Err(err(
@@ -895,10 +1375,12 @@ fn do_call_into(interp: &mut Interp, func: Value, mut args: Vec<Value>, span: Sp
             ))
         }
     };
-    for v in results.iter() {
-        interp.vm.stack.push(v.clone());
+    let n = results.len();
+    interp.vm.stack.reserve(n);
+    for v in results {
+        interp.vm.stack.push(v);
     }
-    interp.vm.last_ret = results.len();
+    interp.vm.last_ret = n;
     Ok(StepOutcome::Continue)
 }
 
@@ -925,6 +1407,22 @@ fn take_slot_storage(
     src_label: &Arc<str>,
     dest: &str,
 ) -> LResult<()> {
+    // Scalars are copied and the source slot stays intact; no ownership
+    // journal, label or heap check is needed for them.
+    let scalar = {
+        let b = handle.borrow();
+        match &*b {
+            SlotV::Set(Value::Number(n)) => Some(Value::Number(*n)),
+            SlotV::Set(Value::Bool(v)) => Some(Value::Bool(*v)),
+            SlotV::Set(Value::Nil) => Some(Value::Nil),
+            _ => None,
+        }
+    };
+    if let Some(v) = scalar {
+        interp.vm.stack.push(v);
+        interp.vm.last_ret = 1;
+        return Ok(());
+    }
     let current = match &*handle.borrow() {
         SlotV::Set(v) => Some(v.clone()),
         SlotV::Moved(_) => None,
@@ -943,6 +1441,64 @@ fn take_slot_storage(
         }
         let note = crate::value::MoveNote { to: dest.to_string(), span: span0() };
         *handle.borrow_mut() = SlotV::Moved(vec![note]);
+        crate::value::with_reg(|r| r.rename(vid, dest.to_string(), span0()));
+    }
+    interp.vm.stack.push(v);
+    interp.vm.last_ret = 1;
+    Ok(())
+}
+
+/// Local-slot variant of `take_slot_storage`. The scalar path avoids both the
+/// `SlotCell` promotion check and the `Rc`/`RefCell` machinery entirely.
+fn take_local_storage(
+    interp: &mut Interp,
+    slot: usize,
+    src_label: &Arc<str>,
+    dest: &str,
+) -> LResult<()> {
+    let scalar = {
+        let frame = interp.vm.frames.last().expect("frame");
+        let cell = frame.slots.get(slot).ok_or_else(|| {
+            err(
+                crate::error::E_RUNTIME,
+                format!("internal: slot {} out of range", slot),
+            )
+        })?;
+        cell.scalar()
+    };
+    if let Some(v) = scalar {
+        interp.vm.stack.push(v);
+        interp.vm.last_ret = 1;
+        return Ok(());
+    }
+    let v = {
+        let frame = interp.vm.frames.last().expect("frame");
+        let cell = frame.slots.get(slot).ok_or_else(|| {
+            err(
+                crate::error::E_RUNTIME,
+                format!("internal: slot {} out of range", slot),
+            )
+        })?;
+        cell.read_clone()
+            .ok_or_else(|| moved_out_err(&src_label.to_string()))?
+    };
+    if matches!(v, Value::Table(_) | Value::Func(_)) {
+        let vid = v.vid().expect("heap value has vid");
+        if !interp.borrowed_by(vid).is_empty() {
+            return Err(err(
+                crate::error::E_BORROW_CONFLICT,
+                format!("cannot move out of `{}` because it is borrowed", src_label),
+            ));
+        }
+        let note = crate::value::MoveNote { to: dest.to_string(), span: span0() };
+        if let Some(cell) = interp
+            .vm
+            .frames
+            .last_mut()
+            .and_then(|f| f.slots.get_mut(slot))
+        {
+            cell.set(SlotV::Moved(vec![note]));
+        }
         crate::value::with_reg(|r| r.rename(vid, dest.to_string(), span0()));
     }
     interp.vm.stack.push(v);
@@ -993,6 +1549,14 @@ fn take_table_storage(
 pub(crate) enum UndoRec {
     /// scalars, aliases, missing/absent sources — nothing to restore or move
     Done,
+    /// direct or closure-captured local, addressed by its frame slot index
+    Local {
+        slot: usize,
+        vid: Option<u64>,
+        dest: String,
+        value: Value,
+    },
+    /// captured upvalue; the handle keeps identity even across promotions
     Slot {
         handle: Rc<RefCell<SlotV>>,
         vid: Option<u64>,
@@ -1021,6 +1585,42 @@ fn same_heap(a: &Value, b: &Value) -> bool {
         (Value::Iter(x), Value::Iter(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
+}
+
+/// Pushes a local slot value and journals the source by slot index, so a
+/// closure created while later arguments are evaluated can promote the slot
+/// without invalidating the pending move.
+fn arg_push_local(
+    interp: &mut Interp,
+    slot: usize,
+    src: &Arc<str>,
+    dest: &str,
+) -> LResult<()> {
+    let v = {
+        let frame = interp.vm.frames.last().expect("frame");
+        let cell = frame.slots.get(slot).ok_or_else(|| {
+            err(
+                crate::error::E_RUNTIME,
+                format!("internal: slot {} out of range", slot),
+            )
+        })?;
+        cell.read_clone()
+            .ok_or_else(|| moved_out_err(&src.to_string()))?
+    };
+    let rec = if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_)) {
+        UndoRec::Local {
+            slot,
+            vid: v.vid(),
+            dest: dest.to_string(),
+            value: v.clone(),
+        }
+    } else {
+        UndoRec::Done
+    };
+    interp.vm.stack.push(v);
+    interp.vm.last_ret = 1;
+    interp.vm.frames.last_mut().expect("frame").undo.push(rec);
+    Ok(())
 }
 
 /// Pushes the value onto the stack and records its source for finalization.
@@ -1105,33 +1705,27 @@ fn arg_push_entry(
 /// Finalizes the journaled argument takes for a call: builtins rollback
 /// (their arguments are non-owning plain reads in the interpreter), user
 /// functions commit the moves at the boundary.
-fn finalize_args(interp: &mut Interp, func: &Value, n_takes: usize) -> LResult<()> {
+fn finalize_args(interp: &mut Interp, is_builtin: bool, n_takes: usize) -> LResult<()> {
     if n_takes == 0 {
         return Ok(());
     }
-    let is_builtin = matches!(
-        func,
-        Value::Func(f) if matches!(f.body, crate::value::FuncBody::Builtin(_))
-    );
-    let undo_len = interp.vm.frames.last().expect("frame").undo.len();
-    let start = undo_len.saturating_sub(n_takes);
-    let rows: Vec<UndoRec> = interp
-        .vm
-        .frames
-        .last_mut()
-        .expect("frame")
-        .undo
-        .drain(start..)
-        .collect();
+    // Move the journal buffer out (O(1), no allocation), process the pending
+    // suffix, then put the empty buffer back for reuse by the next call.
+    let mut undo = {
+        let frame = interp.vm.frames.last_mut().expect("frame");
+        std::mem::take(&mut frame.undo)
+    };
+    let start = undo.len().saturating_sub(n_takes);
     if is_builtin {
-        for rec in rows.into_iter().rev() {
+        for rec in undo.drain(start..).rev() {
             restore_arg(interp, rec)?;
         }
     } else {
-        for rec in rows {
+        for rec in undo.drain(start..) {
             commit_arg(interp, rec)?;
         }
     }
+    interp.vm.frames.last_mut().expect("frame").undo = undo;
     Ok(())
 }
 
@@ -1141,6 +1735,31 @@ fn finalize_args(interp: &mut Interp, func: &Value, n_takes: usize) -> LResult<(
 fn commit_arg(interp: &mut Interp, rec: UndoRec) -> LResult<()> {
     match rec {
         UndoRec::Done => {}
+        UndoRec::Local { slot, vid, dest, value } => {
+            let mark = interp
+                .vm
+                .frames
+                .last()
+                .and_then(|f| f.slots.get(slot))
+                .map(|cell| {
+                    cell.inspect(|s| matches!(s, SlotV::Set(cur) if same_heap(cur, &value)))
+                })
+                .unwrap_or(false);
+            if mark {
+                let note = crate::value::MoveNote { to: dest.clone(), span: span0() };
+                if let Some(cell) = interp
+                    .vm
+                    .frames
+                    .last_mut()
+                    .and_then(|f| f.slots.get_mut(slot))
+                {
+                    cell.set(SlotV::Moved(vec![note]));
+                }
+            }
+            if let Some(vid) = vid {
+                crate::value::with_reg(|r| r.rename(vid, dest.clone(), span0()));
+            }
+        }
         UndoRec::Slot { handle, vid, dest, value, .. } => {
             let mark = {
                 let b = handle.borrow();
@@ -1186,6 +1805,18 @@ fn commit_arg(interp: &mut Interp, rec: UndoRec) -> LResult<()> {
 fn restore_arg(interp: &mut Interp, rec: UndoRec) -> LResult<()> {
     match rec {
         UndoRec::Done => {}
+        UndoRec::Local { slot, value, .. } => {
+            if let Some(cell) = interp
+                .vm
+                .frames
+                .last_mut()
+                .and_then(|f| f.slots.get_mut(slot))
+            {
+                if cell.inspect(|s| matches!(s, SlotV::Moved(_))) {
+                    cell.set(SlotV::Set(value));
+                }
+            }
+        }
         UndoRec::Slot { handle, value, .. } => match &*handle.borrow() {
             // the deferred take never moved the slot; only a nested take or
             // reassignment through upvals could have altered it since
@@ -1223,15 +1854,6 @@ fn restore_arg(interp: &mut Interp, rec: UndoRec) -> LResult<()> {
 }
 
 // ===== value helpers =====
-
-fn drain_args(interp: &mut Interp, base: usize, exp: bool) -> Vec<Value> {
-    let nargs = if exp { base + interp.vm.last_ret } else { base };
-    let sp = interp.vm.stack.len();
-    let take = nargs.min(sp);
-    let args: Vec<Value> = interp.vm.stack.drain(sp - take..).collect();
-    interp.vm.last_ret = 1;
-    args
-}
 
 fn expect_table(v: &Value) -> LResult<Rc<TableObj>> {
     match v.base_value() {
@@ -1285,9 +1907,28 @@ fn num_binop(op: &str, l: &Value, r: &Value, f: fn(f64, f64) -> f64) -> LResult<
     }
 }
 
+#[inline(always)]
 fn bin_arith(op: &str, f: fn(f64, f64) -> f64, interp: &mut Interp) -> LResult<StepOutcome> {
     let r = pop1(interp);
     let l = pop1(interp);
+    // Numeric fast path: no `Value::base_value` / type-name / formatting
+    // machinery on the common case. Aliases deliberately take the slow path.
+    if let (Value::Number(a), Value::Number(b)) = (&l, &r) {
+        interp.vm.stack.push(Value::Number(f(*a, *b)));
+        interp.vm.last_ret = 1;
+        return Ok(StepOutcome::Continue);
+    }
+    bin_arith_slow(op, f, l, r, interp)
+}
+
+#[inline(never)]
+fn bin_arith_slow(
+    op: &str,
+    f: fn(f64, f64) -> f64,
+    l: Value,
+    r: Value,
+    interp: &mut Interp,
+) -> LResult<StepOutcome> {
     let v = num_binop(op, &l, &r, f)?;
     interp.vm.stack.push(v);
     interp.vm.last_ret = 1;
@@ -1355,9 +1996,33 @@ fn values_eq(l: &Value, r: &Value) -> bool {
     }
 }
 
+#[inline(always)]
 fn bin_cmp(kind: CmpKind, interp: &mut Interp) -> LResult<StepOutcome> {
     let r = pop1(interp);
     let l = pop1(interp);
+    if let (Value::Number(a), Value::Number(b)) = (&l, &r) {
+        let result = match kind {
+            CmpKind::Eq => a == b,
+            CmpKind::Ne => a != b,
+            CmpKind::Lt => a < b,
+            CmpKind::Le => a <= b,
+            CmpKind::Gt => a > b,
+            CmpKind::Ge => a >= b,
+        };
+        interp.vm.stack.push(Value::Bool(result));
+        interp.vm.last_ret = 1;
+        return Ok(StepOutcome::Continue);
+    }
+    bin_cmp_slow(kind, l, r, interp)
+}
+
+#[inline(never)]
+fn bin_cmp_slow(
+    kind: CmpKind,
+    l: Value,
+    r: Value,
+    interp: &mut Interp,
+) -> LResult<StepOutcome> {
     let lb = l.base_value();
     let rb = r.base_value();
     let result = match kind {
@@ -1402,14 +2067,30 @@ fn bin_cmp(kind: CmpKind, interp: &mut Interp) -> LResult<StepOutcome> {
 
 // ===== constants =====
 
-fn const_value(interp: &mut Interp, k: u16) -> LResult<Value> {
-    let proto = interp.vm.frames.last().expect("frame").proto.clone();
-    proto
+fn const_value(interp: &Interp, k: u16) -> LResult<Value> {
+    let frame = interp.vm.frames.last().expect("frame");
+    frame
+        .proto
         .proto
         .consts
         .get(k as usize)
         .cloned()
         .ok_or_else(|| err(crate::error::E_RUNTIME, format!("internal: constant {} out of range", k)))
+}
+
+/// Fast path for a global read: one hash lookup and one `Value` clone, no
+/// `Rc<ScopeRef>` clone and no second/third lookup. Missing or moved slots fall
+/// back to `scope::read_slot` so error history and nil semantics stay identical.
+#[inline]
+fn read_global_fast(interp: &Interp, name: &str) -> Option<Value> {
+    let b = interp.globals.borrow();
+    match b.vars.get(name) {
+        Some(SlotV::Set(Value::Number(n))) => Some(Value::Number(*n)),
+        Some(SlotV::Set(Value::Bool(v))) => Some(Value::Bool(*v)),
+        Some(SlotV::Set(Value::Nil)) => Some(Value::Nil),
+        Some(SlotV::Set(v)) => Some(v.clone()),
+        _ => None,
+    }
 }
 
 fn push_const(interp: &mut Interp, k: u16) -> LResult<()> {
@@ -1419,12 +2100,18 @@ fn push_const(interp: &mut Interp, k: u16) -> LResult<()> {
     Ok(())
 }
 
-fn const_str(interp: &mut Interp, k: u16) -> LResult<String> {
-    match const_value(interp, k)? {
-        Value::Str(s) => Ok(s.to_string()),
-        other => Err(err(
+/// String constant as an interned `Arc<str>`: a refcount bump, not a copy.
+fn const_str(interp: &Interp, k: u16) -> LResult<Arc<str>> {
+    let frame = interp.vm.frames.last().expect("frame");
+    match frame.proto.proto.consts.get(k as usize) {
+        Some(Value::Str(s)) => Ok(s.clone()),
+        Some(other) => Err(err(
             crate::error::E_RUNTIME,
             format!("internal: constant {} is not a string ({})", k, other.type_name()),
+        )),
+        None => Err(err(
+            crate::error::E_RUNTIME,
+            format!("internal: constant {} out of range", k),
         )),
     }
 }
@@ -1438,16 +2125,150 @@ fn const_str_from_frame(proto: &Rc<Compiled>, k: u16) -> Arc<str> {
 
 // ===== slots =====
 
-fn slot_handle(interp: &mut Interp, slot: usize) -> LResult<Rc<RefCell<SlotV>>> {
-    interp
-        .vm
-        .frames
-        .last()
-        .expect("frame")
+/// Fast local read for `GetLoc`: direct cells avoid all `Rc`/`RefCell` work;
+/// captured cells fall back to the shared cell path.
+#[inline]
+fn push_local(interp: &mut Interp, slot: usize) -> LResult<()> {
+    let frame = interp.vm.frames.last().expect("frame");
+    let cell = frame
         .slots
         .get(slot)
-        .cloned()
-        .ok_or_else(|| err(crate::error::E_RUNTIME, format!("internal: slot {} out of range", slot)))
+        .ok_or_else(|| err(crate::error::E_RUNTIME, format!("internal: slot {} out of range", slot)))?;
+    // Numeric locals dominate loops and recursive calls.
+    if let Some(v) = cell.scalar() {
+        interp.vm.stack.push(v);
+        interp.vm.last_ret = 1;
+        return Ok(());
+    }
+    match cell.read_clone() {
+        Some(v) => {
+            interp.vm.stack.push(v);
+            interp.vm.last_ret = 1;
+            Ok(())
+        }
+        None => {
+            let label = frame
+                .proto
+                .proto
+                .slot_labels
+                .get(slot)
+                .cloned()
+                .unwrap_or_else(|| Arc::from("(local)"));
+            Err(err(
+                crate::error::E_MOVED,
+                format!("use of moved value `{}`", label),
+            ))
+        }
+    }
+}
+
+/// Fast upvalue read for `GetUp` (same strategy as `push_local`).
+#[inline]
+fn push_upval(interp: &mut Interp, idx: usize) -> LResult<()> {
+    let frame = interp.vm.frames.last().expect("frame");
+    let handle = frame.upvals.get(idx).ok_or_else(|| {
+        err(
+            crate::error::E_RUNTIME,
+            format!("internal: upvalue {} out of range", idx),
+        )
+    })?;
+    let scalar = {
+        let b = handle.borrow();
+        match &*b {
+            SlotV::Set(Value::Number(n)) => Some(Value::Number(*n)),
+            SlotV::Set(Value::Bool(v)) => Some(Value::Bool(*v)),
+            SlotV::Set(Value::Nil) => Some(Value::Nil),
+            _ => None,
+        }
+    };
+    if let Some(v) = scalar {
+        interp.vm.stack.push(v);
+        interp.vm.last_ret = 1;
+        return Ok(());
+    }
+    let value = match &*handle.borrow() {
+        SlotV::Set(v) => Some(v.clone()),
+        SlotV::Moved(_) => None,
+    };
+    match value {
+        Some(v) => {
+            interp.vm.stack.push(v);
+            interp.vm.last_ret = 1;
+            Ok(())
+        }
+        None => {
+            let label = frame
+                .proto
+                .proto
+                .upval_labels
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| Arc::from("(captured)"));
+            Err(err(
+                crate::error::E_MOVED,
+                format!("use of moved value `{}`", label),
+            ))
+        }
+    }
+}
+
+/// Fast path for the three numeric loop-control slots. They are almost always
+/// direct (not closure-captured), so this avoids three separate `frame_num`
+/// calls and three independent `SlotCell` dispatches.
+#[inline]
+fn frame_nums3(frame: &VmFrame, var: usize, limit: usize, step: usize) -> LResult<(f64, f64, f64)> {
+    if let (
+        Some(SlotCell::Direct(SlotV::Set(Value::Number(i)))),
+        Some(SlotCell::Direct(SlotV::Set(Value::Number(l)))),
+        Some(SlotCell::Direct(SlotV::Set(Value::Number(s)))),
+    ) = (
+        frame.slots.get(var),
+        frame.slots.get(limit),
+        frame.slots.get(step),
+    ) {
+        return Ok((*i, *l, *s));
+    }
+    Ok((
+        frame_num(frame, var)?,
+        frame_num(frame, limit)?,
+        frame_num(frame, step)?,
+    ))
+}
+
+/// Reads a numeric loop-control slot without cloning `Value` or its handle.
+#[inline]
+fn frame_num(frame: &VmFrame, slot: usize) -> LResult<f64> {
+    let cell = frame.slots.get(slot).ok_or_else(|| {
+        err(
+            crate::error::E_RUNTIME,
+            format!("internal: slot {} out of range", slot),
+        )
+    })?;
+    let state = cell.inspect(|s| match s {
+        SlotV::Set(Value::Number(n)) => Ok(*n),
+        SlotV::Set(other) => Err(Some(other.type_name())),
+        SlotV::Moved(_) => Err(None),
+    });
+    match state {
+        Ok(n) => Ok(n),
+        Err(Some(name)) => Err(err(
+            crate::error::E_ARITH,
+            format!("for control variables must be numbers (got {})", name),
+        )),
+        Err(None) => {
+            let label = frame
+                .proto
+                .proto
+                .slot_labels
+                .get(slot)
+                .cloned()
+                .unwrap_or_else(|| Arc::from("(local)"));
+            Err(err(
+                crate::error::E_MOVED,
+                format!("use of moved value `{}`", label),
+            ))
+        }
+    }
 }
 
 fn upval_handle(interp: &mut Interp, idx: usize) -> LResult<Rc<RefCell<SlotV>>> {
@@ -1460,16 +2281,6 @@ fn upval_handle(interp: &mut Interp, idx: usize) -> LResult<Rc<RefCell<SlotV>>> 
         .get(idx)
         .cloned()
         .ok_or_else(|| err(crate::error::E_RUNTIME, format!("internal: upvalue {} out of range", idx)))
-}
-
-fn slot_push(interp: &mut Interp, handle: &Rc<RefCell<SlotV>>, label: Arc<str>) -> LResult<()> {
-    let v = match handle.borrow().as_value() {
-        Some(v) => v.clone(),
-        None => return Err(err(crate::error::E_MOVED, format!("use of moved value `{}`", label))),
-    };
-    interp.vm.stack.push(v);
-    interp.vm.last_ret = 1;
-    Ok(())
 }
 
 fn slot_label(interp: &mut Interp, slot: usize) -> Arc<str> {
@@ -1490,33 +2301,6 @@ fn upval_label(interp: &mut Interp, idx: usize) -> Arc<str> {
         .get(idx)
         .cloned()
         .unwrap_or_else(|| Arc::from("(captured)"))
-}
-
-fn set_num_slot(interp: &mut Interp, slot: usize, n: f64) -> LResult<()> {
-    let handle = slot_handle(interp, slot)?;
-    *handle.borrow_mut() = SlotV::Set(Value::Number(n));
-    Ok(())
-}
-
-fn num_slot_call(interp: &mut Interp, slot: usize) -> LResult<f64> {
-    let handle = slot_handle(interp, slot)?;
-    let label = slot_label(interp, slot);
-    let v = match handle.borrow().as_value() {
-        Some(v) => v.clone(),
-        None => {
-            return Err(err(
-                crate::error::E_MOVED,
-                format!("use of moved value `{}`", label),
-            ))
-        }
-    };
-    match v.base_value() {
-        Value::Number(n) => Ok(*n),
-        other => Err(err(
-            crate::error::E_ARITH,
-            format!("for control variables must be numbers (got {})", other.type_name()),
-        )),
-    }
 }
 
 // ===== segments & iteration =====
@@ -1587,12 +2371,12 @@ fn advance_iter(interp: &mut Interp, it: &Value, nvars: usize) -> LResult<Vec<Va
 /// Writes row values into the consecutive loop variable slots; leftover
 /// variables stay unassigned for parity with the interpreter.
 fn store_row(interp: &mut Interp, first: usize, nvars: usize, row: &[Value]) -> LResult<()> {
+    let frame = interp.vm.frames.last_mut().expect("frame");
     for (i, v) in row.iter().enumerate() {
         if i >= nvars {
             break;
         }
-        let handle = slot_handle(interp, first + i)?;
-        *handle.borrow_mut() = SlotV::Set(v.clone());
+        frame.slots[first + i].set(SlotV::Set(v.clone()));
     }
     Ok(())
 }

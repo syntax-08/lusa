@@ -51,7 +51,7 @@ See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full toolchain guide
 ```sh
 cargo build             # debug
 cargo build --release   # release turbo (opt-level 3 + LTO) — use this to install
-cargo test              # integration suite (19 tests)
+cargo test              # integration suite (42 tests)
 ```
 
 The resulting binary (`target\release\lusa.exe`) is standalone: **running

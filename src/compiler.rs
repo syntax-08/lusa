@@ -48,11 +48,19 @@ pub struct Chunk {
     pub slot_labels: Vec<Arc<str>>,
     /// upvalue → captured name (labels)
     pub upval_labels: Vec<Arc<str>>,
+    /// `DeclFromSeg` binding groups, kept out of line so `Instr` stays `Copy`
+    pub decl_groups: Vec<Vec<(u16, u16)>>,
 }
 
 /// Stack-machine instructions. `i32` jump fields hold **absolute instruction
 /// indexes** (patched after compilation).
-#[derive(Clone, Debug)]
+///
+/// `repr(u8)` keeps the discriminant one byte wide and lets LLVM lower the
+/// dense tag match to a single jump table. All payloads are small integers:
+/// the whole value is `Copy`, so the dispatch loop can load it by value
+/// without touching the heap or cloning an `Rc`.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
 pub enum Instr {
     LoadConst(u16),
     LoadNil,
@@ -70,6 +78,9 @@ pub enum Instr {
     GetField(u16), // TOS = obj
     GetIndex,      // TOS = key, under = obj
     SetGlob(u16),  // TOS = value
+    // single-value assignment fast path: no segment bookkeeping
+    SetLoc(u16), // TOS = value
+    SetUp(u16),  // TOS = value
     SetFieldK(u16), // TOS = obj, below = value
     SetIndex,      // TOS = key, under1 = obj, under2 = value
     SetArr,        // TOS = value, under = table (appends via next_arr)
@@ -82,10 +93,16 @@ pub enum Instr {
     BorrowErr, // borrow is rejected in bytecode mode
     // calls — `nt` = number of journaled argument takes finalized by this call
     // (builtins restore them, matching the interpreter's `is_builtin()` rules)
-    Call(usize, usize),
-    CallExp(usize, usize), // nargs = base + last_ret
-    MethodCall(u16, usize, usize),
-    MethodCallExp(u16, usize, usize),
+    Call(u16, u16),
+    CallExp(u16, u16), // nargs = base + last_ret
+    // single-value call variants: the return path truncates instead of the
+    // caller executing a separate `TruncateToOne`
+    CallOne(u16, u16),
+    CallExpOne(u16, u16),
+    MethodCall(u16, u16, u16),
+    MethodCallExp(u16, u16, u16),
+    MethodCallOne(u16, u16, u16),
+    MethodCallExpOne(u16, u16, u16),
     // deferred call-argument takes (same moving reads; journaled per-frame
     // until the call decides: builtins restore, user functions commit)
     ArgLoc(u16, u16),
@@ -104,8 +121,8 @@ pub enum Instr {
     Pop,           // discard one value
     // closures & returns
     MakeClosure(u16),
-    RetFixed(usize),
-    RetExp(usize), // nvals = base + last_ret
+    RetFixed(u16),
+    RetExp(u16), // nvals = base + last_ret
     // varargs
     VarargLoad,    // pushes all `...` (multi)
     VarargLoadOne, // first of `...` (single)
@@ -126,20 +143,20 @@ pub enum Instr {
     ForInSetup {
         iter: u16,
         first: u16,
-        nvars: usize,
+        nvars: u16,
         end: i32,
     },
     ForInStep {
         iter: u16,
         first: u16,
-        nvars: usize,
+        nvars: u16,
         top: i32,
         end: i32,
     },
     // list segments (assignment / declaration value groups)
     SegStart,
     SegEnd,
-    DeclFromSeg(Vec<(u16, u16)>), // (slot, name-const) per target, in order
+    DeclFromSeg(u16), // index into Chunk::decl_groups
     StoreLocSeg(u16),
     StoreUpSeg(u16),
     StoreGlobSeg(u16),  // name-const
@@ -164,6 +181,8 @@ struct Frame {
     upvals: Vec<UpDef>,
     upval_labels: Vec<String>,
     code: Vec<Instr>,
+    /// out-of-line `DeclFromSeg` binding groups
+    decl_groups: Vec<Vec<(u16, u16)>>,
     /// pending break jumps of the innermost enclosing loops
     breaks: Vec<Vec<usize>>,
     nparams: usize,
@@ -217,6 +236,7 @@ impl Frame {
             upvals: Vec::new(),
             upval_labels: Vec::new(),
             code: Vec::new(),
+            decl_groups: Vec::new(),
             breaks: Vec::new(),
             nparams: 0,
             has_vararg: false,
@@ -503,7 +523,7 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
         }
         ExprKind::Paren(inner) => {
             compile_expr(c, inner)?;
-            c.em(Instr::TruncateToOne);
+            emit_truncate_one(c);
         }
         ExprKind::Vararg => {
             c.em(Instr::VarargLoadOne);
@@ -577,8 +597,28 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
 /// Non-last positions truncate expansions to their first value.
 fn truncate_if_expansion(c: &mut Compiler, e: &Expr) {
     if is_expansion(e) {
-        c.em(Instr::TruncateToOne);
+        emit_truncate_one(c);
     }
+}
+
+/// Emits a one-value truncation, fusing it into the call instruction when the
+/// last emitted instruction is that call. The VM then truncates on return,
+/// saving a dispatch on the extremely common `f(...)` single-value path.
+fn emit_truncate_one(c: &mut Compiler) {
+    if let Some(last) = c.cur().code.last_mut() {
+        let fused = match *last {
+            Instr::Call(a, b) => Some(Instr::CallOne(a, b)),
+            Instr::CallExp(a, b) => Some(Instr::CallExpOne(a, b)),
+            Instr::MethodCall(a, b, d) => Some(Instr::MethodCallOne(a, b, d)),
+            Instr::MethodCallExp(a, b, d) => Some(Instr::MethodCallExpOne(a, b, d)),
+            _ => None,
+        };
+        if let Some(ins) = fused {
+            *last = ins;
+            return;
+        }
+    }
+    c.em(Instr::TruncateToOne);
 }
 
 /// Is this expression a known multi-return producer?
@@ -636,9 +676,9 @@ fn compile_call(c: &mut Compiler, callee: &Expr, args: &[Expr], _end: Span) -> L
         }
     }
     if n > 0 && is_expansion(&args[n - 1]) {
-        c.em(Instr::CallExp(n - 1, nt));
+        c.em(Instr::CallExp((n - 1) as u16, nt as u16));
     } else {
-        c.em(Instr::Call(n, nt));
+        c.em(Instr::Call(n as u16, nt as u16));
     }
     Ok(())
 }
@@ -660,9 +700,9 @@ fn compile_method(c: &mut Compiler, obj: &Expr, name: &str, args: &[Expr], _end:
         }
     }
     if n > 0 && is_expansion(&args[n - 1]) {
-        c.em(Instr::MethodCallExp(k, n - 1, nt));
+        c.em(Instr::MethodCallExp(k, (n - 1) as u16, nt as u16));
     } else {
-        c.em(Instr::MethodCall(k, n, nt));
+        c.em(Instr::MethodCall(k, n as u16, nt as u16));
     }
     Ok(())
 }
@@ -726,6 +766,7 @@ fn compile_nested_fn(c: &mut Compiler, lit: &FuncLit, name: &str) -> LResult<()>
             prototypes: frame.protos,
             slot_labels: frame.slots.iter().map(|s| Arc::from(s.as_str())).collect(),
             upval_labels: frame.upval_labels.iter().map(|s| Arc::from(s.as_str())).collect(),
+            decl_groups: frame.decl_groups,
         }),
         upvals: frame.upvals,
     });
@@ -821,12 +862,36 @@ fn compile_local(c: &mut Compiler, targets: &[String], values: &[Expr]) -> LResu
         let k = c.konst_str(t);
         slot_name.push((slot, k));
     }
-    c.em(Instr::DeclFromSeg(slot_name));
+    let group_idx = c.cur().decl_groups.len() as u16;
+    c.cur().decl_groups.push(slot_name);
+    c.em(Instr::DeclFromSeg(group_idx));
     c.em(Instr::SegEnd);
     Ok(())
 }
 
 fn compile_assign(c: &mut Compiler, targets: &[Expr], values: &[Expr]) -> LResult<()> {
+    // Single target, single non-expanding value: the segment machinery exists
+    // to account for multi-value groups, but here it only costs three extra
+    // instructions. Emit a direct store instead (the hot loop assignment path).
+    if targets.len() == 1 && values.len() == 1 && !is_expansion(&values[0]) {
+        if let ExprKind::Var(name) = &targets[0].kind {
+            let dest = format!("`{}`", name);
+            let _ = compile_take_value(c, &values[0], &dest, false)?;
+            match resolve(c, name) {
+                Resolved::Local(slot) => {
+                    c.em(Instr::SetLoc(slot));
+                }
+                Resolved::Upval(i) => {
+                    c.em(Instr::SetUp(i));
+                }
+                Resolved::Global => {
+                    let k = c.konst_str(name);
+                    c.em(Instr::SetGlob(k));
+                }
+            }
+            return Ok(());
+        }
+    }
     c.em(Instr::SegStart);
     let n = values.len();
     for (i, v) in values.iter().enumerate() {
@@ -994,7 +1059,7 @@ fn compile_for_iter(c: &mut Compiler, vars: &[String], values: &[Expr], body: &B
         let s = c.declare(v);
         first = first.min(s);
     }
-    let nvars = vars.len();
+    let nvars = vars.len() as u16;
     c.cur().breaks.push(Vec::new());
     let setup = c.em(Instr::ForInSetup { iter: iter_slot, first, nvars, end: 0 });
     compile_block(c, body)?;
@@ -1056,9 +1121,9 @@ fn compile_return(c: &mut Compiler, values: &[Expr]) -> LResult<()> {
         }
     }
     if n > 0 && is_expansion(&values[n - 1]) {
-        c.em(Instr::RetExp(n - 1));
+        c.em(Instr::RetExp((n - 1) as u16));
     } else {
-        c.em(Instr::RetFixed(n));
+        c.em(Instr::RetFixed(n as u16));
     }
     Ok(())
 }
@@ -1092,6 +1157,7 @@ pub fn compile_program(src: &str) -> LResult<Rc<Compiled>> {
             prototypes: f.protos,
             slot_labels: f.slots.iter().map(|s| Arc::from(s.as_str())).collect(),
             upval_labels: f.upval_labels.iter().map(|s| Arc::from(s.as_str())).collect(),
+            decl_groups: f.decl_groups,
         }),
         upvals: f.upvals,
     }))

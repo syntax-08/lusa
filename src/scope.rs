@@ -5,27 +5,65 @@
 //! scope. Name resolution order: current frame scopes → closure env → globals.
 
 use std::cell::RefCell;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
 use crate::error::{LResult, LusaError, Span, E_MOVED};
 use crate::interp::move_from_history;
 use crate::value::{SlotV, Value};
 
+/// Small non-cryptographic hasher for variable names. The default SipHash is
+/// overkill for a single-threaded language runtime and dominates short global
+/// lookups (`GetGlob` in recursive functions).
+pub struct NameHasher(u64);
+
+const FNV_INIT: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+impl Default for NameHasher {
+    #[inline]
+    fn default() -> Self {
+        Self(FNV_INIT)
+    }
+}
+
+impl Hasher for NameHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        self.0 = h;
+    }
+}
+
+pub type NameMap<K, V> = HashMap<K, V, BuildHasherDefault<NameHasher>>;
+
 pub struct ScopeData {
-    pub vars: HashMap<String, SlotV>,
+    pub vars: NameMap<String, SlotV>,
     /// reserved: distinguishes the (single) globals scope
     #[allow(dead_code)]
     pub is_global: bool,
+    /// bumped on every global mutation; lets the VM keep a one-entry read
+    /// cache without ever observing a stale global value
+    pub version: u64,
 }
 
 pub type ScopeRef = Rc<RefCell<ScopeData>>;
 
 pub fn new_scope(is_global: bool) -> ScopeRef {
     Rc::new(RefCell::new(ScopeData {
-        vars: HashMap::new(),
+        vars: NameMap::default(),
         is_global,
+        version: 0,
     }))
 }
 
@@ -83,18 +121,20 @@ pub fn read_slot(chain: &[ScopeRef], name: &str, span: Span) -> LResult<Value> {
 pub fn set_slot(chain: &[ScopeRef], globals: &ScopeRef, name: &str, slot: SlotV) {
     for s in chain.iter().rev() {
         let mut b = s.borrow_mut();
-        match b.vars.entry(name.to_string()) {
-            Entry::Occupied(mut occ) => {
-                occ.insert(slot);
-                return;
-            }
-            Entry::Vacant(_) => {
-                drop(b);
-                continue;
-            }
+        // Look up by `&str` first: allocating the key on every assignment is
+        // pure overhead when the slot already exists (the common case).
+        if let Some(existing) = b.vars.get_mut(name) {
+            *existing = slot;
+            return;
         }
     }
-    globals.borrow_mut().vars.insert(name.to_string(), slot);
+    let mut g = globals.borrow_mut();
+    if let Some(existing) = g.vars.get_mut(name) {
+        *existing = slot;
+    } else {
+        g.vars.insert(name.to_string(), slot);
+    }
+    g.version = g.version.wrapping_add(1);
 }
 
 /// Declares a name in the topmost scope (a fresh slot). If the name already
@@ -105,7 +145,9 @@ pub fn declare(chain: &[ScopeRef], globals: &ScopeRef, name: &str, slot: SlotV) 
             s.borrow_mut().vars.insert(name.to_string(), slot);
         }
         None => {
-            globals.borrow_mut().vars.insert(name.to_string(), slot);
+            let mut g = globals.borrow_mut();
+            g.vars.insert(name.to_string(), slot);
+            g.version = g.version.wrapping_add(1);
         }
     }
 }

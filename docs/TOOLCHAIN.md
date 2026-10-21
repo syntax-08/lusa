@@ -144,7 +144,7 @@ Requires Rust (cargo) ≥ 1.70. Commands, from the project root:
 ```sh
 cargo build             # debug build (fast to compile, slow to run)
 cargo build --release   # release turbo: lto + codegen-units=1 + opt-level=3
-cargo test              # integration suite (19 tests)
+cargo test              # integration suite (42 tests)
 cargo run               # opens the REPL straight from source
 ```
 
@@ -327,3 +327,49 @@ lusalang run main.lusa --vm   # compile + run on the bytecode VM
 Both speak the same language, including the ownership model (`move` via plain
 assignment, `clone`, `borrow` — note: `borrow` is interpreter-only for now),
 pcall error handling and E-codes.
+
+### VM hot-path notes
+
+The VM is deliberately built around the operations that dominate real programs
+(loops, local reads/writes and recursive calls), while keeping the runtime
+`std`-only:
+
+- **VM→VM calls use a trampoline.** `call_plain`/`call_method` push the callee
+  frame and return to the same interpreter loop. There is no Rust recursion per
+  Lusa call, so deep recursion and `pcall` unwind through frames, not the native
+  stack.
+- **Locals are direct by default.** A frame stores `SlotCell::Direct(SlotV)`.
+  The first time a closure captures a local, that single slot is promoted to
+  `Shared(Rc<RefCell<SlotV>>)`. Non-capturing functions therefore avoid an `Rc`
+  allocation and a `RefCell` borrow on every `GetLoc`/`SetLoc`.
+- **Numeric loop control is a fast path.** `ForNumStep` reads the three control
+  slots in one combined check, updates the loop variable in place and patches
+  `pc` without re-decoding the instruction stream.
+- **Single-value calls truncate on return.** When a call is immediately used
+  where one value is required, the compiler fuses its `TruncateToOne` into a
+  `CallOne`/`MethodCallOne` variant. The callee return path keeps the first
+  result (or produces `nil` for a zero-result call), avoiding a separate
+  dispatch.
+- **Globals use a cheap name hash and a versioned read cache.** Variable-name
+  maps use a small FNV-1a hasher instead of SipHash; `GetGlob` keeps a one-entry
+  cache guarded by a globals `version`, so a cached value can never survive a
+  global assignment.
+- **The instruction stream is allocation-free.** `Instr` is `Copy` and compact,
+  fixed arguments stay on the shared value stack, and frame slot vectors are
+  recycled between calls.
+
+#### Measured hot-path gains
+
+Release build, Windows x64, CPU time (`TotalProcessorTime`, not wall clock),
+medians of three runs:
+
+| workload                         | v0.2.0 baseline | current VM | gain   |
+|----------------------------------|-----------------|------------|--------|
+| 1M-iteration arithmetic loop     | ~1,969 ms       | ~78 ms     | ~25×   |
+| recursive `fib(32)`              | ~23,359 ms      | ~1,641 ms  | ~14×   |
+| recursive `fib(33)`              | —               | ~2,734 ms  | —      |
+| 10M global reads                 | —               | ~828 ms    | —      |
+| 10M local reads                  | —               | ~688 ms    | —      |
+
+The numbers are machine-specific; re-run the same benchmark files with
+`Start-Process` and measure `TotalProcessorTime` for a comparable result.

@@ -169,36 +169,41 @@ impl Clone for Value {
     /// Copy semantics — scalars/strings copy; heap handles duplicate the Rc
     /// (a *read*, not a move); aliases get a fresh tag (they are Copy too,
     /// like Rust's shared references).
+    ///
+    /// The alias branch is cold and outlined; the common scalar/Rc copy stays
+    /// small enough to inline into the VM's slot reads.
+    #[inline]
     fn clone(&self) -> Self {
         match self {
-            Value::Alias(a) => {
-                // clone the base first: cloning a nested alias uses the
-                // registry too, so it must NOT happen inside `with_reg`
-                let base = a.base.clone();
-                let (tag, by, span) = with_reg(|r| {
-                    let tag = r.next_tag();
-                    if let Some(vid) = base.vid() {
-                        r.add_borrower(
-                            vid,
-                            Borrower { tag, by: a.by.clone(), span: a.span, kind: a.kind },
-                        );
-                    }
-                    (tag, a.by.clone(), a.span)
-                });
-                Value::Alias(Box::new(AliasBox { base, tag, kind: a.kind, by, span }))
-            }
-            other => match other {
-                Value::Nil => Value::Nil,
-                Value::Bool(b) => Value::Bool(*b),
-                Value::Number(n) => Value::Number(*n),
-                Value::Str(s) => Value::Str(Arc::clone(s)),
-                Value::Table(t) => Value::Table(Rc::clone(t)),
-                Value::Func(f) => Value::Func(Rc::clone(f)),
-                Value::Iter(i) => Value::Iter(Rc::clone(i)),
-                Value::Alias(_) => unreachable!(),
-            },
+            Value::Alias(a) => clone_alias(a),
+            Value::Nil => Value::Nil,
+            Value::Bool(b) => Value::Bool(*b),
+            Value::Number(n) => Value::Number(*n),
+            Value::Str(s) => Value::Str(Arc::clone(s)),
+            Value::Table(t) => Value::Table(Rc::clone(t)),
+            Value::Func(f) => Value::Func(Rc::clone(f)),
+            Value::Iter(i) => Value::Iter(Rc::clone(i)),
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn clone_alias(a: &AliasBox) -> Value {
+    // clone the base first: cloning a nested alias uses the registry too, so
+    // it must NOT happen inside `with_reg`
+    let base = a.base.clone();
+    let (tag, by, span) = with_reg(|r| {
+        let tag = r.next_tag();
+        if let Some(vid) = base.vid() {
+            r.add_borrower(
+                vid,
+                Borrower { tag, by: a.by.clone(), span: a.span, kind: a.kind },
+            );
+        }
+        (tag, a.by.clone(), a.span)
+    });
+    Value::Alias(Box::new(AliasBox { base, tag, kind: a.kind, by, span }))
 }
 
 impl Value {
@@ -489,7 +494,7 @@ pub enum FuncBody {
     Lusa(Rc<crate::ast::FuncLit>),
     Builtin(Builtin),
     /// compiled bytecode function: prototype + captured upvalue slots
-    Vm(Rc<crate::compiler::Compiled>, Vec<Rc<RefCell<SlotV>>>),
+    Vm(Rc<crate::compiler::Compiled>, Rc<[Rc<RefCell<SlotV>>]>),
 }
 
 pub type Builtin =

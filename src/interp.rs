@@ -96,6 +96,8 @@ impl Interp {
                 .vars
                 .insert((*mod_name).to_string(), SlotV::Set(Value::Table(Rc::new(tbl))));
         }
+        let mut g = self.globals.borrow_mut();
+        g.version = g.version.wrapping_add(1);
     }
 
     pub fn run(&mut self, ast: &Block, progname: &str) -> LResult<Vec<Value>> {
@@ -123,7 +125,9 @@ impl Interp {
         } else if scope::find_in(&frame.env, name).is_some() {
             scope::set_slot(&frame.env, &self.globals, name, slot);
         } else {
-            self.globals.borrow_mut().vars.insert(name.to_string(), slot);
+            let mut g = self.globals.borrow_mut();
+            g.vars.insert(name.to_string(), slot);
+            g.version = g.version.wrapping_add(1);
         }
     }
 
@@ -784,10 +788,10 @@ impl Interp {
                         }
                         None => {
                             // assignment auto-declares a global (Lua-like)
-                            self.globals
-                                .borrow_mut()
-                                .vars
-                                .insert(name.clone(), SlotV::Set(v.clone()));
+                            let mut g = self.globals.borrow_mut();
+                            g.vars.insert(name.clone(), SlotV::Set(v.clone()));
+                            g.version = g.version.wrapping_add(1);
+                            drop(g);
                             self.rename_to_owner(&v, &name, Span::new(0, 0));
                         }
                     }
