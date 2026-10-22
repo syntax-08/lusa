@@ -228,8 +228,8 @@ The old PE32+/ELF64 image emitter and its `emit_binary` API were removed. See
 
 From v0.5.0 onward, `.github/workflows/release.yml` publishes a curated body
 from `.github/release-notes/<tag>.md` instead of an auto-generated commit list.
-The publish job validates the presence of **Introdução de Impacto**,
-**Mapeamento de Features**, and **Como Usar** before creating the release.
+The publish job validates the presence of **Impact Introduction**,
+**Feature Highlights**, and **How to Use** before creating the release.
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the policy and template.
 
 ---

@@ -103,9 +103,9 @@ jobs:
         run: |
           notes=".github/release-notes/${GITHUB_REF_NAME}.md"
           test -s "$notes"
-          grep -Fq "## Introdução de Impacto" "$notes"
-          grep -Fq "## Mapeamento de Features" "$notes"
-          grep -Fq "## Como Usar" "$notes"
+          grep -Fq "## Impact Introduction" "$notes"
+          grep -Fq "## Feature Highlights" "$notes"
+          grep -Fq "## How to Use" "$notes"
       - name: List assets
         run: ls -lh dist
       - name: Create or update release
