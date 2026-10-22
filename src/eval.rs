@@ -173,8 +173,11 @@ pub fn eval_expr(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr
         }
         ExprKind::Func(lit) => {
             let vid = crate::value::with_reg(|r| r.alloc_vid());
-            let mut env = frame.scopes.clone();
-            env.extend(frame.env.clone());
+            // Keep the scope chain ordered outermost -> innermost: name lookup
+            // walks it in reverse, so the closure's current scopes must come
+            // last and shadow captured outer variables with the same name.
+            let mut env = frame.env.clone();
+            env.extend(frame.scopes.clone());
             let fobj = FuncObj {
                 vid,
                 name: Some("function".into()),

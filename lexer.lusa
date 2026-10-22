@@ -1,0 +1,690 @@
+-- lexer.lusa — a self-hosted lexer for Lusa.
+--
+-- Public API
+-- ----------
+--   local Lexer = require("lexer")
+--   local tokens = Lexer.lex(source)
+--
+-- Token shape
+-- -----------
+--   {
+--     kind   = "name" | "number" | "string" | "keyword" |
+--              "operator" | "punctuation" | "eof",
+--     value  = raw source lexeme,
+--     line   = 1-based source line,
+--     column = 1-based source column,
+--     start  = 1-based character offset (inclusive),
+--     finish = 1-based character offset (inclusive)
+--   }
+--
+-- String tokens also carry:
+--   text          raw text between the quotes (escapes still encoded)
+--   quote         the opening delimiter, `"` or `'`
+--   interpolated  true when the string contains `\{...}`
+--
+-- Read-only helpers use `borrow self`.  The bytecode VM does not implement
+-- `borrow` yet, so a one-time probe selects an equivalent direct-read path
+-- there.
+
+local function detect_borrow()
+    local probe = {ok = true}
+    return pcall(function()
+        local view = borrow probe
+        return view.ok == true
+    end)
+end
+
+local CAN_BORROW = detect_borrow()
+
+local Lexer = {}
+
+-- Lusa keywords.  `move` is reserved here for the language's planned
+-- explicit-move syntax; the current Rust parser still moves on assignment.
+local KEYWORDS = {
+    ["local"] = true,
+    ["function"] = true,
+    ["end"] = true,
+    ["if"] = true,
+    ["then"] = true,
+    ["elseif"] = true,
+    ["else"] = true,
+    ["for"] = true,
+    ["in"] = true,
+    ["do"] = true,
+    ["while"] = true,
+    ["repeat"] = true,
+    ["until"] = true,
+    ["return"] = true,
+    ["break"] = true,
+    ["and"] = true,
+    ["or"] = true,
+    ["not"] = true,
+    ["borrow"] = true,
+    ["clone"] = true,
+    ["move"] = true,
+    ["nil"] = true,
+    ["true"] = true,
+    ["false"] = true
+}
+
+local SPACE = {
+    [" "] = true,
+    ["\t"] = true,
+    ["\n"] = true,
+    ["\r"] = true,
+    ["\u{000B}"] = true,
+    ["\u{000C}"] = true,
+    ["\u{FEFF}"] = true
+}
+
+local function make_chars(text)
+    local set = {}
+    local i = 1
+    while i <= #text do
+        set[string.sub(text, i, i)] = true
+        i = i + 1
+    end
+    return set
+end
+
+local NAME_START = make_chars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
+local NAME_CONT = make_chars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789")
+local DIGIT = make_chars("0123456789")
+local HEX_DIGIT = make_chars("0123456789abcdefABCDEF")
+
+local TWO_SYMBOLS = {
+    [".."] = true,
+    ["//"] = true,
+    ["=="] = true,
+    ["~="] = true,
+    ["<="] = true,
+    [">="] = true
+}
+
+local THREE_SYMBOLS = {
+    ["..."] = true
+}
+
+local SYMBOLS = {
+    ["+"] = "operator",
+    ["-"] = "operator",
+    ["*"] = "operator",
+    ["/"] = "operator",
+    ["%"] = "operator",
+    ["^"] = "operator",
+    ["#"] = "operator",
+    ["="] = "operator",
+    ["<"] = "operator",
+    [">"] = "operator",
+    ["."] = "operator",
+    ["("] = "punctuation",
+    [")"] = "punctuation",
+    ["{"] = "punctuation",
+    ["}"] = "punctuation",
+    ["["] = "punctuation",
+    ["]"] = "punctuation",
+    [","] = "punctuation",
+    [";"] = "punctuation",
+    [":"] = "punctuation"
+}
+
+local ESCAPES = {
+    ["\\"] = true,
+    ["n"] = true,
+    ["t"] = true,
+    ["r"] = true,
+    ["0"] = true,
+    ["a"] = true,
+    ["\n"] = true
+}
+
+local function is_name_start(ch)
+    if ch == nil then
+        return false
+    end
+    if NAME_START[ch] ~= nil then
+        return true
+    end
+    local b = string.byte(ch, 1)
+    if b == nil then
+        return false
+    end
+    return b >= 128
+end
+
+local function is_name_cont(ch)
+    if ch == nil then
+        return false
+    end
+    if NAME_CONT[ch] ~= nil then
+        return true
+    end
+    local b = string.byte(ch, 1)
+    if b == nil then
+        return false
+    end
+    return b >= 128
+end
+
+local function is_digit(ch)
+    if ch == nil then
+        return false
+    end
+    return DIGIT[ch] ~= nil
+end
+
+local function is_hex_digit(ch)
+    if ch == nil then
+        return false
+    end
+    return HEX_DIGIT[ch] ~= nil
+end
+
+local function hex_value(ch)
+    local b = string.byte(ch, 1)
+    if b == nil then
+        return nil
+    end
+    if b >= 48 then
+        if b <= 57 then
+            return b - 48
+        end
+    end
+    if b >= 65 then
+        if b <= 70 then
+            return b - 55
+        end
+    end
+    if b >= 97 then
+        if b <= 102 then
+            return b - 87
+        end
+    end
+    return nil
+end
+
+-- Lusa already transfers ownership when a heap value is returned.  Keeping
+-- the transfer behind an explicit helper makes the move visible in the code.
+local function move(value)
+    return value
+end
+
+function Lexer.lex(source)
+    if type(source) ~= "string" then
+        error("lexer: source must be a string, got " .. type(source))
+    end
+
+    -- Match the native lexer: a leading UTF-8 BOM is not part of the program
+    -- and must not shift the first token's column.
+    if #source > 0 then
+        if string.sub(source, 1, 1) == "\u{FEFF}" then
+            source = string.sub(source, 2)
+        end
+    end
+
+    local self = {
+        source = source,
+        len = #source,
+        pos = 1,
+        line = 1,
+        column = 1
+    }
+
+    local tokens = {}
+
+
+    local peek
+    if CAN_BORROW then
+        peek = function(offset)
+            local view = borrow self
+            local index = view.pos + offset
+            if index < 1 then
+                return nil
+            end
+            if index > view.len then
+                return nil
+            end
+            return string.sub(view.source, index, index)
+        end
+    else
+        peek = function(offset)
+            local index = self.pos + offset
+            if index < 1 then
+                return nil
+            end
+            if index > self.len then
+                return nil
+            end
+            return string.sub(self.source, index, index)
+        end
+    end
+
+    local slice
+    if CAN_BORROW then
+        slice = function(from, to)
+            local view = borrow self
+            return string.sub(view.source, from, to)
+        end
+    else
+        slice = function(from, to)
+            return string.sub(self.source, from, to)
+        end
+    end
+
+    local function fail(line, column, message)
+        error(string.format("lexer:%d:%d: %s", line, column, message))
+    end
+
+    local function advance()
+        local ch = string.sub(self.source, self.pos, self.pos)
+        self.pos = self.pos + 1
+        if ch == "\n" then
+            self.line = self.line + 1
+            self.column = 1
+        else
+            self.column = self.column + 1
+        end
+        return ch
+    end
+
+    local function consume(count)
+        local i = 0
+        while i < count do
+            advance()
+            i = i + 1
+        end
+    end
+
+    local function emit(kind, value, line, column, start_pos, finish_pos)
+        tokens[#tokens + 1] = {
+            kind = kind,
+            value = value,
+            line = line,
+            column = column,
+            start = start_pos,
+            finish = finish_pos
+        }
+    end
+
+    local function emit_string(value, text, quote, interpolated, line, column, start_pos, finish_pos)
+        tokens[#tokens + 1] = {
+            kind = "string",
+            value = value,
+            text = text,
+            quote = quote,
+            interpolated = interpolated,
+            line = line,
+            column = column,
+            start = start_pos,
+            finish = finish_pos
+        }
+    end
+
+    -- Mutual recursion: strings may contain interpolations, interpolations
+    -- may contain strings, and both may contain comments.
+    local skip_comment, skip_escape, skip_interpolation, skip_quoted
+
+    skip_comment = function()
+        advance() -- first `-`
+        advance() -- second `-`
+
+        if peek(0) == "[" then
+            if peek(1) == "[" then
+                advance()
+                advance()
+                while true do
+                    local ch = peek(0)
+                    if ch == nil then
+                        fail(self.line, self.column, "unterminated block comment (missing `]]`)")
+                    end
+                    if ch == "]" then
+                        if peek(1) == "]" then
+                            advance()
+                            advance()
+                            return
+                        end
+                    end
+                    advance()
+                end
+            end
+        end
+
+        while true do
+            local ch = peek(0)
+            if ch == nil then
+                return
+            end
+            if ch == "\n" then
+                return
+            end
+            advance()
+        end
+    end
+
+    skip_quoted = function(quote)
+        advance() -- opening quote
+        while true do
+            local ch = peek(0)
+            if ch == nil then
+                fail(self.line, self.column, "unterminated string inside interpolation")
+            end
+            if ch == quote then
+                advance()
+                return
+            end
+            if ch == "\\" then
+                skip_escape()
+            else
+                advance()
+            end
+        end
+    end
+
+    skip_interpolation = function()
+        local depth = 1
+        while depth > 0 do
+            local ch = peek(0)
+            if ch == nil then
+                fail(self.line, self.column, "unterminated interpolation (missing `}`)")
+            end
+
+            if ch == "{" then
+                depth = depth + 1
+                advance()
+            elseif ch == "}" then
+                depth = depth - 1
+                advance()
+            elseif ch == '"' then
+                skip_quoted('"')
+            elseif ch == "'" then
+                skip_quoted("'")
+            elseif ch == "-" then
+                if peek(1) == "-" then
+                    skip_comment()
+                else
+                    advance()
+                end
+            else
+                advance()
+            end
+        end
+    end
+
+    skip_escape = function()
+        advance() -- backslash
+        local ch = peek(0)
+        if ch == nil then
+            fail(self.line, self.column, "unterminated escape sequence")
+        end
+
+        if ch == "{" then
+            advance()
+            skip_interpolation()
+            return true
+        end
+
+        if ch == "u" then
+            advance()
+            if peek(0) ~= "{" then
+                fail(self.line, self.column, "`\\u` must be followed by `{...}`")
+            end
+            advance()
+
+            local codepoint = 0
+            local digits = 0
+            while is_hex_digit(peek(0)) do
+                codepoint = codepoint * 16 + hex_value(peek(0))
+                advance()
+                digits = digits + 1
+            end
+
+            if digits == 0 then
+                fail(self.line, self.column, "invalid unicode escape (expected hex digits)")
+            end
+            if peek(0) ~= "}" then
+                fail(self.line, self.column, "invalid unicode escape (missing `}`)")
+            end
+            advance()
+
+            if codepoint > 1114111 then
+                fail(self.line, self.column, "unicode escape is outside the Unicode range")
+            end
+            if codepoint >= 55296 then
+                if codepoint <= 57343 then
+                    fail(self.line, self.column, "unicode escape is a surrogate code point")
+                end
+            end
+            return false
+        end
+
+        if ESCAPES[ch] ~= nil then
+            advance()
+            return false
+        end
+
+        fail(self.line, self.column, string.format("unknown escape `\\%s`", ch))
+        return false
+    end
+
+    local function skip_trivia()
+        while true do
+            local ch = peek(0)
+            if ch == nil then
+                return
+            end
+            if SPACE[ch] ~= nil then
+                advance()
+            elseif ch == "-" then
+                if peek(1) == "-" then
+                    skip_comment()
+                else
+                    return
+                end
+            else
+                return
+            end
+        end
+    end
+
+    local function lookahead(count)
+        local text = ""
+        local i = 0
+        while i < count do
+            local ch = peek(i)
+            if ch == nil then
+                return text
+            end
+            text = text .. ch
+            i = i + 1
+        end
+        return text
+    end
+
+    local function scan_name()
+        local start_pos = self.pos
+        local line = self.line
+        local column = self.column
+
+        while is_name_cont(peek(0)) do
+            advance()
+        end
+
+        local word = slice(start_pos, self.pos - 1)
+        local kind = "name"
+        if KEYWORDS[word] ~= nil then
+            kind = "keyword"
+        end
+        emit(kind, word, line, column, start_pos, self.pos - 1)
+    end
+
+    local function scan_number()
+        local start_pos = self.pos
+        local line = self.line
+        local column = self.column
+
+        local is_hex = false
+        if peek(0) == "0" then
+            if peek(1) == "x" then
+                is_hex = true
+            end
+            if peek(1) == "X" then
+                is_hex = true
+            end
+        end
+
+        if is_hex then
+            advance()
+            advance()
+            if is_hex_digit(peek(0)) == false then
+                fail(line, column, "invalid hex literal (expected digits after `0x`)")
+            end
+            while is_hex_digit(peek(0)) do
+                advance()
+            end
+            emit("number", slice(start_pos, self.pos - 1), line, column, start_pos, self.pos - 1)
+            return
+        end
+
+        while is_digit(peek(0)) do
+            advance()
+        end
+
+        if peek(0) == "." then
+            if is_digit(peek(1)) then
+                advance()
+                while is_digit(peek(0)) do
+                    advance()
+                end
+            end
+        end
+
+        local has_exponent = false
+        if peek(0) == "e" then
+            has_exponent = true
+        end
+        if peek(0) == "E" then
+            has_exponent = true
+        end
+
+        if has_exponent then
+            local next_ch = peek(1)
+            local has_sign = false
+            if next_ch == "+" then
+                has_sign = true
+            end
+            if next_ch == "-" then
+                has_sign = true
+            end
+
+            local digit_offset = 1
+            if has_sign then
+                digit_offset = 2
+            end
+
+            if is_digit(peek(digit_offset)) then
+                advance() -- e/E
+                if has_sign then
+                    advance()
+                end
+                while is_digit(peek(0)) do
+                    advance()
+                end
+            end
+        end
+
+        emit("number", slice(start_pos, self.pos - 1), line, column, start_pos, self.pos - 1)
+    end
+
+    local function scan_string(quote)
+        local start_pos = self.pos
+        local line = self.line
+        local column = self.column
+        local interpolated = false
+
+        advance() -- opening quote
+        while true do
+            local ch = peek(0)
+            if ch == nil then
+                fail(line, column, "unterminated string (missing closing quote)")
+            end
+            if ch == quote then
+                advance()
+                break
+            end
+            if ch == "\\" then
+                local has_interpolation = skip_escape()
+                if has_interpolation then
+                    interpolated = true
+                end
+            else
+                advance()
+            end
+        end
+
+        local finish_pos = self.pos - 1
+        local raw = slice(start_pos, finish_pos)
+        local text = ""
+        local inner_start = start_pos + 1
+        local inner_finish = finish_pos - 1
+        if inner_finish >= inner_start then
+            text = slice(inner_start, inner_finish)
+        end
+
+        emit_string(raw, text, quote, interpolated, line, column, start_pos, finish_pos)
+    end
+
+    local function scan_symbol()
+        local start_pos = self.pos
+        local line = self.line
+        local column = self.column
+
+        local text = lookahead(3)
+        if THREE_SYMBOLS[text] ~= nil then
+            consume(3)
+            emit("operator", text, line, column, start_pos, self.pos - 1)
+            return
+        end
+
+        local two = string.sub(text, 1, 2)
+        if TWO_SYMBOLS[two] ~= nil then
+            consume(2)
+            emit("operator", two, line, column, start_pos, self.pos - 1)
+            return
+        end
+
+        local one = string.sub(text, 1, 1)
+        local kind = SYMBOLS[one]
+        if kind == nil then
+            fail(line, column, string.format("unexpected character %q", one))
+        end
+
+        advance()
+        emit(kind, one, line, column, start_pos, self.pos - 1)
+    end
+
+    while true do
+        skip_trivia()
+
+        local ch = peek(0)
+        if ch == nil then
+            emit("eof", "", self.line, self.column, self.pos, self.pos)
+            break
+        end
+
+        if ch == '"' then
+            scan_string('"')
+        elseif ch == "'" then
+            scan_string("'")
+        elseif is_digit(ch) then
+            scan_number()
+        elseif is_name_start(ch) then
+            scan_name()
+        else
+            scan_symbol()
+        end
+    end
+
+    return move(tokens)
+end
+
+return move(Lexer)

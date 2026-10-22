@@ -51,7 +51,7 @@ See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full toolchain guide
 ```sh
 cargo build             # debug
 cargo build --release   # release turbo (opt-level 3 + LTO) — use this to install
-cargo test              # 55 tests (6 unit + 49 integration)
+cargo test              # 57 tests (6 unit + 51 integration)
 ```
 
 The resulting binary (`target\release\lusa.exe`) is standalone: **running
@@ -123,6 +123,7 @@ src/
   compiler.rs vm.rs       # AST → bytecode compiler; register-based VM
   error.rs    main.rs     # LusaError + cargo-style render; CLI/REPL
   lib.rs                  # public API (used by tests/integration.rs)
+lexer.lusa                # self-hosted lexer written in Lusa
 ```
 
 Pipeline:
@@ -131,6 +132,38 @@ Pipeline:
 lexer → parser → AST → tree-walking interpreter (default)
                     └→ compiler → bytecode chunks → VM (`--vm`)
 ```
+
+## Self-hosted lexer (`lexer.lusa`)
+
+The first compiler stage also has a complete implementation in Lusa itself,
+at the repository root. It reads a source string and returns an owned table of
+tokens:
+
+```lua
+local Lexer = require("lexer")
+local tokens = Lexer.lex("local x = 0x1F + 1")
+-- tokens[1] = {kind = "keyword", value = "local", line = 1, column = 1, ...}
+```
+
+Install it as a package (`packages/lexer/init.lusa`) or load the file through
+the host API. Each token carries `kind`, `value`, `line`, `column`, `start`
+and `finish`; strings additionally carry `text`, `quote` and `interpolated`.
+
+Supported today:
+
+- names, keywords (including the reserved `move`), decimal/hex/exponent
+  numbers, basic and compound operators, punctuation;
+- single- and double-quoted strings with Lusa escapes, `\u{...}` validation,
+  and balanced `\{...}` interpolation (including nested braces, strings and
+  comments);
+- line and block comments, UTF-8 names, BOM handling, and 1-based line/column
+  tracking through strings and comments;
+- `return move(tokens)` for ownership transfer, and `borrow self` in read-only
+  helpers. The bytecode VM lacks `borrow`, so the lexer probes once and selects
+  a direct-read fallback there; both engines produce identical tokens.
+
+Lexical failures raise `E9000` with a `lexer:line:column:` prefix. The Rust
+lexer still owns `E0001` diagnostics for programs parsed by the native engine.
 
 ## Bytecode VM: registers and source lines
 

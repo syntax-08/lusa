@@ -97,6 +97,29 @@ print(k())
 }
 
 #[test]
+fn closure_locals_shadow_outer_variables_with_the_same_name() {
+    // A nested closure captures its enclosing call's scopes.  Name lookup must
+    // prefer those scopes over a same-named variable in the caller's frame,
+    // including on repeated calls.
+    assert_parity(
+        r#"
+local function move(v) return v end
+local function build()
+    local tokens = {}
+    local function add(x) tokens[#tokens + 1] = x end
+    add(1)
+    add(2)
+    return move(tokens)
+end
+local tokens = build()
+local second = build()
+print(#tokens, #second)
+"#,
+        "2 2",
+    );
+}
+
+#[test]
 fn methods() {
     let m = r#"
 local o = {n = 10}
