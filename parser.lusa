@@ -1,0 +1,833 @@
+-- parser.lusa — recursive-descent parser for a core Lusa subset.
+--
+-- Public API
+-- ----------
+--   local Lexer  = require("lexer")
+--   local Parser = require("parser")
+--   local ast    = Parser.parse(Lexer.lex(source))
+--
+-- The parser consumes the token table by value and only reads scalar token
+-- fields (`kind`, `value`, `line`, `column`, ...).  It never writes to the
+-- token array.  Every AST node is a fresh table; the root is returned with
+-- `move`, so the caller becomes its unique owner.
+--
+-- AST schema (each node also carries `line` and `column`):
+--
+--   Program  { tag = "Program", body = { stmt... } }
+--   Local    { tag = "Local", names = { name... }, values = { expr... } }
+--   Assign   { tag = "Assign", targets = { Name... }, values = { expr... } }
+--   CallStmt { tag = "CallStmt", value = expr }
+--   If       { tag = "If", branches = { { cond = expr, body = { stmt... } }... },
+--              else_body = { stmt... } | nil }
+--   While    { tag = "While", cond = expr, body = { stmt... } }
+--   Repeat   { tag = "Repeat", body = { stmt... }, cond = expr }
+--   Do       { tag = "Do", body = { stmt... } }
+--   Return   { tag = "Return", values = { expr... } }
+--   Break    { tag = "Break" }
+--
+--   Nil      { tag = "Nil" }
+--   Bool     { tag = "Bool", value = true | false }
+--   Number   { tag = "Number", value = number }
+--   String   { tag = "String", value = decoded text, raw = source text,
+--              interpolated = bool }
+--   Name     { tag = "Name", name = string }
+--   Paren    { tag = "Paren", value = expr }
+--   Unary    { tag = "Unary", op = "-" | "not" | "#", value = expr }
+--   Binary   { tag = "Binary", op = string, lhs = expr, rhs = expr }
+--   Logical  { tag = "Logical", op = "and" | "or", lhs = expr, rhs = expr }
+--   Call     { tag = "Call", callee = expr, args = { expr... } }
+--   Clone    { tag = "Clone", value = expr }
+--   Borrow   { tag = "Borrow", value = expr }
+--
+-- Supported statements: local declarations, name assignments, calls, `if`,
+-- `while`, `repeat`, `do`, `return`, `break`.  Expressions cover literals,
+-- names, calls, parentheses, unary and binary operators, `and`/`or`,
+-- `clone` and `borrow`.  Table constructors, fields/indexes, methods,
+-- functions and numeric/generic `for` are intentionally left as extension
+-- points for the next stage.
+--
+-- Errors use E9000 with a `parser:line:column:` prefix.
+
+local function move(value)
+    return value
+end
+
+local Parser = {}
+
+-- Parser state.  The module is single-threaded; `Parser.parse` resets all of
+-- these fields.  Helpers are module-level functions, so parsing a file does
+-- not allocate a fresh mutual-recursion closure graph on every call.
+local tokens = nil
+local pos = 1
+local total = 0
+
+local parse_program
+local parse_block
+local parse_stmt
+local parse_local
+local parse_if
+local parse_while
+local parse_repeat
+local parse_do
+local parse_return
+local parse_break
+local parse_assign_or_call
+local parse_expr
+local subexpr
+local parse_prefix
+local parse_suffixes
+local parse_primary
+local parse_args
+local parse_exprlist
+
+-- ===== token cursor =====
+
+local function peek_kind()
+    if pos > total then
+        return "eof"
+    end
+    return tokens[pos].kind
+end
+
+local function peek_value()
+    if pos > total then
+        return ""
+    end
+    return tokens[pos].value
+end
+
+local function peek_line()
+    if pos > total then
+        return 0
+    end
+    return tokens[pos].line
+end
+
+local function peek_column()
+    if pos > total then
+        return 0
+    end
+    return tokens[pos].column
+end
+
+local function advance()
+    if pos <= total then
+        pos = pos + 1
+    end
+end
+
+local function at_kind(kind)
+    return peek_kind() == kind
+end
+
+local function at_value(value)
+    return peek_value() == value
+end
+
+local function at_keyword(value)
+    if peek_kind() ~= "keyword" then
+        return false
+    end
+    return peek_value() == value
+end
+
+local function describe_token()
+    local kind = peek_kind()
+    if kind == "eof" then
+        return "end of input"
+    end
+    local value = peek_value()
+    if value == nil or value == "" then
+        return kind
+    end
+    return kind .. " `" .. tostring(value) .. "`"
+end
+
+local function fail(message)
+    error(string.format("parser:%d:%d: %s", peek_line(), peek_column(), message))
+end
+
+local function fail_at(line, column, message)
+    error(string.format("parser:%d:%d: %s", line, column, message))
+end
+
+local function expect_value(value, what)
+    if at_value(value) then
+        advance()
+        return
+    end
+    fail("expected " .. what .. ", found " .. describe_token())
+end
+
+local function expect_kind(kind, what)
+    if at_kind(kind) then
+        advance()
+        return
+    end
+    fail("expected " .. what .. ", found " .. describe_token())
+end
+
+local function expect_name()
+    if peek_kind() ~= "name" then
+        fail("expected a name, found " .. describe_token())
+    end
+    local name = peek_value()
+    advance()
+    return name
+end
+
+local function is_block_end()
+    local kind = peek_kind()
+    if kind == "eof" then
+        return true
+    end
+    if kind == "keyword" then
+        local value = peek_value()
+        if value == "end" or value == "else" or value == "elseif" or value == "until" then
+            return true
+        end
+    end
+    return false
+end
+
+-- ===== literals =====
+
+local function hex_value(ch)
+    local b = string.byte(ch, 1)
+    if b == nil then
+        return nil
+    end
+    if b >= 48 then
+        if b <= 57 then
+            return b - 48
+        end
+    end
+    if b >= 65 then
+        if b <= 70 then
+            return b - 55
+        end
+    end
+    if b >= 97 then
+        if b <= 102 then
+            return b - 87
+        end
+    end
+    return nil
+end
+
+local function parse_number(text, line, column)
+    local prefix = string.sub(text, 1, 2)
+    if prefix == "0x" or prefix == "0X" then
+        local value = 0
+        local i = 3
+        local digits = 0
+        while i <= #text do
+            local digit = hex_value(string.sub(text, i, i))
+            if digit == nil then
+                fail_at(line, column, "invalid hex literal `" .. text .. "`")
+            end
+            value = value * 16 + digit
+            digits = digits + 1
+            i = i + 1
+        end
+        if digits == 0 then
+            fail_at(line, column, "invalid hex literal `" .. text .. "`")
+        end
+        return value
+    end
+    local value = tonumber(text)
+    if value == nil then
+        fail_at(line, column, "invalid number literal `" .. text .. "`")
+    end
+    return value
+end
+
+local function decode_string(text, line, column)
+    local out = {}
+    local i = 1
+    while i <= #text do
+        local ch = string.sub(text, i, i)
+        if ch ~= "\\" then
+            out[#out + 1] = ch
+            i = i + 1
+        else
+            local next_ch = string.sub(text, i + 1, i + 1)
+            if next_ch == "\\" then
+                out[#out + 1] = "\\"
+                i = i + 2
+            elseif next_ch == "n" then
+                out[#out + 1] = "\n"
+                i = i + 2
+            elseif next_ch == "t" then
+                out[#out + 1] = "\t"
+                i = i + 2
+            elseif next_ch == "r" then
+                out[#out + 1] = "\r"
+                i = i + 2
+            elseif next_ch == "0" then
+                out[#out + 1] = string.char(0)
+                i = i + 2
+            elseif next_ch == "a" then
+                out[#out + 1] = string.char(7)
+                i = i + 2
+            elseif next_ch == "\n" then
+                out[#out + 1] = "\n"
+                i = i + 2
+            elseif next_ch == "u" then
+                if string.sub(text, i + 2, i + 2) ~= "{" then
+                    fail_at(line, column, "`\\u` must be followed by `{...}`")
+                end
+                local j = i + 3
+                local codepoint = 0
+                local digits = 0
+                while j <= #text do
+                    local digit = hex_value(string.sub(text, j, j))
+                    if digit == nil then
+                        break
+                    end
+                    codepoint = codepoint * 16 + digit
+                    digits = digits + 1
+                    j = j + 1
+                end
+                if digits == 0 or string.sub(text, j, j) ~= "}" then
+                    fail_at(line, column, "invalid unicode escape")
+                end
+                if codepoint > 1114111 then
+                    fail_at(line, column, "unicode escape is outside the Unicode range")
+                end
+                if codepoint >= 55296 and codepoint <= 57343 then
+                    fail_at(line, column, "unicode escape is a surrogate code point")
+                end
+                out[#out + 1] = string.char(codepoint)
+                i = j + 1
+            else
+                fail_at(line, column, "unknown escape `\\" .. tostring(next_ch) .. "`")
+            end
+        end
+    end
+    return table.concat(out)
+end
+
+-- ===== statements =====
+
+parse_block = function()
+    local list = {}
+    while not is_block_end() do
+        if at_value(";") then
+            advance()
+        else
+            local st = parse_stmt()
+            local is_return = st.tag == "Return"
+            list[#list + 1] = st
+            if at_value(";") then
+                advance()
+            end
+            if is_return then
+                break
+            end
+        end
+    end
+    return move(list)
+end
+
+parse_local = function()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- local
+
+    if at_keyword("function") then
+        fail("`local function` is not supported by this reference parser")
+    end
+
+    local names = {}
+    names[#names + 1] = expect_name()
+    while at_value(",") do
+        advance()
+        names[#names + 1] = expect_name()
+    end
+
+    local values = {}
+    if at_value("=") then
+        advance()
+        values = parse_exprlist()
+    end
+
+    return {
+        tag = "Local",
+        names = names,
+        values = values,
+        line = line,
+        column = column
+    }
+end
+
+parse_if = function()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- if
+
+    local branches = {}
+    local cond = parse_expr()
+    expect_value("then", "`then`")
+    local body = parse_block()
+    branches[#branches + 1] = {cond = cond, body = body}
+
+    local else_body = nil
+    while true do
+        if at_keyword("elseif") then
+            advance()
+            cond = parse_expr()
+            expect_value("then", "`then`")
+            body = parse_block()
+            branches[#branches + 1] = {cond = cond, body = body}
+        elseif at_keyword("else") then
+            advance()
+            else_body = parse_block()
+            break
+        else
+            break
+        end
+    end
+
+    expect_value("end", "`end` to close the `if`")
+    return {
+        tag = "If",
+        branches = branches,
+        else_body = else_body,
+        line = line,
+        column = column
+    }
+end
+
+parse_while = function()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- while
+
+    local cond = parse_expr()
+    expect_value("do", "`do`")
+    local body = parse_block()
+    expect_value("end", "`end` to close the `while`")
+
+    return {
+        tag = "While",
+        cond = cond,
+        body = body,
+        line = line,
+        column = column
+    }
+end
+
+parse_repeat = function()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- repeat
+
+    local body = parse_block()
+    expect_value("until", "`until`")
+    local cond = parse_expr()
+
+    return {
+        tag = "Repeat",
+        body = body,
+        cond = cond,
+        line = line,
+        column = column
+    }
+end
+
+parse_do = function()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- do
+
+    local body = parse_block()
+    expect_value("end", "`end` to close the `do`")
+
+    return {
+        tag = "Do",
+        body = body,
+        line = line,
+        column = column
+    }
+end
+
+parse_return = function()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- return
+
+    local values = {}
+    if not is_block_end() and not at_value(";") then
+        values = parse_exprlist()
+    end
+
+    return {
+        tag = "Return",
+        values = values,
+        line = line,
+        column = column
+    }
+end
+
+parse_break = function()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- break
+    return {tag = "Break", line = line, column = column}
+end
+
+local function parse_expression_statement()
+    local e = parse_expr()
+    if e.tag ~= "Call" then
+        fail_at(e.line, e.column, "only calls may appear as expression statements")
+    end
+    local line = e.line
+    local column = e.column
+    return {tag = "CallStmt", value = e, line = line, column = column}
+end
+
+parse_assign_or_call = function()
+    local first = parse_prefix()
+    local first_line = first.line
+    local first_column = first.column
+
+    if at_value("=") or at_value(",") then
+        local targets = {first}
+        while at_value(",") do
+            advance()
+            targets[#targets + 1] = parse_prefix()
+        end
+
+        local target_count = #targets
+        local i = 1
+        while i <= target_count do
+            if targets[i].tag ~= "Name" then
+                fail_at(targets[i].line, targets[i].column,
+                    "invalid assignment target (only names are supported)")
+            end
+            i = i + 1
+        end
+
+        expect_value("=", "`=`")
+        local values = parse_exprlist()
+        return {
+            tag = "Assign",
+            targets = targets,
+            values = values,
+            line = first_line,
+            column = first_column
+        }
+    end
+
+    if first.tag ~= "Call" then
+        fail_at(first_line, first_column, "only calls may appear as expression statements")
+    end
+    return {
+        tag = "CallStmt",
+        value = first,
+        line = first_line,
+        column = first_column
+    }
+end
+
+parse_stmt = function()
+    local kind = peek_kind()
+    local value = peek_value()
+
+    if kind == "keyword" then
+        if value == "local" then
+            return parse_local()
+        elseif value == "if" then
+            return parse_if()
+        elseif value == "while" then
+            return parse_while()
+        elseif value == "repeat" then
+            return parse_repeat()
+        elseif value == "do" then
+            return parse_do()
+        elseif value == "return" then
+            return parse_return()
+        elseif value == "break" then
+            return parse_break()
+        elseif value == "for" or value == "function" then
+            fail("`" .. value .. "` is not supported by this reference parser")
+        end
+    elseif kind == "name" then
+        return parse_assign_or_call()
+    end
+
+    -- Literals, unary operators, parentheses and calls may start a statement;
+    -- the expression must reduce to a call.
+    return parse_expression_statement()
+end
+
+-- ===== expressions =====
+
+parse_exprlist = function()
+    local list = {}
+    list[#list + 1] = parse_expr()
+    while at_value(",") do
+        advance()
+        list[#list + 1] = parse_expr()
+    end
+    return move(list)
+end
+
+subexpr = function(limit)
+    local lhs = parse_prefix()
+    while true do
+        local kind = peek_kind()
+        local value = peek_value()
+        local precedence = 0
+        local right_assoc = false
+
+        if kind == "keyword" and value == "or" then
+            precedence = 1
+        elseif kind == "keyword" and value == "and" then
+            precedence = 2
+        elseif value == "==" or value == "~=" or value == "<" or value == ">"
+            or value == "<=" or value == ">=" then
+            precedence = 3
+        elseif value == ".." then
+            precedence = 4
+            right_assoc = true
+        elseif value == "+" or value == "-" then
+            precedence = 5
+        elseif value == "*" or value == "/" or value == "//" or value == "%" then
+            precedence = 6
+        elseif value == "^" then
+            precedence = 8
+            right_assoc = true
+        else
+            break
+        end
+
+        if precedence < limit then
+            break
+        end
+
+        advance()
+        local line = lhs.line
+        local column = lhs.column
+
+        if value == "and" or value == "or" then
+            local rhs = subexpr(precedence)
+            lhs = {
+                tag = "Logical",
+                op = value,
+                lhs = lhs,
+                rhs = rhs,
+                line = line,
+                column = column
+            }
+        else
+            local next_limit = precedence + 1
+            if right_assoc then
+                next_limit = precedence
+            end
+            local rhs = subexpr(next_limit)
+            lhs = {
+                tag = "Binary",
+                op = value,
+                lhs = lhs,
+                rhs = rhs,
+                line = line,
+                column = column
+            }
+        end
+    end
+    return lhs
+end
+
+parse_expr = function()
+    return subexpr(1)
+end
+
+parse_suffixes = function(e)
+    while true do
+        if at_value("(") then
+            local line = e.line
+            local column = e.column
+            advance() -- (
+            local args = parse_args()
+            e = {
+                tag = "Call",
+                callee = e,
+                args = args,
+                line = line,
+                column = column
+            }
+        elseif at_value(".") or at_value("[") or at_value(":") then
+            fail_at(e.line, e.column,
+                "field/index/method access is not supported by this reference parser")
+        else
+            return e
+        end
+    end
+end
+
+parse_prefix = function()
+    local kind = peek_kind()
+    local value = peek_value()
+    local line = peek_line()
+    local column = peek_column()
+
+    local is_unary = false
+    if kind == "operator" and (value == "-" or value == "#") then
+        is_unary = true
+    elseif kind == "keyword" and (value == "not" or value == "borrow" or value == "clone") then
+        is_unary = true
+    end
+
+    if is_unary then
+        advance()
+        local operand = subexpr(7)
+        local tag = "Unary"
+        if value == "borrow" then
+            tag = "Borrow"
+        elseif value == "clone" then
+            tag = "Clone"
+        end
+        local node = {
+            tag = tag,
+            op = value,
+            value = operand,
+            line = line,
+            column = column
+        }
+        return parse_suffixes(node)
+    end
+
+    return parse_suffixes(parse_primary())
+end
+
+parse_primary = function()
+    local kind = peek_kind()
+    local value = peek_value()
+    local line = peek_line()
+    local column = peek_column()
+
+    if kind == "number" then
+        advance()
+        return {
+            tag = "Number",
+            value = parse_number(value, line, column),
+            line = line,
+            column = column
+        }
+    end
+
+    if kind == "string" then
+        local text = tokens[pos].text
+        local interpolated = tokens[pos].interpolated
+        advance()
+        if text == nil then
+            text = ""
+        end
+        local decoded = text
+        if not interpolated then
+            decoded = decode_string(text, line, column)
+        end
+        return {
+            tag = "String",
+            value = decoded,
+            raw = text,
+            interpolated = interpolated,
+            line = line,
+            column = column
+        }
+    end
+
+    if kind == "name" then
+        advance()
+        return {
+            tag = "Name",
+            name = value,
+            line = line,
+            column = column
+        }
+    end
+
+    if kind == "keyword" then
+        if value == "nil" then
+            advance()
+            return {tag = "Nil", line = line, column = column}
+        elseif value == "true" then
+            advance()
+            return {tag = "Bool", value = true, line = line, column = column}
+        elseif value == "false" then
+            advance()
+            return {tag = "Bool", value = false, line = line, column = column}
+        end
+    end
+
+    if value == "(" then
+        advance()
+        local inner = parse_expr()
+        expect_value(")", "`)`")
+        return {
+            tag = "Paren",
+            value = inner,
+            line = line,
+            column = column
+        }
+    end
+
+    if value == "{" then
+        fail("table constructors are not supported by this reference parser")
+    end
+    if value == "..." then
+        fail("varargs are not supported by this reference parser")
+    end
+
+    fail("expected an expression, found " .. describe_token())
+end
+
+parse_args = function()
+    local args = {}
+    if at_value(")") then
+        advance()
+        return move(args)
+    end
+    args[#args + 1] = parse_expr()
+    while at_value(",") do
+        advance()
+        args[#args + 1] = parse_expr()
+    end
+    expect_value(")", "`)`")
+    return move(args)
+end
+
+parse_program = function()
+    local body = parse_block()
+    expect_kind("eof", "end of input")
+    return {
+        tag = "Program",
+        body = body,
+        line = 1,
+        column = 1
+    }
+end
+
+-- ===== public API =====
+
+function Parser.parse(input)
+    if type(input) ~= "table" then
+        error("parser: expected a token table")
+    end
+
+    tokens = input
+    pos = 1
+    total = #tokens
+    if total == 0 then
+        error("parser: empty token stream")
+    end
+
+    local ast = parse_program()
+    tokens = nil
+    total = 0
+    return move(ast)
+end
+
+return move(Parser)

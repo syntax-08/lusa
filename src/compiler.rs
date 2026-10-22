@@ -756,7 +756,10 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
                 LogOp::And => c.em(Instr::JumpIfFalseKeep(0)),
                 LogOp::Or => c.em(Instr::JumpIfTrueKeep(0)),
             };
-            c.em(Instr::Pop);
+            // The keep-jumps already pop the value when evaluation must
+            // continue (false for `or`, true for `and`) and keep it when the
+            // expression short-circuits.  An extra Pop here would remove the
+            // surrounding value (for example the callee) on the continue path.
             compile_expr(c, r)?;
             truncate_if_expansion(c, r);
             c.set_line(e.span);

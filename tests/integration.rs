@@ -583,6 +583,30 @@ end
 }
 
 #[test]
+fn vm_parity_logical_short_circuit() {
+    assert_parity(
+        r#"
+print(false or true)
+print(true and false)
+print(false or "x")
+print(nil or 7)
+print(true and 42)
+print(false and 42)
+
+local calls = 0
+local function bump()
+    calls = calls + 1
+    return true
+end
+local a = false and bump()
+local b = true or bump()
+print(a, b, calls)
+"#,
+        "true\nfalse\nx\n7\n42\nfalse\nfalse true 0",
+    );
+}
+
+#[test]
 fn vm_parity_functions_closures_recursion() {
     assert_parity(
         r#"

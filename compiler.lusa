@@ -1,0 +1,619 @@
+-- compiler.lusa — AST → portable bytecode image for the core Lusa subset.
+--
+-- Public API
+-- ----------
+--   local Parser   = require("parser")
+--   local Compiler = require("compiler")
+--   local ast      = Parser.parse(tokens)
+--   local image    = Compiler.compile(clone ast)
+--
+--   image = {
+--       version   = 1,
+--       code      = { byte... },       -- pure 0..255 opcode/operand stream
+--       constants = { {kind=..., value=...}... },
+--       lines     = { line... },       -- parallel to `code`, one per byte
+--       nlocals   = number
+--   }
+--
+-- Ownership
+-- ---------
+-- `Compiler.compile` takes ownership of its AST argument.  It consumes fields
+-- of that owned tree (moves), but never writes through a field of a tree it
+-- does not own and never aliases an AST node.  Call `Compiler.compile(clone
+-- ast)` when the AST must remain available for inspection or a second pass.
+--
+-- Bytecode format
+-- ---------------
+-- Opcodes are one byte and follow the discriminant order of the native VM's
+-- `Instr` enum (`src/compiler.rs`, `repr(u8)`).  Operands are big-endian u16
+-- values.  Jump operands are absolute 1-based **byte offsets** in `code`
+-- (unlike the native enum, whose jumps use instruction indexes); this keeps
+-- the reference image self-contained and easy to decode from a byte stream.
+--
+-- Supported nodes: Local, Assign (name targets), CallStmt, If, While, Repeat,
+-- Do, Return, Break; Nil, Bool, Number, String (without interpolation), Name,
+-- Paren, Unary, Binary, Logical, Call, Clone, Borrow.  Calls are single-value
+-- `CallOne` expressions; multi-return expansion and varargs are out of scope.
+-- Unsupported constructs produce a `compiler:line:column:` error instead of
+-- silently miscompiling.
+
+local function move(value)
+    return value
+end
+
+local Compiler = {}
+
+-- Subset of the native `Instr` discriminants.  Keeping the numbers explicit
+-- makes the contract stable even if Rust adds variants in the middle later.
+local OPCODES = {
+    LOAD_CONST = 0,
+    LOAD_NIL = 1,
+    GET_LOCAL = 2,
+    GET_GLOBAL = 4,
+    SET_GLOBAL = 13,
+    SET_LOCAL = 14,
+    ADD = 21,
+    SUB = 22,
+    MUL = 23,
+    DIV = 24,
+    FLOOR_DIV = 25,
+    MOD = 26,
+    POW = 27,
+    CONCAT = 28,
+    EQ = 29,
+    NE = 30,
+    LT = 31,
+    LE = 32,
+    GT = 33,
+    GE = 34,
+    NEG = 35,
+    NOT = 36,
+    LEN = 37,
+    CLONE = 38,
+    BORROW_ERR = 39,
+    CALL_ONE = 42,
+    JUMP = 53,
+    JUMP_IF_FALSE = 54,
+    JUMP_IF_TRUE_KEEP = 55,
+    JUMP_IF_FALSE_KEEP = 56,
+    POP = 59,
+    RETURN_FIXED = 61
+}
+
+local BINARY_OP = {
+    ["+"] = OPCODES.ADD,
+    ["-"] = OPCODES.SUB,
+    ["*"] = OPCODES.MUL,
+    ["/"] = OPCODES.DIV,
+    ["//"] = OPCODES.FLOOR_DIV,
+    ["%"] = OPCODES.MOD,
+    ["^"] = OPCODES.POW,
+    [".."] = OPCODES.CONCAT,
+    ["=="] = OPCODES.EQ,
+    ["~="] = OPCODES.NE,
+    ["<"] = OPCODES.LT,
+    ["<="] = OPCODES.LE,
+    [">"] = OPCODES.GT,
+    [">="] = OPCODES.GE
+}
+
+local UNARY_OP = {
+    ["-"] = OPCODES.NEG,
+    ["not"] = OPCODES.NOT,
+    ["#"] = OPCODES.LEN
+}
+
+-- Compiler state.  Like the parser, this module is intentionally
+-- single-threaded; `Compiler.compile` resets every field.  Helpers live at
+-- module scope and close over this state, so there is no per-call closure
+-- graph to collect.
+local code = {}
+local lines = {}
+local constants = {}
+local scopes = {}
+local scope_count = 0
+local next_slot = 0
+local current_line = 1
+local current_column = 1
+local break_stack = {}
+local break_depth = 0
+
+local compile_expr
+local compile_block
+local compile_statements
+local compile_stmt
+
+-- ===== diagnostics =====
+
+local function fail(line, column, message)
+    error(string.format("compiler:%d:%d: %s", line, column, message))
+end
+
+local function set_location(line, column)
+    if line ~= nil then
+        current_line = line
+    end
+    if column ~= nil then
+        current_column = column
+    end
+end
+
+-- ===== byte emission =====
+
+local function push_byte(value)
+    if type(value) ~= "number" then
+        fail(current_line, current_column, "internal: byte is not a number")
+    end
+    if value < 0 or value > 255 or value ~= math.floor(value) then
+        fail(current_line, current_column, "byte out of range: " .. tostring(value))
+    end
+    code[#code + 1] = value
+    lines[#lines + 1] = current_line
+end
+
+local function emit0(opcode)
+    push_byte(opcode)
+end
+
+local function emit_u16(opcode, value)
+    if type(value) ~= "number" then
+        fail(current_line, current_column, "internal: operand is not a number")
+    end
+    if value < 0 or value > 65535 or value ~= math.floor(value) then
+        fail(current_line, current_column, "operand out of range: " .. tostring(value))
+    end
+    push_byte(opcode)
+    push_byte(math.floor(value / 256))
+    push_byte(value % 256)
+end
+
+local function emit_u16_u16(opcode, first, second)
+    if first < 0 or first > 65535 or first ~= math.floor(first) then
+        fail(current_line, current_column, "operand out of range: " .. tostring(first))
+    end
+    if second < 0 or second > 65535 or second ~= math.floor(second) then
+        fail(current_line, current_column, "operand out of range: " .. tostring(second))
+    end
+    push_byte(opcode)
+    push_byte(math.floor(first / 256))
+    push_byte(first % 256)
+    push_byte(math.floor(second / 256))
+    push_byte(second % 256)
+end
+
+local function emit_jump(opcode)
+    push_byte(opcode)
+    local operand = #code + 1
+    push_byte(0)
+    push_byte(0)
+    return operand
+end
+
+local function patch_jump(operand, target)
+    if target == nil then
+        target = #code + 1
+    end
+    if target < 1 or target > 65535 then
+        fail(current_line, current_column, "jump target out of range: " .. tostring(target))
+    end
+    code[operand] = math.floor(target / 256)
+    code[operand + 1] = target % 256
+end
+
+local function emit_jump_to(opcode, target)
+    local operand = emit_jump(opcode)
+    patch_jump(operand, target)
+end
+
+-- ===== constants =====
+
+local function add_const(kind, value)
+    local i = 1
+    while i <= #constants do
+        if constants[i].kind == kind and constants[i].value == value then
+            -- Constant operands are zero-based (matching the native VM);
+            -- `image.constants` itself is a normal 1-based Lusa array.
+            return i - 1
+        end
+        i = i + 1
+    end
+    local index = #constants + 1
+    if index > 65536 then
+        fail(current_line, current_column, "constant pool exceeds 65536 entries")
+    end
+    constants[index] = {kind = kind, value = value}
+    return index - 1
+end
+
+-- ===== lexical scopes / local slots =====
+
+local function enter_scope()
+    -- `#table` does not shrink when a trailing slot is set to nil in Lusa, so
+    -- keep the stack depth explicitly instead of inferring it from `scopes`.
+    scope_count = scope_count + 1
+    scopes[scope_count] = {names = {}}
+end
+
+local function leave_scope()
+    scopes[scope_count] = nil
+    scope_count = scope_count - 1
+end
+
+local function declare(name)
+    local slot = next_slot
+    if slot > 65535 then
+        fail(current_line, current_column, "too many local slots")
+    end
+    next_slot = next_slot + 1
+    scopes[scope_count].names[name] = slot
+    return slot
+end
+
+local function find_local(name)
+    local i = scope_count
+    while i >= 1 do
+        local slot = scopes[i].names[name]
+        if slot ~= nil then
+            return slot
+        end
+        i = i - 1
+    end
+    return nil
+end
+
+-- ===== statements =====
+
+compile_block = function(block)
+    enter_scope()
+    compile_statements(block)
+    leave_scope()
+end
+
+compile_statements = function(block)
+    local count = #block
+    local i = 1
+    while i <= count do
+        compile_stmt(block[i])
+        i = i + 1
+    end
+end
+
+compile_stmt = function(stmt)
+    set_location(stmt.line, stmt.column)
+    local tag = stmt.tag
+
+    if tag == "Local" then
+        local names = stmt.names
+        local values = stmt.values
+        local target_count = #names
+        local value_count = #values
+        if value_count > target_count then
+            fail(current_line, current_column,
+                "more initializers than targets are not supported")
+        end
+
+        -- Evaluate every initializer before declaring any of the new names,
+        -- so `local x = x` reads the outer `x`.
+        local i = 1
+        while i <= target_count do
+            if i <= value_count then
+                compile_expr(values[i])
+            else
+                emit0(OPCODES.LOAD_NIL)
+            end
+            i = i + 1
+        end
+
+        local slots = {}
+        i = 1
+        while i <= target_count do
+            slots[i] = declare(names[i])
+            i = i + 1
+        end
+
+        -- SetLoc pops the top of the stack; store in reverse order.
+        set_location(stmt.line, stmt.column)
+        i = target_count
+        while i >= 1 do
+            emit_u16(OPCODES.SET_LOCAL, slots[i])
+            i = i - 1
+        end
+
+    elseif tag == "Assign" then
+        local targets = stmt.targets
+        local values = stmt.values
+        local target_count = #targets
+        local value_count = #values
+        if value_count > target_count then
+            fail(current_line, current_column,
+                "more values than targets are not supported")
+        end
+
+        local i = 1
+        while i <= target_count do
+            if i <= value_count then
+                compile_expr(values[i])
+            else
+                emit0(OPCODES.LOAD_NIL)
+            end
+            i = i + 1
+        end
+
+        set_location(stmt.line, stmt.column)
+        i = target_count
+        while i >= 1 do
+            local target = targets[i]
+            if target.tag ~= "Name" then
+                fail(current_line, current_column,
+                    "only name assignment targets are supported")
+            end
+            local name = target.name
+            local slot = find_local(name)
+            if slot ~= nil then
+                emit_u16(OPCODES.SET_LOCAL, slot)
+            else
+                emit_u16(OPCODES.SET_GLOBAL, add_const("string", name))
+            end
+            i = i - 1
+        end
+
+    elseif tag == "CallStmt" then
+        compile_expr(stmt.value)
+        set_location(stmt.line, stmt.column)
+        emit0(OPCODES.POP)
+
+    elseif tag == "If" then
+        local branches = stmt.branches
+        local else_body = stmt.else_body
+        local branch_count = #branches
+        local end_jumps = {}
+
+        local i = 1
+        while i <= branch_count do
+            local branch = branches[i]
+            compile_expr(branch.cond)
+            local false_jump = emit_jump(OPCODES.JUMP_IF_FALSE)
+            compile_block(branch.body)
+            if i < branch_count or else_body ~= nil then
+                end_jumps[#end_jumps + 1] = emit_jump(OPCODES.JUMP)
+            end
+            patch_jump(false_jump)
+            i = i + 1
+        end
+
+        if else_body ~= nil then
+            compile_block(else_body)
+        end
+
+        local end_target = #code + 1
+        i = 1
+        while i <= #end_jumps do
+            patch_jump(end_jumps[i], end_target)
+            i = i + 1
+        end
+
+    elseif tag == "While" then
+        break_depth = break_depth + 1
+        local top = break_depth
+        break_stack[top] = {}
+
+        local start = #code + 1
+        compile_expr(stmt.cond)
+        local exit_jump = emit_jump(OPCODES.JUMP_IF_FALSE)
+        compile_block(stmt.body)
+        emit_jump_to(OPCODES.JUMP, start)
+
+        local end_target = #code + 1
+        patch_jump(exit_jump, end_target)
+
+        local breaks = break_stack[top]
+        break_stack[top] = nil
+        break_depth = break_depth - 1
+        local i = 1
+        while i <= #breaks do
+            patch_jump(breaks[i], end_target)
+            i = i + 1
+        end
+
+    elseif tag == "Repeat" then
+        break_depth = break_depth + 1
+        local top = break_depth
+        break_stack[top] = {}
+
+        local start = #code + 1
+        enter_scope()
+        compile_statements(stmt.body)
+        -- The condition is evaluated with the body's locals still in scope.
+        compile_expr(stmt.cond)
+        leave_scope()
+        emit_jump_to(OPCODES.JUMP_IF_FALSE, start)
+
+        local end_target = #code + 1
+        local breaks = break_stack[top]
+        break_stack[top] = nil
+        break_depth = break_depth - 1
+        local i = 1
+        while i <= #breaks do
+            patch_jump(breaks[i], end_target)
+            i = i + 1
+        end
+
+    elseif tag == "Do" then
+        compile_block(stmt.body)
+
+    elseif tag == "Return" then
+        local values = stmt.values
+        local count = #values
+        local i = 1
+        while i <= count do
+            compile_expr(values[i])
+            i = i + 1
+        end
+        set_location(stmt.line, stmt.column)
+        emit_u16(OPCODES.RETURN_FIXED, count)
+
+    elseif tag == "Break" then
+        if break_depth == 0 then
+            fail(current_line, current_column, "`break` outside a loop")
+        end
+        local top = break_depth
+        local index = #break_stack[top] + 1
+        break_stack[top][index] = emit_jump(OPCODES.JUMP)
+
+    else
+        fail(current_line, current_column, "unsupported statement node `" .. tostring(tag) .. "`")
+    end
+end
+
+-- ===== expressions =====
+
+compile_expr = function(expr)
+    set_location(expr.line, expr.column)
+    local tag = expr.tag
+
+    if tag == "Nil" then
+        emit0(OPCODES.LOAD_NIL)
+
+    elseif tag == "Bool" then
+        local index = add_const("bool", expr.value)
+        emit_u16(OPCODES.LOAD_CONST, index)
+
+    elseif tag == "Number" then
+        local index = add_const("number", expr.value)
+        emit_u16(OPCODES.LOAD_CONST, index)
+
+    elseif tag == "String" then
+        if expr.interpolated == true then
+            fail(current_line, current_column,
+                "string interpolation is not supported by this reference compiler")
+        end
+        local index = add_const("string", expr.value)
+        emit_u16(OPCODES.LOAD_CONST, index)
+
+    elseif tag == "Name" then
+        local name = expr.name
+        local slot = find_local(name)
+        if slot ~= nil then
+            emit_u16(OPCODES.GET_LOCAL, slot)
+        else
+            emit_u16(OPCODES.GET_GLOBAL, add_const("string", name))
+        end
+
+    elseif tag == "Paren" then
+        compile_expr(expr.value)
+
+    elseif tag == "Unary" then
+        local op = expr.op
+        local opcode = UNARY_OP[op]
+        if opcode == nil then
+            fail(current_line, current_column, "unsupported unary operator `" .. tostring(op) .. "`")
+        end
+        compile_expr(expr.value)
+        set_location(expr.line, expr.column)
+        emit0(opcode)
+
+    elseif tag == "Binary" then
+        local op = expr.op
+        local opcode = BINARY_OP[op]
+        if opcode == nil then
+            fail(current_line, current_column, "unsupported binary operator `" .. tostring(op) .. "`")
+        end
+        local lhs = expr.lhs
+        local rhs = expr.rhs
+        compile_expr(lhs)
+        compile_expr(rhs)
+        set_location(expr.line, expr.column)
+        emit0(opcode)
+
+    elseif tag == "Logical" then
+        local op = expr.op
+        if op ~= "and" and op ~= "or" then
+            fail(current_line, current_column, "unsupported logical operator `" .. tostring(op) .. "`")
+        end
+        compile_expr(expr.lhs)
+        local skip
+        if op == "and" then
+            skip = emit_jump(OPCODES.JUMP_IF_FALSE_KEEP)
+        else
+            skip = emit_jump(OPCODES.JUMP_IF_TRUE_KEEP)
+        end
+        compile_expr(expr.rhs)
+        patch_jump(skip)
+
+    elseif tag == "Call" then
+        local callee = expr.callee
+        local args = expr.args
+        local count = #args
+        compile_expr(callee)
+        local i = 1
+        while i <= count do
+            compile_expr(args[i])
+            i = i + 1
+        end
+        set_location(expr.line, expr.column)
+        emit_u16_u16(OPCODES.CALL_ONE, count, 0)
+
+    elseif tag == "Clone" then
+        compile_expr(expr.value)
+        set_location(expr.line, expr.column)
+        emit0(OPCODES.CLONE)
+
+    elseif tag == "Borrow" then
+        -- Matches the native compiler: bytecode mode rejects `borrow`.
+        emit0(OPCODES.BORROW_ERR)
+
+    else
+        fail(current_line, current_column, "unsupported expression node `" .. tostring(tag) .. "`")
+    end
+end
+
+-- ===== public API =====
+
+function Compiler.compile(ast)
+    if type(ast) ~= "table" then
+        error("compiler: expected a Program AST")
+    end
+    if ast.tag ~= "Program" then
+        error("compiler: expected a Program AST")
+    end
+
+    code = {}
+    lines = {}
+    constants = {}
+    scopes = {}
+    scope_count = 0
+    next_slot = 0
+    current_line = 1
+    current_column = 1
+    break_stack = {}
+    break_depth = 0
+
+    local body = ast.body
+    if type(body) ~= "table" then
+        error("compiler: Program AST has no body")
+    end
+
+    compile_block(body)
+
+    current_line = 0
+    current_column = 1
+    emit_u16(OPCODES.RETURN_FIXED, 0)
+
+    if #code > 65535 then
+        error("compiler: code exceeds 65535 bytes")
+    end
+
+    local image = {
+        version = 1,
+        code = code,
+        constants = constants,
+        lines = lines,
+        nlocals = next_slot
+    }
+    return move(image)
+end
+
+Compiler.Version = 1
+Compiler.Opcode = clone OPCODES
+
+return move(Compiler)

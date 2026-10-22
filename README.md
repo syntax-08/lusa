@@ -51,7 +51,7 @@ See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full toolchain guide
 ```sh
 cargo build             # debug
 cargo build --release   # release turbo (opt-level 3 + LTO) — use this to install
-cargo test              # 57 tests (6 unit + 51 integration)
+cargo test              # 59 tests (6 unit + 51 integration + 2 self-hosted)
 ```
 
 The resulting binary (`target\release\lusa.exe`) is standalone: **running
@@ -124,6 +124,9 @@ src/
   error.rs    main.rs     # LusaError + cargo-style render; CLI/REPL
   lib.rs                  # public API (used by tests/integration.rs)
 lexer.lusa                # self-hosted lexer written in Lusa
+parser.lusa               # self-hosted recursive-descent parser
+compiler.lusa             # self-hosted bytecode compiler
+docs/SELF_HOSTING.md      # self-hosted front-end reference
 ```
 
 Pipeline:
@@ -164,6 +167,37 @@ Supported today:
 
 Lexical failures raise `E9000` with a `lexer:line:column:` prefix. The Rust
 lexer still owns `E0001` diagnostics for programs parsed by the native engine.
+
+## Self-hosted parser and compiler
+
+`parser.lusa` turns the lexer's token table into a nested-table AST, and
+`compiler.lusa` lowers that AST to a portable numeric bytecode image. Both use
+module-level state (single-threaded, non-reentrant) and are tested on the
+interpreter and `--vm`:
+
+```lua
+local Lexer = require("lexer")
+local Parser = require("parser")
+local Compiler = require("compiler")
+
+local ast = Parser.parse(Lexer.lex("local a = 1 + 2 return a"))
+local image = Compiler.compile(clone ast)
+-- image = {version=1, code={...}, constants={...}, lines={...}, nlocals=1}
+```
+
+The parser consumes the token table by value and only reads scalar token fields.
+The compiler consumes its AST argument; pass `clone ast` when the AST must stay
+available. The reference subset covers locals, name assignment, calls,
+`if`/`elseif`/`else`, `while`, `repeat`, `do`, `return`, `break`, literals,
+names, parentheses, unary/binary operators, `and`/`or`, `clone` and `borrow`.
+Tables, fields/indexes/methods, function definitions, numeric/generic `for`,
+varargs and interpolated-string compilation are extension points and report
+explicit errors.
+
+The image uses native `Instr` numbers with big-endian `u16` operands,
+zero-based constant/local slots, and absolute 1-based byte-offset jumps. See
+[`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) for the AST schema, full opcode
+table, exact byte example, ownership rules and test coverage.
 
 ## Bytecode VM: registers and source lines
 
