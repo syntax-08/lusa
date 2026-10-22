@@ -2,7 +2,9 @@
 
 **Lusa** is a dynamic language inspired by Lua, written 100% in Rust (only
 `std`, zero dependencies), with an optional twist of **Rust-style ownership**
-— value moves, borrows and clones with **cargo-style diagnostics**.
+— value moves, borrows and clones with **cargo-style diagnostics**. Module 8.5
+adds a typed C11 backend (`u32`/`i32`/`i128`/`f32`), RAII drops, host-toolchain
+native builds, and `unsafe` volatile access for hardware registers.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -32,8 +34,11 @@ Then, from any new terminal:
 | command                         | effect                                     |
 |---------------------------------|--------------------------------------------|
 | `lusalang version`              | runtime version (`lusa -v`)                |
-| `lusalang run main.lusa`        | runs a program                             |
+| `lusalang run main.lusa`        | runs a program in the interpreter          |
+| `lusalang run main.lusa --native` | builds/runs through the C11 backend       |
+| `lusalang build main.lusa`      | compiles a native executable via C11        |
 | `lusalang check main.lusa`      | validates (lex+parse) without running      |
+| `lusalang check main.lusa --typed` | runs the static type checker            |
 | `lusalang new myproject`        | creates a new project with a ready scaffold |
 | `lusalang install syntax-08/lusa-ui` | install a package (library) from GitHub |
 | `lusalang packages`             | list installed packages                    |
@@ -51,7 +56,7 @@ See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full toolchain guide
 ```sh
 cargo build             # debug
 cargo build --release   # release turbo (opt-level 3 + LTO) — use this to install
-cargo test              # 61 tests (6 unit + 51 integration + 4 self-hosted/native bootstrap)
+cargo test --all-targets  # unit + integration + self-hosted + C11 backend tests
 ```
 
 The resulting binary (`target\release\lusa.exe`) is standalone: **running
@@ -122,12 +127,13 @@ src/
   eval.rs     builtins.rs # expression evaluation; stdlib
   compiler.rs vm.rs       # AST → bytecode compiler; register-based VM
   error.rs    main.rs     # LusaError + cargo-style render; CLI/REPL
+  cbackend.rs             # embedded self-hosted C11 backend + host compiler discovery
   lib.rs                  # public API (used by tests/integration.rs)
 lexer.lusa                # self-hosted lexer written in Lusa
-parser.lusa               # self-hosted recursive-descent parser
+parser.lusa               # self-hosted recursive-descent parser (typed subset)
 compiler.lusa             # self-hosted bytecode compiler
-compiler_bootstrap.lusa   # Modules 7–8 optimizer + heap/native PE/ELF emitter
-docs/SELF_HOSTING.md      # self-hosted front-end and native backend reference
+compiler_bootstrap.lusa   # Module 8.5 optimizer + checker + C11 emitter
+docs/SELF_HOSTING.md      # self-hosted front-end and C11 backend reference
 ```
 
 Pipeline:
@@ -135,8 +141,9 @@ Pipeline:
 ```text
 lexer → parser → AST → tree-walking interpreter (default)
                     ├→ compiler → bytecode chunks → VM (`--vm`)
-                    └→ Compiler.optimize → Compiler.emit_binary
-                                           → PE32+ / ELF64 image
+                    └→ optimizer → static checker → C11 emitter
+                                           → host GCC/Clang/TCC/MSVC
+                                           → native executable
 ```
 
 ## Self-hosted lexer (`lexer.lusa`)
@@ -202,63 +209,87 @@ zero-based constant/local slots, and absolute 1-based byte-offset jumps. See
 [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) for the AST schema, full opcode
 table, exact byte example, ownership rules and test coverage.
 
-## Native bootstrap backend (`compiler_bootstrap.lusa`)
+## Module 8.5: typed C11 backend (`compiler_bootstrap.lusa`)
 
-Modules 7–8 add a native-code stage that emits a complete x86_64 executable
-directly, with no external linker and no Rust runtime on the target:
+The native path no longer writes x86_64 instructions or PE/ELF headers. It
+transpiles the checked AST to portable C11 and invokes the host C compiler:
+
+```sh
+lusalang build hello.lusa                 # native executable
+lusalang build hello.lusa --emit-c        # intermediate hello.c
+lusalang run hello.lusa --native          # build + run
+lusalang check hello.lusa --typed         # static check only
+```
 
 ```lua
 local ast = Parser.parse(Lexer.lex(source))
-
-local optimized = Compiler.optimize(clone ast)       -- consumes the clone
-local pe = Compiler.emit_binary(borrow ast, "windows") -- read-only borrow
-local elf = Compiler.emit_binary(clone ast, "linux")
-io_write_binary("program.exe", pe)
+local c_source = Compiler.emit_c(borrow ast)   -- borrow keeps the AST readable
+local result = Compiler.bootstrap(Lexer, Parser, source)
 ```
 
-- `Compiler.optimize(move_ast)` consumes its argument and returns a new AST with
-  constant folding, logical pruning, constant-`if` elimination, and unreachable
-  code removal.
-- `Compiler.emit_binary(borrow_ast, target_os)` snapshots the borrowed body and
-  optimizes a private copy; the caller's AST is unchanged after emission.
-- `Compiler.bootstrap(lexer, parser, source, target_os)` runs the self-hosted
-  front end, optimizer, and native emitter in one call.
-- `Compiler.verify_fixpoint(...)` compiles the same source twice and reports
-  byte equality plus both images.
-- `Compiler.self_compile(...)` reports the remaining front-end gap honestly:
-  the parser still rejects function definitions, keyed/field access, and `for`,
-  so full self-compilation returns `{ok=false, stage="frontend", error=...}`.
+### Typed subset
 
-The native subset now includes heap strings and homogeneous array tables,
-one-based index reads, `#`, dynamic concatenation, and automatic RAII drops:
+`local x: u32 = 10` and `function read(pin: u32): f32` are accepted by the
+self-hosted parser. Supported types map to C11 as follows:
 
-- owned locals are dropped in reverse order at scope exits (including
-  `if`/`while` blocks, `return`, and `break`), and heap globals are dropped at
-  program exit;
-- moving clears the source slot and cancels its drop; borrowing suppresses the
-  owner's move/drop while the alias lives;
-- strings/tables use a 32-byte header and are allocated per object with
-  `VirtualAlloc`/`VirtualFree` on Windows or `mmap`/`munmap` on Linux;
-- table/string drops are recursive, and dynamic concatenation computes the
-  combined length before copying both payloads.
+| Lusa | C11 |
+|------|-----|
+| `u32` | `uint32_t` |
+| `i32` | `int32_t` |
+| `i128` | `lusa_i128` (`__int128`, or `long long` on MSVC) |
+| `f32` | `float` |
+| `[T]` / `[[T]]` | `LusaTable *` with a homogeneous element kind |
 
-Keyed/heterogeneous tables, field or index assignment, heap `clone`, closures
-or function definitions, methods, numeric/generic `for`, varargs,
-interpolation, and floating-point arithmetic are rejected with
-`bootstrap:line:column:` diagnostics.
+Untyped integer literals infer `i32`; untyped decimal literals infer `f32`.
+The checker runs before emission and aborts with Cargo-style diagnostics such as
+`error[E0308]: mismatched types ... --> lusa:1:16`.
 
-Windows output is a hand-built PE32+ image importing `ExitProcess`,
-`VirtualAlloc`, and `VirtualFree` (kernel32) plus `printf` (msvcrt); Linux output
-uses direct `mmap`/`munmap`/`write`/`exit` syscalls in an ELF64 with a single RWX
-load segment. `Compiler.memory_layout()` documents the object header, table
-payload, allocator, and move/borrow/drop rules.
+### Heap and RAII
 
-`tests/bootstrap_native.rs` runs the same bootstrap pipeline on the interpreter
-and VM, requires byte-identical PE/ELF images, executes the generated PE, and
-exercises loops/`print`. `tests/bootstrap_heap.rs` compiles and executes a heap
-seed covering concatenation, tables, nested scope drops, moves, borrows, and
-globals; its ELF output is structurally validated. See
-[`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) for the full layout and ABI.
+`Compiler.memory_layout()` is the ABI source of truth:
+
+- `LusaString`/`LusaTable` begin with a 32-byte `LusaObj` header
+  (`type`, `length`, `flags`, `size`).
+- Allocation uses `malloc`/`calloc`/`realloc`; release uses `free`.
+- Owned locals and globals are deep-dropped in reverse declaration order at
+  lexical exits, before `return`/`break`, and before an assignment overwrites
+  an owned value.
+- A move clears the source slot and cancels its drop; `clone` deep-copies
+  strings/tables; `borrow` emits a non-owning alias with no drop.
+
+### Unsafe hardware access
+
+```lusa
+unsafe do
+    local reg: i128 = unsafe_ptr_cast(0x40000000)
+    unsafe_write_mem(reg, 1)
+    local value: u32 = unsafe_read_mem(reg)
+    print(value)
+end
+```
+
+This lowers to `*(volatile uint32_t *)(uintptr_t)address = value`. The raw
+intrinsics are rejected outside an `unsafe` block (`E0316`). The caller is
+responsible for valid addresses; the backend deliberately does no memory
+sandboxing or bounds checks.
+
+### Host compiler discovery
+
+`--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
+Studio via `vswhere.exe` (and runs `vcvars64.bat` when needed). GCC/Clang/TCC
+use `-std=c11 -O2`; MSVC uses `/nologo /TC /O2 /std:c11`. If no compiler is
+found, the interpreter and bytecode VM still work; only `build`/`run --native`
+require a C toolchain.
+
+Runnable examples: `examples/typed_native.lusa` (build/run) and
+`examples/unsafe_hardware.lusa` (compile-only; replace the illustrative MMIO
+address before running).
+
+`tests/c_backend.rs` covers typed mapping, functions/tables, moves/clone/drops,
+Cargo-style diagnostics, unsafe volatile emission, and a native build/run test
+that skips when no compiler is installed. See
+[`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
+[`docs/LANGUAGE.md`](docs/LANGUAGE.md) section 9 for details.
 
 ## Bytecode VM: registers and source lines
 

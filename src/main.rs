@@ -1,8 +1,10 @@
 //! Lusa CLI: run `.lusa` files or fall into the REPL.
 
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 
 use lusa::ast;
+use lusa::cbackend;
 use lusa::error::{render, LusaError};
 use lusa::interp::{Frame, Interp};
 use lusa::parser;
@@ -14,19 +16,27 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("-h") | Some("--help") | Some("help") => {
-            println!("lusalang — Lusa runtime manager (no cargo needed for daily use)");
+            println!("lusalang — Lusa compiler and runtime (no cargo needed for daily use)");
             println!();
-            println!("  lusalang run <file.lusa>       run a program ([--vm] runs it in bytecode mode)");
-            println!("  lusalang check <file.lusa>     validate (lex+parse) without running");
+            println!(
+                "  lusalang run <file.lusa>       run a program ([--vm] bytecode; [--native] C11)"
+            );
+            println!("  lusalang build <file.lusa>     compile to a native executable with the host C compiler");
+            println!("  lusalang check <file.lusa>     validate (lex+parse; [--typed] runs the C11 type checker)");
             println!("  lusalang repl                  open the interactive REPL");
             println!("  lusalang new <name>            create a new project (scaffold)");
             println!("  lusalang install <user>/<repo> install a package from GitHub");
             println!("  lusalang packages              list installed packages");
             println!("  lusalang uninstall <name>      remove an installed package");
             println!("  lusalang where                 show where the runtime is installed");
-            println!("  lusalang lsp                   run the language server (editors contact it)");
+            println!(
+                "  lusalang lsp                   run the language server (editors contact it)"
+            );
             println!("  lusalang self-update [--check] download and install the newest release");
             println!("  lusalang version               runtime version");
+            println!();
+            println!("  C backend: --cc <path> selects GCC/Clang/TCC/cl.exe; LUSA_CC and CC are honored.");
+            println!("             build --emit-c writes the intermediate C without invoking the C compiler.");
             println!();
             println!("  (short aliases: lusa [file.lusa] | lusa -e \"<code>\")");
         }
@@ -34,7 +44,7 @@ fn main() {
             println!(concat!(
                 "lusa ",
                 env!("CARGO_PKG_VERSION"),
-                " (runtime RC3: native heap bootstrap)"
+                " (interpreter + bytecode VM + C11 native backend)"
             ));
         }
         Some("repl") => {
@@ -42,63 +52,22 @@ fn main() {
         }
         Some("where") => {
             let exe = std::env::current_exe().ok();
-            println!("runtime: {}", exe.map(|p| p.display().to_string()).unwrap_or_else(|| "?".into()));
+            println!(
+                "runtime: {}",
+                exe.map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "?".into())
+            );
             println!(concat!("version: lusa ", env!("CARGO_PKG_VERSION")));
             println!("docs   : docs/LANGUAGE.md (language) + docs/TOOLCHAIN.md (toolchain)");
         }
         Some("run") => {
-            let mut want_vm = false;
-            let mut path: Option<&String> = None;
-            for a in &args[2..] {
-                if a == "--vm" {
-                    want_vm = true;
-                } else {
-                    path = Some(a);
-                }
-            }
-            let path = match path {
-                Some(p) => p,
-                None => {
-                    eprintln!("usage: lusalang run <file.lusa> [--vm]");
-                    std::process::exit(2);
-                }
-            };
-            let src = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("lusa: cannot read {}: {}", path, e);
-                    std::process::exit(2);
-                }
-            };
-            if want_vm {
-                match lusa::vm::run_source_vm(&src) {
-                    Ok(lines) => {
-                        for line in lines {
-                            println!("{}", line);
-                        }
-                        let _ = std::io::stdout().flush();
-                        println!("[bytecode vm] {} finished", path);
-                        std::process::exit(0);
-                    }
-                    Err(e) => {
-                        let _ = std::io::stdout().flush();
-                        let _ = std::io::stderr().flush();
-                        eprint!("{}(bytecode vm)", render(&e, &src, path));
-                        std::process::exit(1);
-                    }
-                }
-            }
-            std::process::exit(run_source(&src, path));
+            std::process::exit(cmd_run(&args[2..]));
+        }
+        Some("build") => {
+            std::process::exit(cmd_build(&args[2..]));
         }
         Some("check") => {
-            let path = match args.get(2) {
-                Some(p) => p,
-                None => {
-                    eprintln!("usage: lusalang check <file.lusa>");
-                    std::process::exit(2);
-                }
-            };
-            std::process::exit(check(path));
+            std::process::exit(cmd_check(&args[2..]));
         }
         Some("new") => {
             let name = match args.get(2) {
@@ -114,7 +83,9 @@ fn main() {
             let spec = match args.get(2) {
                 Some(s) => s.as_str(),
                 None => {
-                    eprintln!("usage: lusalang install <user>/<repo> (optionally `<user>/<repo>#<tag>`)");
+                    eprintln!(
+                        "usage: lusalang install <user>/<repo> (optionally `<user>/<repo>#<tag>`)"
+                    );
                     std::process::exit(2);
                 }
             };
@@ -159,22 +130,255 @@ fn main() {
     }
 }
 
-/// `lusa check <file>`: lex+parse only; reports diagnostics without running.
-fn check(path: &str) -> i32 {
-    let src = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("lusa: cannot read {}: {}", path, e);
+fn read_source(path: &str) -> Result<String, i32> {
+    std::fs::read_to_string(path).map_err(|e| {
+        eprintln!("lusa: cannot read {}: {}", path, e);
+        2
+    })
+}
+
+/// `lusalang run <file> [--native|--vm] [--cc <cc>] [program args...]`.
+fn cmd_run(args: &[String]) -> i32 {
+    let mut want_vm = false;
+    let mut want_native = false;
+    let mut cc: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut program_args: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--vm" => want_vm = true,
+            "--native" | "--c" => want_native = true,
+            "--cc" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => cc = Some(v.clone()),
+                    None => {
+                        eprintln!("lusa: --cc requires a compiler path (or use LUSA_CC)");
+                        return 2;
+                    }
+                }
+            }
+            s if s.starts_with("--cc=") => cc = Some(s["--cc=".len()..].to_string()),
+            "-h" | "--help" => {
+                println!("usage: lusalang run <file.lusa> [--native|--vm] [--cc <cc>] [args...]");
+                return 0;
+            }
+            s if s.starts_with('-') && s != "-" => {
+                eprintln!("lusa: unknown run option `{s}`");
+                return 2;
+            }
+            _ => {
+                if path.is_none() {
+                    path = Some(a.clone());
+                } else {
+                    program_args.push(a.clone());
+                }
+            }
+        }
+        i += 1;
+    }
+    if want_native && want_vm {
+        eprintln!("lusa: choose either --native or --vm");
+        return 2;
+    }
+    let path = match path {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: lusalang run <file.lusa> [--native|--vm] [--cc <cc>] [args...]");
             return 2;
         }
     };
+    let src = match read_source(&path) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    if want_native {
+        return match cbackend::run_native(&src, cc.as_deref(), &program_args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("lusa: C11 backend failed:\n{}", e);
+                1
+            }
+        };
+    }
+    if want_vm {
+        match lusa::vm::run_source_vm(&src) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{}", line);
+                }
+                let _ = std::io::stdout().flush();
+                println!("[bytecode vm] {} finished", path);
+                return 0;
+            }
+            Err(e) => {
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+                eprint!("{}(bytecode vm)", render(&e, &src, &path));
+                return 1;
+            }
+        }
+    }
+    if !program_args.is_empty() {
+        eprintln!("lusa: program arguments require --native");
+    }
+    run_source(&src, &path)
+}
+
+/// `lusalang build <file> [-o <output>] [--cc <cc>] [--emit-c]`.
+fn cmd_build(args: &[String]) -> i32 {
+    let mut input: Option<String> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut cc: Option<String> = None;
+    let mut emit_c = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "-o" | "--output" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => output = Some(PathBuf::from(v)),
+                    None => {
+                        eprintln!("lusa: {a} requires an output path");
+                        return 2;
+                    }
+                }
+            }
+            "--cc" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => cc = Some(v.clone()),
+                    None => {
+                        eprintln!("lusa: --cc requires a compiler path (or use LUSA_CC)");
+                        return 2;
+                    }
+                }
+            }
+            s if s.starts_with("--cc=") => cc = Some(s["--cc=".len()..].to_string()),
+            "--emit-c" => emit_c = true,
+            "-h" | "--help" => {
+                println!("usage: lusalang build <file.lusa> [-o <output>] [--cc <cc>] [--emit-c]");
+                return 0;
+            }
+            s if s.starts_with('-') => {
+                eprintln!("lusa: unknown build option `{s}`");
+                return 2;
+            }
+            _ => {
+                if input.is_some() {
+                    eprintln!("lusa: build accepts exactly one source file");
+                    return 2;
+                }
+                input = Some(a.clone());
+            }
+        }
+        i += 1;
+    }
+    let input = match input {
+        Some(p) => PathBuf::from(p),
+        None => {
+            eprintln!("usage: lusalang build <file.lusa> [-o <output>] [--cc <cc>] [--emit-c]");
+            return 2;
+        }
+    };
+    let src = match std::fs::read_to_string(&input) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lusa: cannot read {}: {}", input.display(), e);
+            return 2;
+        }
+    };
+
+    if emit_c {
+        let c_path = output.unwrap_or_else(|| input.with_extension("c"));
+        return match cbackend::emit_c_file(&src, &c_path) {
+            Ok(()) => {
+                println!("C11 emitted: {}", c_path.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("lusa: C11 backend failed:\n{}", e);
+                1
+            }
+        };
+    }
+
+    let output = output.unwrap_or_else(|| cbackend::default_output(&input));
+    match cbackend::build(&src, &output, cc.as_deref()) {
+        Ok(compiler) => {
+            println!(
+                "built {} with {}",
+                output.display(),
+                compiler.display_name()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("lusa: C11 build failed:\n{}", e);
+            1
+        }
+    }
+}
+
+/// `lusalang check <file> [--typed]`: parse-only by default; `--typed` runs the
+/// C11 backend's checker without producing an executable.
+fn cmd_check(args: &[String]) -> i32 {
+    let mut typed = false;
+    let mut path: Option<String> = None;
+    for a in args {
+        match a.as_str() {
+            "--typed" => typed = true,
+            "-h" | "--help" => {
+                println!("usage: lusalang check <file.lusa> [--typed]");
+                return 0;
+            }
+            s if s.starts_with('-') => {
+                eprintln!("lusa: unknown check option `{s}`");
+                return 2;
+            }
+            _ => {
+                if path.is_some() {
+                    eprintln!("lusa: check accepts exactly one source file");
+                    return 2;
+                }
+                path = Some(a.clone());
+            }
+        }
+    }
+    let path = match path {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: lusalang check <file.lusa> [--typed]");
+            return 2;
+        }
+    };
+    let src = match read_source(&path) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    if typed {
+        return match cbackend::emit_c(&src) {
+            Ok(c) => {
+                println!("check ok (typed): {} ({} bytes of C11)", path, c.len());
+                0
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        };
+    }
     match parser::parse(&src) {
         Ok(block) => {
             println!("check ok: {} ({} statements)", path, block.len());
             0
         }
         Err(e) => {
-            eprint!("{}", render(&e, &src, path));
+            eprint!("{}", render(&e, &src, &path));
             1
         }
     }
@@ -221,14 +425,28 @@ fn new_project(name: &str) -> i32 {
         return 2;
     }
     let main = SCAFFOLD_MAIN.replace("{name}", name);
-    if let Err(e) = std::fs::write(format!("{}{}main.lusa", name, std::path::MAIN_SEPARATOR), &main) {
+    if let Err(e) = std::fs::write(
+        format!("{}{}main.lusa", name, std::path::MAIN_SEPARATOR),
+        &main,
+    ) {
         eprintln!("lusa: failed to write main.lusa: {}", e);
         return 2;
     }
     let readme = format!("# lusa: {}\n\nrun: lusalang run main.lusa\n", name);
-    let _ = std::fs::write(format!("{}{}README.md", name, std::path::MAIN_SEPARATOR), readme);
-    println!("project created: {}{}main.lusa", name, std::path::MAIN_SEPARATOR);
-    println!("next step      : lusalang run {}{}main.lusa", name, std::path::MAIN_SEPARATOR);
+    let _ = std::fs::write(
+        format!("{}{}README.md", name, std::path::MAIN_SEPARATOR),
+        readme,
+    );
+    println!(
+        "project created: {}{}main.lusa",
+        name,
+        std::path::MAIN_SEPARATOR
+    );
+    println!(
+        "next step      : lusalang run {}{}main.lusa",
+        name,
+        std::path::MAIN_SEPARATOR
+    );
     0
 }
 
@@ -241,10 +459,14 @@ fn packages_dir() -> std::path::PathBuf {
         }
     }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        return std::path::PathBuf::from(local).join("Lusa").join("packages");
+        return std::path::PathBuf::from(local)
+            .join("Lusa")
+            .join("packages");
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    std::path::PathBuf::from(home).join(".lusa").join("packages")
+    std::path::PathBuf::from(home)
+        .join(".lusa")
+        .join("packages")
 }
 
 /// Reads `key = "value"` from a package's lusa.toml manifest, if present.
@@ -380,7 +602,11 @@ fn pkg_install(spec: &str) -> i32 {
             let target = dir.join(e.file_name());
             if std::fs::rename(e.path(), &target).is_err() {
                 if let Err(copy_err) = copy_recursively(&e.path(), &target) {
-                    eprintln!("lusa: cannot move {}: {}", e.file_name().display(), copy_err);
+                    eprintln!(
+                        "lusa: cannot move {}: {}",
+                        e.file_name().display(),
+                        copy_err
+                    );
                     let _ = std::fs::remove_dir_all(&dir);
                     let _ = std::fs::remove_dir_all(&tmp);
                     return 1;
@@ -393,7 +619,11 @@ fn pkg_install(spec: &str) -> i32 {
     let version = manifest_value(&dir, "version").unwrap_or_else(|| "?".into());
     if dir.join("init.lusa").is_file() || dir.join("lusa.toml").is_file() {
         println!("installed: {} v{} -> {}", name, version, dir.display());
-        println!("use it   : local {} = require(\"{}\")", name.replace(['-', '.'], "_"), name);
+        println!(
+            "use it   : local {} = require(\"{}\")",
+            name.replace(['-', '.'], "_"),
+            name
+        );
     } else {
         println!("downloaded {} -> {}", name, dir.display());
         println!("note     : no init.lusa / lusa.toml entry point found; require() may fail");
@@ -435,7 +665,11 @@ fn pkg_list() -> i32 {
 fn pkg_uninstall(name: &str) -> i32 {
     let dir = packages_dir().join(name);
     if !dir.is_dir() {
-        eprintln!("lusa: \"{}\" is not installed (root: {})", name, packages_dir().display());
+        eprintln!(
+            "lusa: \"{}\" is not installed (root: {})",
+            name,
+            packages_dir().display()
+        );
         return 1;
     }
     if let Err(e) = std::fs::remove_dir_all(&dir) {
@@ -487,7 +721,9 @@ fn looks_incomplete(e: &LusaError, buf: &str) -> bool {
     let n = buf.chars().count();
     let near_end = matches!(e.span, Some(sp) if sp.start >= n.saturating_sub(1) || sp.end >= n.saturating_sub(1));
     near_end
-        && (e.msg.contains("expected") || e.msg.contains("unterminated") || e.msg.contains("missing"))
+        && (e.msg.contains("expected")
+            || e.msg.contains("unterminated")
+            || e.msg.contains("missing"))
 }
 
 /// Interactive REPL with multi-line continuation (Lua-style).

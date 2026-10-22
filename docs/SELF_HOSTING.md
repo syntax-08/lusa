@@ -1,22 +1,24 @@
-# Self-hosted front end
+# Self-hosted compiler and C11 backend
 
-The `lexer.lusa`, `parser.lusa` and `compiler.lusa` files at the repository root
-implement the first three stages of the toolchain in Lusa itself.  They are
-reference implementations: small, readable, portable across the tree-walking
-interpreter and `--vm`, and intentionally limited to a core language subset.
+The repository contains two self-hosted front ends:
 
 ```text
 source text
     │
-    ▼
-lexer.lusa ──► flat token table
-    │
-    ▼
-parser.lusa ─► nested-table AST
-    │
-    ▼
-compiler.lusa ─► numeric bytecode image
+    ├── lexer.lusa ──► flat token table
+    │       └── parser.lusa ──► nested-table AST
+    │               ├── compiler.lusa ──► bytecode image (interpreter/VM)
+    │               └── compiler_bootstrap.lusa ──► type checking + C11
+    └── src/*.rs ──► the Rust interpreter/VM used to run the self-hosted code
 ```
+
+`lusalang build` embeds `lexer.lusa`, `parser.lusa`, and
+`compiler_bootstrap.lusa` in the Rust binary, runs the self-hosted pipeline
+through the interpreter, and invokes the host C compiler. `compiler.lusa` and
+the Rust interpreter/VM remain available for `lusalang run` and
+`lusalang run --vm`.
+
+## Front-end modules
 
 Each module exposes one table:
 
@@ -24,429 +26,255 @@ Each module exposes one table:
 local Lexer = require("lexer")
 local Parser = require("parser")
 local Compiler = require("compiler")
+local CBootstrap = require("compiler_bootstrap")
 
 local tokens = Lexer.lex(source)
 local ast = Parser.parse(tokens)
-local image = Compiler.compile(clone ast)
+local image = Compiler.compile(clone ast)          -- bytecode (VM)
+local c_source = CBootstrap.emit_c(clone ast)      -- C11 backend
 ```
 
-The parser consumes the token table by value.  The compiler consumes the AST by
-value, so `clone ast` is required when the AST must remain available.  Neither
-module uses `borrow`, because both are exercised on the bytecode VM as well as
-the interpreter.
+The parser consumes the token table by value and returns a freshly built
+`Program`. `compiler.lusa` consumes its AST. The C backend snapshots the AST
+before optimizing so a caller can retain its own copy.
 
-## Supported subset
+### Supported statements and expressions
 
-Statements:
+Statements: `local` (with optional `: type`), assignment, call statements,
+`if`/`elseif`/`else`, `while`, `repeat`, `do`, `unsafe do`, `function`,
+`return`, and `break`.
 
-- `local` declarations with optional initializers
-- name assignment, including multiple targets/values
-- call statements
-- `if` / `elseif` / `else`
-- `while`, `repeat`, `do`
-- `return`, `break`
+Expressions: `nil`, booleans, decimal and hexadecimal numbers, strings,
+names, calls, parentheses, unary `-`/`not`/`#`, arithmetic/concatenation/
+comparison operators, `and`/`or`, `clone`, `borrow`, array table constructors,
+and one-based index reads (`t[1]`, nested `t[1][2]`).
 
-Expressions:
+The reference parser intentionally rejects keyed constructors (`{k = v}`),
+field/method access, assignment through a field/index, numeric/generic `for`,
+and varargs.
 
-- `nil`, booleans, numbers (decimal and hex), strings (decoded escapes)
-- names, calls, parentheses
-- unary `-`, `not`, `#`
-- binary arithmetic, concatenation, comparison and equality operators
-- `and` / `or`
-- `clone` and `borrow`
-- array table constructors (`{}`, `{1, 2}`, trailing comma allowed)
-- integer index reads (`t[1]`, including nested `t[1][2]`)
+### AST schema
 
-Intentionally unsupported in this reference stage: keyed table constructors
-(`{k = v}`), field/method access (`.`, `:`), assignment through a field/index,
-function definitions, numeric/generic `for`, varargs, and compilation of
-interpolated strings. The parser reports a `parser:line:column:` error instead
-of silently building a partial AST. The compiler reports unsupported AST nodes
-with a `compiler:line:column:` error. `borrow` is parsed and compiled to the
-bytecode `BorrowErr` opcode, matching the native compiler's VM behavior. Calls
-are compiled as single-value `CallOne` expressions; multi-return expansion from
-calls and vararg propagation are not part of this reference subset. A
-declaration or assignment with more initializers than targets is rejected
-rather than silently dropping the extras.
-
-## AST schema
-
-Every node is a fresh table with `tag`, `line` and `column` fields.
+Every node carries `tag`, `line`, and `column`.
 
 | node | fields |
 |------|--------|
 | `Program` | `body = { stmt... }` |
-| `Local` | `names = { string... }`, `values = { expr... }` |
-| `Assign` | `targets = { Name... }`, `values = { expr... }` |
+| `Local` | `names`, `types`, `values` |
+| `Assign` | `targets = { Name... }`, `values` |
+| `Function` | `name`, `params = { {name,type}... }`, `return_type`, `body` |
 | `CallStmt` | `value = Call` |
-| `If` | `branches = { { cond = expr, body = { stmt... } }... }`, `else_body = { stmt... } or nil` |
-| `While` | `cond = expr`, `body = { stmt... }` |
-| `Repeat` | `body = { stmt... }`, `cond = expr` |
-| `Do` | `body = { stmt... }` |
-| `Return` | `values = { expr... }` |
+| `If` | `branches = { {cond, body}... }`, `else_body` |
+| `While` | `cond`, `body` |
+| `Repeat` | `body`, `cond` |
+| `Do` | `body` |
+| `Unsafe` | `body` (raw-pointer block) |
+| `Return` | `values` |
 | `Break` | no extra fields |
-| `Nil` | no extra fields |
-| `Bool` | `value = true or false` |
-| `Number` | `value = number` |
-| `String` | `value = decoded text`, `raw = raw text`, `interpolated = bool` |
-| `Name` | `name = string` |
-| `Paren` | `value = expr` |
-| `Unary` | `op = "-" or "not" or "#"`, `value = expr` |
-| `Binary` | `op = string`, `lhs = expr`, `rhs = expr` |
-| `Logical` | `op = "and" or "or"`, `lhs = expr`, `rhs = expr` |
-| `Call` | `callee = expr`, `args = { expr... }` |
-| `Table` | `items = { expr... }` (array entries only) |
-| `Index` | `table = expr`, `index = expr` |
-| `Clone` | `value = expr` |
-| `Borrow` | `value = expr` |
+| `Nil` / `Bool` / `Number` / `String` | literal payload |
+| `Name` | `name` |
+| `Paren` | `value` |
+| `Unary` | `op`, `value` |
+| `Binary` / `Logical` | `op`, `lhs`, `rhs` |
+| `Call` | `callee`, `args` |
+| `Table` | `items` (array entries only) |
+| `Index` | `table`, `index` |
+| `Clone` / `Borrow` | `value` |
 
-`Assign` targets are restricted to `Name` nodes. The parser accepts `t[i]` as
-an expression but rejects `a.b = ...`, `a[i] = ...`, and call targets with an
-explicit error.
+## Ownership and module state
 
-## Ownership strategy
+- `Parser.parse` moves the token table into module state, reads scalar token
+  fields, and returns a fresh AST.
+- `compiler.lusa` consumes the AST by value; pass `clone ast` to keep it.
+- `compiler_bootstrap.lusa` snapshots `borrow_ast.body` before optimizing, so
+  `Compiler.emit_c(borrow ast)` leaves the caller's AST readable.
+- The interpreter enforces ownership on the self-hosted code itself. Helpers
+  that inspect AST nodes use `borrow`, and helpers that transform a node return
+  it so the caller can rebind it.
+- Scope stacks use depth counters rather than trailing `nil` writes because
+  Lusa's `#table` does not shrink in that case.
 
-- `Parser.parse(input)` moves the token table into module state, reads only
-  scalar token fields, and returns a freshly built `Program` with `move`.
-  Token sub-tables are never moved, written, or aliased into the AST.
-- Parser nodes are assembled bottom-up.  Fields that are still needed (for
-  example a target's source location) are copied to scalars before the table is
-  moved into its parent.
-- `Compiler.compile(ast)` takes ownership of `ast`.  Traversal moves fields out
-  of the owned tree, but helper functions receive scalar locations or owned
-  subtrees; they never receive a shared AST node merely to inspect it.
-- The compiler's scope stack and loop/break stack use explicit depth counters.
-  Lusa's `#table` does not shrink when a trailing slot is assigned `nil`, so
-  `scopes[#scopes] = nil` cannot be used to pop a stack safely.
-- Callers that need the AST after compilation pass `clone ast`.  Tests assert
-  that the original tree is unchanged after compiling a clone.
+## Module 8.5: typed C11 backend
 
-## Bytecode image
-
-`Compiler.compile` returns:
-
-```lua
-{
-    version = 1,
-    code = { byte... },            -- opcodes and operands, 0..255
-    constants = { {kind=..., value=...}... },
-    lines = { line... },           -- one entry per byte in `code`
-    nlocals = number
-}
-```
-
-Encoding rules:
-
-- Opcodes are one byte and follow the native `Instr` discriminants in
-  `src/compiler.rs`.
-- Operands are big-endian `u16` values.
-- Constant operands are **zero-based** indexes into `constants`; the Lusa array
-  itself is one-based, so operand `k` refers to `constants[k + 1]`.
-- Local-slot operands are zero-based.  `nlocals` is the high-water mark of
-  unique slots allocated across all lexical scopes.
-- Jump operands are absolute **one-based byte offsets** into `code`.  This is a
-  property of the portable image; the native enum stores instruction indexes.
-- `lines[i]` is the source line for `code[i]`, including operand bytes.
-- The compiler appends an implicit `ReturnFixed(0)` after the program body, so
-  top-level fallthrough returns no values.
-
-### Opcode subset
-
-| byte | opcode | operands | meaning |
-|------|--------|----------|---------|
-| 0 | `LoadConst` | constant | push a constant |
-| 1 | `LoadNil` | — | push `nil` |
-| 2 | `GetLocal` | slot | push local |
-| 4 | `GetGlobal` | name constant | push global |
-| 13 | `SetGlobal` | name constant | pop into global |
-| 14 | `SetLocal` | slot | pop into local |
-| 21..28 | `Add`…`Concat` | — | binary arithmetic/concat |
-| 29..34 | `Eq`…`Ge` | — | comparison |
-| 35..37 | `Neg`, `Not`, `Len` | — | unary |
-| 38 | `Clone` | — | deep clone top |
-| 39 | `BorrowErr` | — | always errors in bytecode mode |
-| 42 | `CallOne` | nargs, ntakes | fixed-arity call; this compiler emits `ntakes = 0` |
-| 53 | `Jump` | target | unconditional jump |
-| 54 | `JumpIfFalse` | target | pop and branch when false |
-| 55 | `JumpIfTrueKeep` | target | `or`: keep truthy and jump, otherwise pop |
-| 56 | `JumpIfFalseKeep` | target | `and`: keep falsey and jump, otherwise pop |
-| 59 | `Pop` | — | discard top |
-| 61 | `ReturnFixed` | count | return top `count` values |
-
-The keep-jumps already pop the value when evaluation continues, so a logical
-expression must not emit an extra `Pop` after them.  The native VM compiler had
-such an extra instruction; it was removed and is covered by the
-`vm_parity_logical_short_circuit` regression test.
-
-### Example
-
-For:
-
-```lua
-local a = 1 + 2
-return a
-```
-
-the image has `version = 1`, `nlocals = 1`, constants `1` and `2`, and these
-19 bytes (hexadecimal; the test asserts the same values as decimals):
+### Pipeline
 
 ```text
-00 00 00    LoadConst 0      -- 1
-00 00 01    LoadConst 1      -- 2
-15          Add
-0E 00 00    SetLocal 0
-02 00 00    GetLocal 0
-3D 00 01    ReturnFixed 1
-3D 00 00    ReturnFixed 0    -- implicit
+source
+  │ lexer.lusa
+  ▼
+tokens
+  │ parser.lusa
+  ▼
+AST
+  │ optimizer (constant folding, dead-code pruning)
+  ▼
+optimized AST
+  │ static checker (annotates ctype/own/borrowed/moved)
+  ▼
+checked AST
+  │ C emitter
+  ▼
+program.c ──► host GCC / Clang / TCC / MSVC ──► native executable
 ```
 
-## Errors and tests
-
-Both modules raise `E9000` with their stage in the message:
-
-```text
-parser:1:10: expected an expression, found end of input
-compiler:1:11: string interpolation is not supported by this reference compiler
-```
-
-`tests/parser_compiler_self_hosted.rs` composes all three modules inside
-separate `do ... end` blocks, checks AST shape, verifies the exact 19-byte image
-above, decodes instruction boundaries and jump targets, asserts clone-based AST
-preservation, and exercises parser/compiler error paths on both engines.
-
-## Modules 7–8: native backend, heap objects and RAII
-
-`compiler_bootstrap.lusa` is the first native-code stage. It does not emit VM
-bytecode: it builds complete x86_64 executable images with hand-written PE32+
-and ELF64 headers, so an emitted program needs neither the Rust runtime nor an
-external linker. Module 7 established the scalar backend; Module 8 adds native
-heap strings/tables, OS-backed allocation, deep scope drops, and move/borrow
-tracking.
+No PE/ELF headers or x86_64 instructions are emitted by the compiler. The C
+file is the portable intermediate and can be inspected with `--emit-c`.
 
 ### Public API
 
 | function | ownership contract | result |
 |----------|--------------------|--------|
-| `Compiler.optimize(move_ast)` | consumes a `Program` AST | optimized `Program` |
-| `Compiler.emit_binary(borrow_ast, target_os)` | reads the AST; a `borrow ast` argument is valid | byte table (`PE` or `ELF`) |
-| `Compiler.bootstrap(lexer, parser, source, target_os)` | consumes the front-end tables | `{target, source_bytes, image_bytes, image}` |
-| `Compiler.verify_fixpoint(lexer, parser, source, target_os)` | clones the front-end tables for each run | `{equal, first, second}` |
-| `Compiler.self_compile(lexer, parser, target_os, path)` | consumes the front-end tables and reads `path` | success descriptor or an explicit `{ok=false, stage=...}` report |
-| `Compiler.write_image(path, image)` | reads `image` | `io_write_binary(path, image)` |
-| `Compiler.memory_layout()` | none | heap/RAII ABI description |
+| `Compiler.optimize(move_ast)` | consumes a `Program` | optimized `Program` |
+| `Compiler.check(borrow_ast)` | snapshots the AST | `{ok, functions, globals}` |
+| `Compiler.emit_c(borrow_ast)` | snapshots the AST | C11 source string |
+| `Compiler.bootstrap(lexer, parser, source)` | consumes front-end handles | `{target, source_bytes, c_source, c_bytes}` |
+| `Compiler.write_c(path, c_source)` | reads the C string | writes a file |
+| `Compiler.verify_fixpoint(lexer, parser, source)` | clones handles for each run | `{equal, first, second}` |
+| `Compiler.self_compile(lexer, parser, path)` | consumes handles and reads `path` | success/error descriptor |
+| `Compiler.memory_layout()` | none | ABI/schema description |
 
-`emit_binary` snapshots only `borrow_ast.body`, then optimizes a private copy.
-The caller's AST and body remain readable after emission. Top-level fields are
-copied as scalars; the emitter never mutates the borrowed tree. The scratch
-tables used while lowering are cleared after the image is built.
+`Compiler.Version = 2` and `Compiler.Targets = { c = "c11" }`.
 
-The front-end APIs consume their lexer/parser arguments because the Module-5/6
-modules use module-level state. Pass `clone Lexer, clone Parser` when the same
-handles are needed again; `verify_fixpoint` does this internally so the caller's
-handles remain valid.
+### Static types
 
-### Optimizer
+| Lusa annotation | C11 type |
+|-----------------|----------|
+| `u32` | `uint32_t` |
+| `i32` | `int32_t` |
+| `i128` | `lusa_i128` (`__int128`, or `long long` under MSVC) |
+| `f32` | `float` |
+| `bool` | `bool` (`<stdbool.h>`) |
+| `string` | `LusaString *` |
+| `[T]`, `[[T]]` | `LusaTable *` with a homogeneous element kind |
 
-The optimizer is ownership-consuming: each helper takes a node and returns the
-replacement, so nodes are never aliased after being folded or dropped. It
-performs:
+Untyped integer literals infer `i32`; untyped decimal literals infer `f32`.
+The checker validates locals, assignments, function arguments/returns,
+conditions, table elements, and operator operands. Errors use Cargo-style
+`error[E....]` diagnostics with `--> lusa:line:column` and expected/found notes.
+The checker annotates the optimized AST with `ctype`, `own`, `borrowed`, and
+`moved` so the emitter never guesses.
 
-- constant folding for arithmetic, comparisons, unary operators, and static
-  string concatenation;
-- `and`/`or` pruning when the left side is a known boolean;
-- constant-`if` elimination while preserving a later dynamic `elseif` head;
-- removal of statements after `return`/`break`;
-- removal of `while false` bodies and unreachable branches.
+### Unsafe blocks and raw pointers
 
-### Native subset
+`unsafe do ... end` is a lexical block that disables the checker's
+borrow-assignment restriction locally while preserving ordinary RAII drops for
+owned values declared inside it.
 
-Accepted core:
-
-- integer/boolean/`nil`/static-string literals, plus dynamic strings produced
-  by `..`;
-- locals, globals, assignment, arithmetic and comparison operators, `and`/`or`,
-  unary `-`/`not`/`#`;
-- `if`/`elseif`/`else`, `while`, `repeat`, `do`, `return`, `break`;
-- homogeneous array tables (`{}`, `{1, 2}`, `{"a", "b"}`, nested tables),
-  one-based integer index reads (`t[1]`), and `#t`;
-- `move` by plain assignment and immutable `borrow` aliases;
-- `print` with multiple arguments; Windows and ELF both format strings, tables
-  (`<table>`), integers, booleans, and `nil`.
-
-Owned locals and globals are dropped automatically at lexical scope exits,
-including `if`/`while` blocks and the early `return`/`break` paths. Moving a
-value clears its source slot and cancels that slot's drop; borrowing keeps a
-non-owning alias alive and blocks moving or overwriting the owner until the
-alias leaves scope. Reassigning a heap global or local drops the previous value
-first.
-
-Rejected nodes produce a `bootstrap:line:column:` error rather than a partial
-image: keyed or heterogeneous tables, field access, assignment through an index
-or field, heap `clone`, closures/functions, methods, numeric and generic `for`,
-varargs, interpolation, floating-point arithmetic, and borrowed/moved
-heap-valued table elements. Table values are homogeneous and integer-indexed;
-the reserved hash-capacity field is not yet used. The backend represents raw
-scalars as signed 64-bit integers; `false`/`nil` are `0` and `true` is `1`, while
-strings and tables are payload pointers.
-
-### PE32+ layout (Windows)
-
-- DOS/PE headers occupy the first `0x200` bytes.
-- `.text` is at RVA `0x1000`, file offset `0x200`; its first `0x1000` bytes are
-  the static data area (NUL-terminated strings and writable global slots).
-- Generated code begins at section offset `0x1000`, so the entry point is RVA
-  `0x2000`.
-- `.rdata` starts at RVA `0x3000` and contains the import descriptor, ILT/IAT,
-  and hint/name entries.
-- Imports are `ExitProcess`, `VirtualAlloc`, and `VirtualFree` from
-  `kernel32.dll`, plus `printf` from `msvcrt.dll`. Calls use RIP-relative
-  `FF 15` through the IAT.
-- Because globals currently share the data/code section, `.text` is mapped
-  read/write/execute (`0xE0000020`). A future layout can split globals into a
-  dedicated writable `.data` section and keep code read/execute-only.
-- Every Windows API call reserves the required 32-byte shadow space and keeps
-  `rsp` 16-byte aligned. The prologue aligns the stack, establishes `rbp`, and
-  reserves `align16(64 + 8*slots) + 8` bytes. Slot `i` lives at
-  `[rbp - 40 - 8*i]`.
-- Top-level `return` reaches `ExitProcess`, so the process exit code is the
-  returned scalar. `print` uses `%s` for strings, booleans, `nil`, and tables
-  (`<table>`), and `%lld` for integers.
-
-### ELF64 layout (Linux)
-
-- Entry is `0x402000` (`0x400000` load base + `0x2000` code offset).
-- Static data starts at image offset `0x1000`; code starts at image offset
-  `0x2000`.
-- One `PT_LOAD` segment carries `R|W|X` flags; there is no dynamic loader,
-  interpreter, relocation, or symbol table.
-- `print` uses the `write(2)` syscall and supports static/dynamic strings,
-  tables (`<table>`), integers, booleans, and `nil`; exit uses `exit(2)`
-  directly.
-
-### Heap lifecycle and RAII ABI
-
-`Compiler.memory_layout()` describes the live Module-8 representation:
-
-```lua
-{
-    scalar = "i64 in a register/stack slot",
-    value_header = {
-        size = 32,
-        type = "u64 at object-32 (1 = string, 2 = table)",
-        length = "u64 at object-24",
-        flags = "u64 at object-16 (bit 0 = owned)",
-        allocation = "u64 at object-8",
-        payload = "object itself (header + 32)"
-    },
-    table = {
-        element_kind = "u64 at payload+0",
-        hash_capacity = "u64 at payload+8 (reserved)",
-        entries = "u64 at payload+16, one-based array values"
-    },
-    allocator = {
-        windows = "VirtualAlloc / VirtualFree",
-        linux = "mmap(2) / munmap(2)"
-    }
-}
+```lusa
+unsafe do
+    local reg: i128 = unsafe_ptr_cast(0x40000000)
+    unsafe_write_mem(reg, 1)
+    local value: u32 = unsafe_read_mem(reg)
+    print(value)
+end
 ```
 
-The 32-byte header immediately precedes the value pointer stored in a native
-slot. Static strings embedded in the image carry the same header with
-`flags = 0`; dynamic strings and tables carry `flags = 1` and are returned to
-the OS by `rt_drop`.
+Generated C:
 
-- String payload: UTF-8 bytes followed by a NUL. Dynamic concatenation computes
-  the combined byte length, allocates `header + length + 1`, copies both
-  payloads, and returns the new payload pointer.
-- Table payload: `elem_kind` (0 unknown, 1 number, 2 bool, 3 nil, 4 string,
-  5 table), a reserved hash-capacity slot, then the one-based entries.
-  `#t` reads the header length; `t[i]` performs a bounds check and loads entry
-  `i`. The native subset currently supports homogeneous array tables only.
-- Deep drop: `rt_drop` checks the owned flag, recursively drops table entries
-  whose element kind is string or table, then releases the object. Strings are
-  released directly.
-- RAII lowering: owned locals are dropped in reverse declaration order at every
-  lexical scope exit, including `if`/`while` blocks, `return`, and `break`.
-  Heap globals are dropped at program exit; assigning over an owned local or
-  global drops the old value first.
-- Move: the source slot/global is cleared and its pending drop is cancelled.
-  Borrow: the compiler records a non-owning alias, suppresses the owner's drop
-  while the alias lives, and rejects moving or overwriting the owner. The alias
-  itself is never dropped.
-- `clone` of a heap value is intentionally rejected with a
-  `bootstrap:line:column:` diagnostic; scalar `clone` is a copy. A deep-copying
-  heap clone remains future work.
+```c
+lusa_i128 v = ((uintptr_t)(0x40000000));
+(*(volatile uint32_t *)(uintptr_t)(v)) = (uint32_t)(1);
+uint32_t read = (*(volatile uint32_t *)(uintptr_t)(v));
+```
 
-This is the RAII analogue of Rust: the scope owns its heap values and the
-compiler inserts release calls rather than relying on a garbage collector.
+Intrinsics (`unsafe_ptr_cast`, `unsafe_read_mem`, `unsafe_write_mem`) are
+rejected outside an unsafe block with `E0316`. They perform no bounds checks or
+memory sandboxing: the caller is responsible for using valid hardware or
+process addresses.
 
-### Self-compilation status
+### C runtime and heap ABI
 
-`self_compile` reads a source path (default `compiler_bootstrap.lusa`) and runs
-it through the self-hosted lexer/parser and native pipeline. Full self-hosting
-is deliberately not claimed yet:
+`Compiler.memory_layout()` describes the generated runtime:
 
-- the Module-6 parser now accepts array tables and index reads, but still
-  rejects this file's function definitions, keyed/field access, and `for`
-  loops;
-- the native backend would also reject closures/functions and `for` even if
-  the parser accepted them;
-- the Module-5 lexer is character-by-character and is very slow on the full
-  ~70 KiB source.
+```c
+typedef struct LusaObj {
+    uint64_t type;      /* 1 = string, 2 = table */
+    uint64_t length;    /* bytes or element count */
+    uint64_t flags;     /* bit 0 = owned */
+    uint64_t size;      /* allocation size */
+} LusaObj;
 
-On success it returns
-`{ok=true, target, source_bytes, image_bytes, image}`. For this file the API
-therefore returns `{ok=false, stage="frontend", error=...}`, with the parser
-diagnostic. If lexing fails first the stage is `"lexer"`; if a future parser
-accepts the source but the native emitter cannot lower it, the stage is
-`"backend"`. The integration test exercises both sides of the contract: a tiny
-supported source must produce a PE through `self_compile`, while a tiny
-unsupported file must report the front-end gap without spending minutes in the
-lexer. `verify_fixpoint` and the AST-to-image comparison validate deterministic
-emission on the supported subset.
+typedef struct LusaString { LusaObj obj; char *data; } LusaString;
+typedef struct LusaTable {
+    LusaObj obj;
+    uint64_t elem_kind;
+    uint64_t capacity;
+    uint64_t *items;
+} LusaTable;
+```
+
+- Allocation uses `malloc`/`calloc`/`realloc`; release uses `free`.
+- Table access is one-based in Lusa and lowered to zero-based C indices.
+- `lusa_drop_string`/`lusa_drop_table` check the owned flag and recursively
+  release string/table elements before `free`.
+- Owned locals/globals are dropped in reverse declaration order at every
+  lexical exit, before `return`/`break`, and before an assignment overwrites an
+  owned value.
+- A move stores the pointer in the destination, clears the source slot
+  (`= NULL`), and cancels the source drop.
+- `clone` deep-copies strings and tables (`lusa_string_clone`,
+  `lusa_table_clone`); scalar clone is a copy.
+- `borrow` emits an alias with no allocation and no drop.
+
+### Diagnostics
+
+The checker raises messages such as:
+
+```text
+error[E0308]: mismatched types in local `x`
+  --> lusa:1:16
+   = expected `u32`
+   = found    `string`
+```
+
+`src/cbackend.rs` unwraps the interpreter's `E9000` wrapper so the user sees
+the original Cargo-style diagnostic. Lexer/parser failures are normalized to
+`E0001`/`E0101` with a source location.
+
+### Host toolchain discovery
+
+`src/cbackend.rs` searches, in order:
+
+1. `--cc <path>`
+2. `LUSA_CC`
+3. `CC`
+4. `cc`, `gcc`, `clang`, `tcc`, `cl` on `PATH`
+5. Visual Studio installations found through `vswhere.exe` and
+   `VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe`
+
+GCC/Clang/TCC use `-std=c11 -O2`; MSVC uses `/nologo /TC /O2 /std:c11` and
+falls back if that standard switch is not supported. When `cl.exe` is found
+outside a Developer Command Prompt, the wrapper calls the matching
+`vcvars64.bat`/`vcvarsall.bat x64` first so `INCLUDE` and `LIB` are available.
+Linux GCC/Clang builds link `-lm`; TCC/Windows retries without it when
+necessary.
 
 ### Tests
 
-`tests/bootstrap_native.rs` composes all four modules, then:
+`tests/c_backend.rs` covers:
 
-- asserts that `optimize` consumes only its argument, that `emit_binary`
-  leaves a borrowed AST unchanged, and that a top-level borrow can be cloned
-  without re-entering the ownership registry;
-- checks constant folding, false-head `elseif` preservation, constant
-  `if`/`while` pruning, dead-code removal, and the memory ABI;
-- rejects an invalid target with the documented diagnostic, and verifies that
-  an array `Table` AST node now emits a valid PE;
-- compiles the same seed through `bootstrap` and the AST path and requires the
-  same bytes; checks `verify_fixpoint`;
-- exercises `self_compile` on a supported file and on an unsupported file that
-  reports `stage="frontend"`;
-- runs the pipeline on both the interpreter and VM and requires byte-identical
-  PE/ELF output;
-- executes the generated PE (exit value, static strings, while/repeat/break
-  loops, assignments, bool/nil printing);
-- validates ELF class/type/machine/entry/program-header and the single RWX
-  `PT_LOAD` segment.
+- typed locals and default inference;
+- function prototypes/definitions and calls;
+- strings, tables, clone, moves, and generated RAII drops;
+- Cargo-style type diagnostics;
+- unsafe volatile pointer emission and the E0316 guard;
+- a native build-and-run test that skips when no host C compiler is available.
 
-`tests/bootstrap_heap.rs` compiles a dedicated seed and executes its generated
-PE. It covers dynamic concatenation, string and table lifetimes, array tables
-and one-based indexing, nested tables, `if`/`while` scope drops, moves,
-borrows, assignment drops, global heap values, and a nonzero process exit. The
-same seed is emitted as ELF64 and structurally validated (there is no Linux
-runtime in the current test environment).
+`tests/parser_compiler_self_hosted.rs` continues to validate the bytecode
+compiler on the shared parser. `tests/lexer_self_hosted.rs` validates token
+locations and literals.
 
-`tests/parser_compiler_self_hosted.rs` additionally asserts the new `Table`
-and `Index` AST shapes and retains explicit errors for field access and index
-assignment.
+### Current limits
+
+The C emitter supports the typed subset above, not the full dynamic language:
+keyed constructors, field/method access, assignment through an index/field,
+heterogeneous tables, numeric/generic `for`, varargs, interpolated strings, and
+closures/nested functions are rejected with diagnostics. The dynamic
+interpreter and bytecode VM remain the complete-language engines.
 
 ## Extension points
 
-The next stage can add keyed/hash tables, field/index assignment, heap `clone`,
-function prototypes/upvalues, numeric and generic `for`, and varargs by
-extending the AST schema, the parser precedence/suffix handling, and the
-compiler's lowering. The heap drop/borrow machinery is already in place for
-owned strings and homogeneous array tables; keyed entries still need hashing,
-key lookup, and the corresponding drop traversal. Full-file self-parse also
-requires functions and `for` before this module can replace the remaining Rust
-stages. The module-level state design is single-threaded and non-reentrant by
-choice; a future version can thread an explicit parser/compiler context table
-instead.
+The next steps are keyed/hash tables, field/index assignment, heap-table
+mutation, closures/upvalues, numeric and generic `for`, and varargs in the C
+emitter. The runtime already has deep clone/drop and volatile raw-memory
+support; those features mainly need AST schema and lowering extensions.

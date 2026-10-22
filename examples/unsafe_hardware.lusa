@@ -1,0 +1,16 @@
+-- Hardware / memory-mapped register example (compile-only on a normal PC).
+--
+--   lusalang build examples/unsafe_hardware.lusa
+--
+-- The address below is illustrative. Replace it with a valid register or
+-- peripheral address for your target before running; the C backend performs
+-- no bounds checking or sandboxing inside `unsafe`.
+
+unsafe do
+    local reg: i128 = unsafe_ptr_cast(0x40000000)
+    unsafe_write_mem(reg, 1)
+    local value: u32 = unsafe_read_mem(reg)
+    print("register:", value)
+end
+
+return 0

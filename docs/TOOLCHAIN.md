@@ -90,9 +90,13 @@ success — if something interrupts it, just rename `lusa.exe.old` back.
 | command                          | effect                                           | detail                                        |
 |----------------------------------|--------------------------------------------------|-----------------------------------------------|
 | `lusalang version` / `lusa -v`   | runtime version                                  |                                               |
-| `lusalang run <file.lusa>`       | runs a program                                   | path relative to the current directory        |
+| `lusalang run <file.lusa>`       | runs a program in the interpreter                | path relative to the current directory        |
 | `lusalang run <file.lusa> --vm`  | runs through the **bytecode VM**                 | same program, compiled to instructions first  |
+| `lusalang run <file.lusa> --native` | transpiles to C11 and runs a native executable | uses the host C compiler; accepts program args |
+| `lusalang build <file.lusa>`     | compiles to a native executable via C11           | `-o <out>`, `--cc <cc>`, `--emit-c`           |
+| `lusalang build <file> --emit-c` | writes the intermediate `.c` instead of building  | default `<file>.c`                            |
 | `lusalang check <file.lusa>`     | validates **lex+parse** and exits (0 ok, 1 fail) | **does not execute**; only catches code errors |
+| `lusalang check <file> --typed`  | runs the C11 type checker                         | Cargo-style `error[E....]` diagnostics         |
 | `lusalang new <name>`            | creates `<name>\main.lusa` + `<name>\README.md`  | scaffold ships with a working demo            |
 | `lusalang repl` / `lusa`         | interactive REPL                                 | multi-line, `:quit` to exit                   |
 | `lusalang where`                 | path of the installed runtime                    |                                               |
@@ -144,7 +148,7 @@ Requires Rust (cargo) ≥ 1.70. Commands, from the project root:
 ```sh
 cargo build             # debug build (fast to compile, slow to run)
 cargo build --release   # release turbo: lto + codegen-units=1 + opt-level=3
-cargo test              # 61 tests (6 unit + 51 integration + 4 self-hosted/native bootstrap)
+cargo test --all-targets  # unit + integration + self-hosted + C11 backend tests
 cargo run               # opens the REPL straight from source
 ```
 
@@ -179,32 +183,40 @@ $d = Measure-Command { & .\target\debug\lusa.exe bench.lusa > $null }
 $r = Measure-Command { & .\target\release\lusa.exe bench.lusa > $null }
 ```
 
-### Native bootstrap backend (Modules 7–8)
+### Native C11 backend (Module 8.5)
 
-`compiler_bootstrap.lusa` is an experimental direct-code emitter that runs
-inside the interpreter/VM. It consumes the self-hosted parser AST and writes a
-complete executable image with no external linker:
+`lusalang build` and `lusalang run --native` embed `lexer.lusa`,
+`parser.lusa`, and `compiler_bootstrap.lusa` in `lusa.exe`. The self-hosted
+pipeline optimizes and type-checks the AST, emits a portable C11 translation
+unit, and invokes the host C compiler:
 
-```lua
-local ast = Parser.parse(Lexer.lex(source))
-local pe = Compiler.emit_binary(borrow ast, "windows")
-io_write_binary("program.exe", pe)
+```sh
+lusalang build hello.lusa                  # hello.exe (or hello on Unix)
+lusalang build hello.lusa --emit-c         # hello.c, no C compiler invoked
+lusalang build hello.lusa -o app.exe --cc "C:\path\to\clang.exe"
+lusalang run hello.lusa --native           # build to a temp dir and run
+lusalang check hello.lusa --typed          # type check only
 ```
 
-- Windows images are hand-built PE32+ files importing `ExitProcess`,
-  `VirtualAlloc`, `VirtualFree`, and `printf`.
-- Linux images are static ELF64 files using direct `mmap`/`munmap`, `write`,
-  and `exit` syscalls.
-- Module 8 adds heap strings and homogeneous array tables, OS-backed
-  allocation, dynamic concatenation, deep RAII drops at scope exits, and
-  move/borrow tracking. Keyed tables, field/index assignment, heap `clone`,
-  closures/functions, and `for` remain future work.
-- `cargo test --test bootstrap_heap` exercises the generated Windows PE;
-  generated ELF files are structurally validated because the CI host is
-  Windows-only.
+The intermediate C file contains:
 
-This backend is not yet the `lusalang build` command; it is the foundation for
-the standalone native path.
+- `LusaString`/`LusaTable` structs with a 32-byte `LusaObj` header;
+- `malloc`/`calloc`/`realloc`/`free` allocation and deep RAII drops;
+- `uint32_t`, `int32_t`, `lusa_i128`, and `float` numeric mappings;
+- `unsafe do ... end` lowered to `*(volatile uint32_t *)(uintptr_t)address`
+  reads/writes for registers and memory-mapped hardware.
+
+Compiler discovery order is `--cc`, `LUSA_CC`, `CC`, `PATH`
+(`cc`/`gcc`/`clang`/`tcc`/`cl`), then Visual Studio via `vswhere.exe`. GCC,
+Clang, TCC, and MSVC are supported; for MSVC the wrapper runs the matching
+`vcvars64.bat`/`vcvarsall.bat x64` so `INCLUDE`/`LIB` are configured even
+outside a Developer Command Prompt. If no compiler is found, `build` reports
+the paths/flags to configure; the interpreter and bytecode VM never require a C
+toolchain.
+
+The old PE32+/ELF64 image emitter and its `emit_binary` API were removed. See
+[`SELF_HOSTING.md`](SELF_HOSTING.md) for the compiler architecture and
+[`LANGUAGE.md`](LANGUAGE.md) section 9 for the typed/unsafe language surface.
 
 ---
 
@@ -237,23 +249,23 @@ copy the exe into `setup\`, delete the old zip and re-zip the folder.
 | phase | item                                                    |
 |-------|---------------------------------------------------------|
 | 1 ✅ | `run / check / new / repl / where / version` + installer, portable package |
-| 2    | `lusalang build` — `.lusa` → bytecode (`.lub`) compiler + VM running **without cargo**; typical gain 3–10× over the tree-walk |
+| 2 ✅ | `lusalang build` — `.lusa` → C11 → native executable through the host GCC/Clang/TCC/MSVC |
 | 3    | `lusalang pack` — bundles script(s) + runtime into a single standalone `.exe` to distribute your projects |
 | 4    | `lusalang require` / multi-file module system           |
-| 5    | JIT (long term) or AOT via transpilation (very long)    |
+| 5    | JIT (long term); AOT via C11 is available now          |
 
 ### "Can Lusa get its own compiler?"
 
-Yes — three possible routes:
+Yes — two engines already ship:
 
-1. **Bytecode + VM embedded in `lusalang build`** (recommended): real AST →
-   instructions → stack-based VM inside the same `lusa.exe`. A real compiler,
-   zero dependencies, runs anywhere without cargo.
-2. **AOT**: transpile `.lusa` to C/Rust and generate a native `.exe`. Requires
-   a runtime embedded in the output — weeks of work, but feasible.
-3. **JIT**: LuaJIT-style; only worth it in a much more mature MVP.
+1. **Bytecode + VM** (`lusalang run --vm`): AST → instructions → stack-based VM
+   inside `lusa.exe`; no C toolchain needed.
+2. **AOT C11 backend** (`lusalang build` / `run --native`): typed AST → portable
+   C11 → host compiler. This is the hardware/portability path and the only one
+   that accepts `unsafe` blocks and raw volatile memory access.
 
-Route 1 is outlined in the `README.md` roadmap (`compiler.rs` + `vm.rs`).
+A JIT remains a long-term possibility; the C11 backend is the current native
+route.
 
 ## Packages: installing libraries with `lusalang install`
 

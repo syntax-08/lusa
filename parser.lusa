@@ -14,20 +14,25 @@
 -- AST schema (each node also carries `line` and `column`):
 --
 --   Program  { tag = "Program", body = { stmt... } }
---   Local    { tag = "Local", names = { name... }, values = { expr... } }
+--   Local    { tag = "Local", names = { name... }, types = { type|"auto"... },
+--              values = { expr... } }
 --   Assign   { tag = "Assign", targets = { Name... }, values = { expr... } }
+--   Function { tag = "Function", name = string,
+--              params = { {name=string, type=type}... }, return_type = type,
+--              body = { stmt... } }
 --   CallStmt { tag = "CallStmt", value = expr }
 --   If       { tag = "If", branches = { { cond = expr, body = { stmt... } }... },
 --              else_body = { stmt... } | nil }
 --   While    { tag = "While", cond = expr, body = { stmt... } }
 --   Repeat   { tag = "Repeat", body = { stmt... }, cond = expr }
 --   Do       { tag = "Do", body = { stmt... } }
+--   Unsafe   { tag = "Unsafe", body = { stmt... } }   (raw pointer / FFI block)
 --   Return   { tag = "Return", values = { expr... } }
 --   Break    { tag = "Break" }
 --
 --   Nil      { tag = "Nil" }
 --   Bool     { tag = "Bool", value = true | false }
---   Number   { tag = "Number", value = number }
+--   Number   { tag = "Number", value = number, float = bool }
 --   String   { tag = "String", value = decoded text, raw = source text,
 --              interpolated = bool }
 --   Name     { tag = "Name", name = string }
@@ -39,12 +44,13 @@
 --   Clone    { tag = "Clone", value = expr }
 --   Borrow   { tag = "Borrow", value = expr }
 --
--- Supported statements: local declarations, name assignments, calls, `if`,
--- `while`, `repeat`, `do`, `return`, `break`.  Expressions cover literals,
--- names, calls, parentheses, unary and binary operators, `and`/`or`,
--- `clone` and `borrow`, plus array table constructors and integer index
--- expressions (`t[1]`).  Keyed fields, methods, functions and
--- numeric/generic `for` remain extension points for the next stage.
+-- Supported statements: local declarations (with optional `: type`),
+-- name assignments, calls, `if`, `while`, `repeat`, `do`, `return`, `break`,
+-- and named function definitions with typed parameters and an optional
+-- return type.  Expressions cover literals, names, calls, parentheses,
+-- unary and binary operators, `and`/`or`, `clone` and `borrow`, plus array
+-- table constructors and integer index expressions (`t[1]`).  Keyed fields,
+-- methods and numeric/generic `for` remain extension points.
 --
 -- Errors use E9000 with a `parser:line:column:` prefix.
 
@@ -65,10 +71,13 @@ local parse_program
 local parse_block
 local parse_stmt
 local parse_local
+local parse_function
+local parse_type
 local parse_if
 local parse_while
 local parse_repeat
 local parse_do
+local parse_unsafe
 local parse_return
 local parse_break
 local parse_assign_or_call
@@ -330,20 +339,50 @@ parse_block = function()
     return move(list)
 end
 
+-- A type name is deliberately kept as a name token here.  The backend's
+-- semantic checker owns the supported-type list, so the parser stays a pure
+-- syntax layer and can report a better `unknown type` diagnostic later.
+parse_type = function()
+    if at_value("[") then
+        advance()
+        local element = parse_type()
+        expect_value("]", "`]` to close the table type")
+        return "table<" .. element .. ">"
+    end
+
+    if peek_kind() ~= "name" then
+        fail("expected a type name, found " .. describe_token())
+    end
+    local name = peek_value()
+    advance()
+    return name
+end
+
+local function parse_optional_type()
+    if at_value(":") then
+        advance()
+        return parse_type()
+    end
+    return "auto"
+end
+
 parse_local = function()
     local line = peek_line()
     local column = peek_column()
     advance() -- local
 
     if at_keyword("function") then
-        fail("`local function` is not supported by this reference parser")
+        fail("`local function` is not supported by this reference parser; use `function name(...)`")
     end
 
     local names = {}
+    local types = {}
     names[#names + 1] = expect_name()
+    types[#types + 1] = parse_optional_type()
     while at_value(",") do
         advance()
         names[#names + 1] = expect_name()
+        types[#types + 1] = parse_optional_type()
     end
 
     local values = {}
@@ -355,7 +394,60 @@ parse_local = function()
     return {
         tag = "Local",
         names = names,
+        types = types,
         values = values,
+        line = line,
+        column = column
+    }
+end
+
+parse_function = function()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- function
+
+    local name = expect_name()
+    local params = {}
+    expect_value("(", "`(` after the function name")
+    if not at_value(")") then
+        while true do
+            local param_line = peek_line()
+            local param_column = peek_column()
+            local param_name = expect_name()
+            local param_type = "auto"
+            if at_value(":") then
+                advance()
+                param_type = parse_type()
+            end
+            params[#params + 1] = {
+                name = param_name,
+                type = param_type,
+                line = param_line,
+                column = param_column
+            }
+            if not at_value(",") then
+                break
+            end
+            advance()
+        end
+    end
+    expect_value(")", "`)` to close the parameter list")
+
+    local return_type = "void"
+    if at_value(":") then
+        advance()
+        return_type = parse_type()
+    end
+
+    local body = parse_block()
+    expect_value("end", "`end` to close the function")
+
+    return {
+        tag = "Function",
+        name = name,
+        params = params,
+        return_type = return_type,
+        body = body,
         line = line,
         column = column
     }
@@ -452,6 +544,28 @@ parse_do = function()
     }
 end
 
+parse_unsafe = function()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- unsafe
+
+    -- Lua-style block: `unsafe do ... end`.  Accepting the condition-less
+    -- `unsafe ... end` form as well keeps the grammar friendly for tiny
+    -- register writes.
+    if at_value("do") then
+        advance()
+    end
+    local body = parse_block()
+    expect_value("end", "`end` to close the `unsafe` block")
+
+    return {
+        tag = "Unsafe",
+        body = body,
+        line = line,
+        column = column
+    }
+end
+
 parse_return = function()
     local line = peek_line()
     local column = peek_column()
@@ -538,6 +652,8 @@ parse_stmt = function()
     if kind == "keyword" then
         if value == "local" then
             return parse_local()
+        elseif value == "function" then
+            return parse_function()
         elseif value == "if" then
             return parse_if()
         elseif value == "while" then
@@ -546,12 +662,14 @@ parse_stmt = function()
             return parse_repeat()
         elseif value == "do" then
             return parse_do()
+        elseif value == "unsafe" then
+            return parse_unsafe()
         elseif value == "return" then
             return parse_return()
         elseif value == "break" then
             return parse_break()
-        elseif value == "for" or value == "function" then
-            fail("`" .. value .. "` is not supported by this reference parser")
+        elseif value == "for" then
+            fail("`for` is not supported by this reference parser")
         end
     elseif kind == "name" then
         return parse_assign_or_call()
@@ -723,9 +841,20 @@ parse_primary = function()
 
     if kind == "number" then
         advance()
+        local is_float = false
+        if string.find(value, ".", 1, true) ~= nil then
+            is_float = true
+        end
+        if string.find(value, "e", 1, true) ~= nil then
+            is_float = true
+        end
+        if string.find(value, "E", 1, true) ~= nil then
+            is_float = true
+        end
         return {
             tag = "Number",
             value = parse_number(value, line, column),
+            float = is_float,
             line = line,
             column = column
         }

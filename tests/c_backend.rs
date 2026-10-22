@@ -1,0 +1,181 @@
+//! Module 8.5: typed Lusa -> C11 -> native executable.
+//!
+//! Emission tests always run.  Native compile/run tests skip cleanly when the
+//! host machine has no detectable C compiler; CI installs GCC/Clang, while a
+//! developer can point `LUSA_CC` at TCC, Clang, GCC, or `cl.exe`.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+use lusa::cbackend;
+
+fn emit(source: &str) -> String {
+    cbackend::emit_c(source).unwrap_or_else(|e| panic!("C backend failed:\n{e}"))
+}
+
+fn assert_has(c: &str, needle: &str) {
+    assert!(
+        c.contains(needle),
+        "generated C is missing `{needle}`:\n{c}"
+    );
+}
+
+#[test]
+fn typed_locals_and_default_inference() {
+    let c = emit(
+        "local n = 42\n\
+         local amount = 2.5\n\
+         local id: u32 = 1\n\
+         local signed: i32 = -5\n\
+         local big: i128 = 1234567890123\n\
+         print(n, amount, id, signed, big)\n\
+         return 0\n",
+    );
+    assert_has(&c, "int32_t init");
+    assert_has(&c, "float init");
+    assert_has(&c, "uint32_t init");
+    assert_has(&c, "lusa_i128 init");
+    assert_has(&c, "lusa_print_i128");
+}
+
+#[test]
+fn functions_tables_and_raii_are_emitted() {
+    let c = emit(
+        "function add(a: i32, b: i32): i32\n\
+             return a + b\n\
+         end\n\
+         function make(n: u32): [string]\n\
+             local out: [string] = {\"a\", \"b\"}\n\
+             return out\n\
+         end\n\
+         local text = \"hi\"\n\
+         local values: [i32] = {1, 2, 3}\n\
+         local total = add(2, 3)\n\
+         local names = make(2)\n\
+         local copy = clone text\n\
+         local moved = values\n\
+         print(text, copy, total, #moved, names[1])\n\
+         return 0\n",
+    );
+    assert_has(&c, "static int32_t f");
+    assert_has(&c, "static LusaTable * f");
+    assert_has(&c, "LusaTable *table");
+    assert_has(&c, "lusa_table_new(");
+    assert_has(&c, "lusa_table_get_i32(");
+    assert_has(&c, "lusa_string_clone(");
+    assert_has(&c, "lusa_drop_string(&");
+    assert_has(&c, "lusa_drop_table(&");
+    // A move transfers ownership and clears the source slot.
+    assert_has(&c, "= NULL;");
+    // Drops run before the return path.
+    let drop_pos = c.find("lusa_drop_table(&").expect("table drop");
+    let ret_pos = c.rfind("return (int)(").expect("main return");
+    assert!(drop_pos < ret_pos, "drops must precede the final return");
+}
+
+#[test]
+fn strings_with_quotes_and_newlines_are_encoded_safely() {
+    let c = emit(
+        "local apostrophe = \"it's\"\n\
+         local quote = 'a \"quote\"'\n\
+         print(apostrophe, quote)\n\
+         return 0\n",
+    );
+    assert_has(&c, "static unsigned char lusa_bytes_");
+    // `it's` is stored as a byte table, so the apostrophe survives the
+    // compiler-embedding layer without a quoting bug.
+    assert_has(&c, "105, 116, 39, 115");
+}
+
+#[test]
+fn unsafe_block_emits_volatile_pointer_access() {
+    let c = emit(
+        "unsafe do\n\
+             local reg: i128 = unsafe_ptr_cast(0x40000000)\n\
+             unsafe_write_mem(reg, 1)\n\
+             local value: u32 = unsafe_read_mem(reg)\n\
+             print(value, \"ok\")\n\
+         end\n\
+         return 0\n",
+    );
+    assert_has(&c, "unsafe: raw memory access");
+    assert_has(&c, "*(volatile uint32_t *)(uintptr_t)");
+    assert_has(&c, "= (uint32_t)(");
+    assert_has(&c, "(uintptr_t)(");
+}
+
+#[test]
+fn unsafe_intrinsics_require_an_unsafe_block() {
+    let err = cbackend::emit_c(
+        "local reg: i128 = unsafe_ptr_cast(0x40000000)\n\
+         unsafe_write_mem(reg, 1)\n\
+         return 0\n",
+    )
+    .expect_err("raw pointer access outside unsafe must fail");
+    assert!(err.contains("E0316"), "diagnostic: {err}");
+    assert!(err.contains("unsafe"), "diagnostic: {err}");
+    assert!(err.contains("--> lusa:"), "diagnostic: {err}");
+}
+
+#[test]
+fn type_errors_use_cargo_style_diagnostics() {
+    let err = cbackend::emit_c("local x: u32 = \"bad\"\nreturn 0\n")
+        .expect_err("mismatched literal must fail");
+    assert!(err.contains("error[E0308]"), "diagnostic: {err}");
+    assert!(err.contains("--> lusa:1:"), "diagnostic: {err}");
+    assert!(err.contains("expected `u32`"), "diagnostic: {err}");
+    assert!(err.contains("found    `string`"), "diagnostic: {err}");
+}
+
+#[test]
+fn native_build_and_run_when_a_compiler_is_available() {
+    let compiler = match cbackend::find_compiler(None) {
+        Ok(cc) => cc,
+        Err(e) => {
+            eprintln!("skipping native C backend test: {e}");
+            return;
+        }
+    };
+    let out_dir = std::env::temp_dir().join("opencode");
+    std::fs::create_dir_all(&out_dir).expect("temp dir");
+    let exe: PathBuf = out_dir.join(format!("lusa-cbackend-{}.exe", std::process::id()));
+    let _ = std::fs::remove_file(&exe);
+
+    let source = r#"
+function add(a: i32, b: i32): i32
+    return a + b
+end
+
+local total: i32 = 0
+local i: i32 = 0
+while i < 3 do
+    total = total + i
+    i = i + 1
+end
+
+local values: [i32] = {10, 20, 30}
+local names: [string] = {"a", "b"}
+local moved = values
+local text = "hi"
+local copy = clone text
+print(add(total, 4), text, copy, #moved, moved[2], names[1])
+if total > 2 then
+    print("big")
+end
+return 0
+"#;
+    let built = cbackend::build(source, &exe, None)
+        .unwrap_or_else(|e| panic!("native build with {} failed:\n{e}", compiler.display_name()));
+    assert_eq!(built.path, compiler.path);
+    let run = Command::new(&exe)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {}: {e}", exe.display()));
+    let _ = std::fs::remove_file(&exe);
+    assert!(
+        run.status.success(),
+        "native program failed: {run:?}\ncompiler: {}",
+        built.display_name()
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+    assert_eq!(stdout, "7 hi hi 3 20 a\nbig\n");
+}

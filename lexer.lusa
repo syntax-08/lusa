@@ -54,6 +54,7 @@ local KEYWORDS = {
     ["while"] = true,
     ["repeat"] = true,
     ["until"] = true,
+    ["unsafe"] = true,
     ["return"] = true,
     ["break"] = true,
     ["and"] = true,

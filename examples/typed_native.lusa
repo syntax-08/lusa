@@ -1,0 +1,29 @@
+-- Module 8.5 example: compile with
+--   lusalang build examples/typed_native.lusa
+--   lusalang run examples/typed_native.lusa --native
+--
+-- This typed form is accepted by the self-hosted C11 backend. The dynamic
+-- interpreter/VM use the untyped language surface.
+
+function add(a: i32, b: i32): i32
+    return a + b
+end
+
+function make_label(n: u32): [string]
+    local labels: [string] = {"idle", "ready", "busy"}
+    return labels
+end
+
+local id: u32 = 2
+local scale: f32 = 2.5
+local labels = make_label(id)
+local total: i32 = 0
+local i: i32 = 0
+
+while i < 3 do
+    total = total + i
+    i = i + 1
+end
+
+print("label:", labels[id], "total:", add(total, 4), "scale:", scale)
+return 0

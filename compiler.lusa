@@ -438,7 +438,9 @@ compile_stmt = function(stmt)
             i = i + 1
         end
 
-    elseif tag == "Do" then
+    elseif tag == "Do" or tag == "Unsafe" then
+        -- The bytecode VM has no raw-memory opcodes; an unsafe block is still
+        -- a lexical block.  Use `lusalang build` for volatile hardware access.
         compile_block(stmt.body)
 
     elseif tag == "Return" then
