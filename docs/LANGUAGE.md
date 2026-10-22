@@ -276,6 +276,8 @@ Codes `E{category}{n}`, like rustc:
 | E0308  | static   | C11 backend: mismatched types (assignment, return, call, condition) |
 | E0311  | static   | C11 backend: wrong argument/initializer count |
 | E0316  | unsafe   | C11 backend: raw pointer intrinsic used outside `unsafe` |
+| E0318  | static   | C11 backend: missing method or invalid method receiver |
+| E0319  | static   | C11 backend: unsupported generic `for` iterator |
 | E9000  | runtime  | `error(msg)` |
 | E9100  | runtime  | `assert(false, msg)` |
 | E9999  | runtime  | internal error (umbrella; includes stack overflow for calls > 200 — catchable with `pcall`) |
@@ -405,6 +407,9 @@ lusalang build hardware_test.lusa   # real volatile access
 
 - `LusaString` and `LusaTable` begin with a 32-byte `LusaObj` header
   (`type`, `length`, `flags`, `size`).
+- `LusaTable` includes the 1-based array part plus a string-keyed
+  open-addressing map (`LusaEntry`), so keyed and array values share one
+  object and one deep-drop traversal.
 - Allocation uses `malloc`, `calloc`, `realloc`, and `free`; there is no
   `VirtualAlloc`/`mmap` dependency.
 - Owned locals and globals are deep-dropped in reverse declaration order at
@@ -414,15 +419,63 @@ lusalang build hardware_test.lusa   # real volatile access
   copy for strings and tables; `borrow` emits an alias without allocation or
   drop.
 
-### 9.4 Native subset limits
+### 9.4 Native keyed tables, methods, and generic iterators
+
+Keyed constructors and field access are lowered to the generated hash-map
+runtime:
+
+```lusa
+local user = { id = 1, name = "Lusa", profile = { city = "Oslo" } }
+print(user.id, user.name, user.profile.city)
+user.name = "New"
+user.profile.city = "Bergen"
+```
+
+The C runtime uses a string-keyed open-addressing map (`LusaEntry` +
+FNV-1a/linear probing) alongside the array part. `lusa_table_set_string`,
+`lusa_table_get_string`, and typed keyed getters are emitted directly; field
+assignment drops the previous owned value.
+
+Colon methods are compiled as static C functions with `self` as a non-owning
+`LusaTable *` receiver:
+
+```lusa
+function user:rename(next_name: string): void
+    self.name = next_name
+end
+user:rename("New")
+```
+
+Generic iterators support `pairs` for keyed tables and `ipairs` for array
+tables:
+
+```lusa
+for key, value in pairs(user) do
+    print(key, value)
+end
+
+for index, value in ipairs({10, 20, 30}) do
+    print(index, value)
+end
+```
+
+`pairs` values use a tagged `LusaValue` when the table is heterogeneous;
+`ipairs` values retain their array element type. Per-iteration locals are
+dropped by the normal RAII scope machinery.
+
+### 9.5 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
-array-table literals, homogeneous tables, one-based indexing, `#`, `if`,
+array/keyed table literals, nested keyed tables, field reads/writes, colon
+methods, `pairs`/`ipairs` generic `for`, one-based array indexing, `#`, `if`,
 `while`, `repeat`, `do`, `return`, `break`, assignments, globals, `print`,
 `clone`, `borrow`, `unsafe` blocks, and the raw intrinsics above.
 
-Not supported by the C emitter: keyed table constructors (`{k = v}`),
-field/method access, assignment through an index/field, heterogeneous tables,
-numeric/generic `for`, varargs, interpolated strings, and closures/nested
-functions. The normal `lusalang run` interpreter and `--vm` engine continue to
-implement the full dynamic language in the preceding sections.
+Not supported by the C emitter: numeric `for`, arbitrary dynamic key
+construction in table literals, assignment through a dynamic index, varargs,
+interpolated strings, and closures/nested functions. Native colon methods are
+static functions and are not stored as table fields, so `pairs(user)` does not
+enumerate method names; keep enumerable data in a separate table when parity
+with the dynamic engines matters. The normal `lusalang run` interpreter and
+`--vm` engine continue to implement the full dynamic language in the preceding
+sections.

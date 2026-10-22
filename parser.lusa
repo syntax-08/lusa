@@ -17,7 +17,7 @@
 --   Local    { tag = "Local", names = { name... }, types = { type|"auto"... },
 --              values = { expr... } }
 --   Assign   { tag = "Assign", targets = { Name... }, values = { expr... } }
---   Function { tag = "Function", name = string,
+--   Function { tag = "Function", name = string, receiver = string|nil,
 --              params = { {name=string, type=type}... }, return_type = type,
 --              body = { stmt... } }
 --   CallStmt { tag = "CallStmt", value = expr }
@@ -25,6 +25,8 @@
 --              else_body = { stmt... } | nil }
 --   While    { tag = "While", cond = expr, body = { stmt... } }
 --   Repeat   { tag = "Repeat", body = { stmt... }, cond = expr }
+--   ForIn    { tag = "ForIn", vars = { name... }, iter = expr,
+--              body = { stmt... } }
 --   Do       { tag = "Do", body = { stmt... } }
 --   Unsafe   { tag = "Unsafe", body = { stmt... } }   (raw pointer / FFI block)
 --   Return   { tag = "Return", values = { expr... } }
@@ -42,6 +44,10 @@
 --   Binary   { tag = "Binary", op = string, lhs = expr, rhs = expr }
 --   Logical  { tag = "Logical", op = "and" | "or", lhs = expr, rhs = expr }
 --   Call     { tag = "Call", callee = expr, args = { expr... } }
+--   MethodCall { tag = "MethodCall", obj = expr, name = string,
+--                args = { expr... } }
+--   Field    { tag = "Field", table = expr, field_name = string }
+--   Table    { tag = "Table", items = { expr... }, keys = { string|nil... } }
 --   Clone    { tag = "Clone", value = expr }
 --   Borrow   { tag = "Borrow", value = expr }
 --
@@ -77,6 +83,7 @@ local parse_type
 local parse_if
 local parse_while
 local parse_repeat
+local parse_for
 local parse_do
 local parse_unsafe
 local parse_return
@@ -104,6 +111,14 @@ local function peek_value()
         return ""
     end
     return tokens[pos].value
+end
+
+local function peek_value_at(offset)
+    local index = pos + offset
+    if index < 1 or index > total then
+        return nil
+    end
+    return tokens[index].value
 end
 
 local function peek_line()
@@ -408,6 +423,12 @@ parse_function = function()
     advance() -- function
 
     local name = expect_name()
+    local receiver = nil
+    if at_value(":") then
+        advance()
+        receiver = name
+        name = expect_name()
+    end
     local params = {}
     expect_value("(", "`(` after the function name")
     if not at_value(")") then
@@ -446,6 +467,7 @@ parse_function = function()
     return {
         tag = "Function",
         name = name,
+        receiver = receiver,
         params = params,
         return_type = return_type,
         body = body,
@@ -524,6 +546,32 @@ parse_repeat = function()
         tag = "Repeat",
         body = body,
         cond = cond,
+        line = line,
+        column = column
+    }
+end
+
+parse_for = function()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- for
+
+    local vars = {expect_name()}
+    while at_value(",") do
+        advance()
+        vars[#vars + 1] = expect_name()
+    end
+    expect_value("in", "`in` in the generic `for`")
+    local iter = parse_expr()
+    expect_value("do", "`do`")
+    local body = parse_block()
+    expect_value("end", "`end` to close the `for`")
+
+    return {
+        tag = "ForIn",
+        vars = vars,
+        iter = iter,
+        body = body,
         line = line,
         column = column
     }
@@ -617,9 +665,9 @@ parse_assign_or_call = function()
         local target_count = #targets
         local i = 1
         while i <= target_count do
-            if targets[i].tag ~= "Name" then
+            if targets[i].tag ~= "Name" and targets[i].tag ~= "Field" then
                 fail_at(targets[i].line, targets[i].column,
-                    "invalid assignment target (only names are supported)")
+                    "invalid assignment target (expected a name or field)")
             end
             i = i + 1
         end
@@ -635,8 +683,9 @@ parse_assign_or_call = function()
         }
     end
 
-    if first.tag ~= "Call" then
-        fail_at(first_line, first_column, "only calls may appear as expression statements")
+    if first.tag ~= "Call" and first.tag ~= "MethodCall" then
+        fail_at(first_line, first_column,
+            "only calls may appear as expression statements")
     end
     return {
         tag = "CallStmt",
@@ -670,7 +719,7 @@ parse_stmt = function()
         elseif value == "break" then
             return parse_break()
         elseif value == "for" then
-            fail("`for` is not supported by this reference parser")
+            return parse_for()
         end
     elseif kind == "name" then
         return parse_assign_or_call()
@@ -790,9 +839,33 @@ parse_suffixes = function(e)
                 line = line,
                 column = column
             }
-        elseif at_value(".") or at_value(":") then
-            fail_at(e.line, e.column,
-                "field/method access is not supported by this reference parser")
+        elseif at_value(".") then
+            advance()
+            local name = expect_name()
+            local line = e.line
+            local column = e.column
+            e = {
+                tag = "Field",
+                table = move(e),
+                field_name = name,
+                line = line,
+                column = column
+            }
+        elseif at_value(":") then
+            advance()
+            local name = expect_name()
+            expect_value("(", "`(` after the method name")
+            local args = parse_args()
+            local line = e.line
+            local column = e.column
+            e = {
+                tag = "MethodCall",
+                obj = move(e),
+                name = name,
+                args = args,
+                line = line,
+                column = column
+            }
         else
             return e
         end
@@ -922,20 +995,41 @@ parse_primary = function()
     if value == "{" then
         advance()
         local items = {}
+        local keys = {}
         if not at_value("}") then
-            items[#items + 1] = parse_expr()
-            while at_value(",") do
+            while true do
+                local field_key = nil
+                if peek_kind() == "name" and peek_value_at(1) == "=" then
+                    field_key = peek_value()
+                    advance() -- name
+                    advance() -- =
+                elseif at_value("[") then
+                    advance()
+                    local key_expr = parse_expr()
+                    expect_value("]", "`]` after the table key")
+                    expect_value("=", "`=` after the table key")
+                    if key_expr.tag ~= "String" then
+                        fail_at(key_expr.line, key_expr.column,
+                            "the C backend supports only string literal table keys")
+                    end
+                    field_key = key_expr.value
+                end
+                items[#items + 1] = parse_expr()
+                keys[#keys + 1] = field_key
+                if not at_value(",") then
+                    break
+                end
                 advance()
                 if at_value("}") then
                     break
                 end
-                items[#items + 1] = parse_expr()
             end
         end
         expect_value("}", "`}` to close the table")
         return {
             tag = "Table",
             items = items,
+            keys = keys,
             line = line,
             column = column
         }

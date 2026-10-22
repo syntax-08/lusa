@@ -6,7 +6,9 @@
 adds a typed C11 backend (`u32`/`i32`/`i128`/`f32`), RAII drops, host-toolchain
 native builds, and `unsafe` volatile access for hardware registers. Module 9
 brings the same typed/`unsafe` surface to the interpreter and bytecode VM
-(with safe simulated memory), plus exact `i128` integer literals.
+(with safe simulated memory), plus exact `i128` integer literals. Module 10
+adds native keyed tables, colon methods, and `pairs`/`ipairs` lowering to the
+C11 backend.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -283,6 +285,42 @@ the C backend. The interpreter and `--vm` instead use a safe simulated-memory
 map, so the same script can be tested without touching hardware. Native
 execution requires valid addresses; the backend deliberately does no memory
 sandboxing or bounds checks.
+
+### Keyed tables, methods, and iterators
+
+The C11 backend now supports heterogeneous string-keyed tables through a native
+open-addressing map:
+
+```lusa
+local user = { id = 1, name = "Lusa", profile = { city = "Oslo" } }
+print(user.id, user.name, user.profile.city)
+user.name = "New"
+user.profile.city = "Bergen"
+```
+
+Colon methods compile to static C functions with a non-owning `self` receiver:
+
+```lusa
+function user:rename(next_name: string): void
+    self.name = next_name
+end
+user:rename("New")
+```
+
+Generic `for` lowers both keyed and array iteration:
+
+```lusa
+for key, value in pairs(user) do
+    print(key, value)
+end
+
+for index, value in ipairs({10, 20, 30}) do
+    print(index, value)
+end
+```
+
+RAII scopes are entered per iteration, so temporary strings/tables allocated in
+the loop body are dropped before the next iteration.
 
 ### Host compiler discovery
 

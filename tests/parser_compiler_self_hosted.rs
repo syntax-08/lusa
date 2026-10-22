@@ -355,7 +355,13 @@ assert(index_node.tag == "Index")
 local index_table = index_node.table
 assert(index_table.tag == "Name")
 
-expect_parser_error("local x = a.b")
+local field_ast = M6Parser.parse(M6Lexer.lex("local x = a.b"))
+assert(field_ast.body[1].values[1].tag == "Field")
+assert(field_ast.body[1].values[1].field_name == "b")
+local keyed_ast = M6Parser.parse(M6Lexer.lex("local x = { id = 1, name = 7 }"))
+assert(keyed_ast.body[1].values[1].tag == "Table")
+assert(keyed_ast.body[1].values[1].keys[1] == "id")
+assert(keyed_ast.body[1].values[1].keys[2] == "name")
 expect_parser_error("t[1] = 2")
 
 local ok, err = pcall(function()

@@ -246,7 +246,19 @@ local function opt_expr(expr)
             out[#out + 1] = opt_expr(items[i])
             i = i + 1
         end
-        return {tag = "Table", items = out, line = line, column = column}
+        local keys = expr.keys
+        if keys == nil then
+            keys = {}
+            local j = 1
+            while j <= #out do
+                keys[j] = nil
+                j = j + 1
+            end
+        end
+        return {
+            tag = "Table", items = out, keys = keys,
+            line = line, column = column
+        }
     end
 
     if tag == "Index" then
@@ -321,6 +333,7 @@ opt_stmt = function(stmt)
         return {
             tag = "Function",
             name = stmt.name,
+            receiver = stmt.receiver,
             params = params,
             return_type = stmt.return_type,
             body = opt_block(stmt.body),
@@ -460,7 +473,8 @@ end
 
 local TYPE_NAMES = {
     i32 = true, u32 = true, i128 = true, f32 = true,
-    bool = true, string = true, ["nil"] = true, void = true, auto = true
+    bool = true, string = true, table = true,
+    ["nil"] = true, void = true, auto = true
 }
 
 local function table_element(type_name)
@@ -504,7 +518,12 @@ local function is_integer_type(type_name)
 end
 
 local function is_heap_type(type_name)
-    return type_name == "string" or table_element(type_name) ~= nil
+    return type_name == "string" or type_name == "table"
+        or table_element(type_name) ~= nil
+end
+
+local function is_table_type(type_name)
+    return type_name == "table" or table_element(type_name) ~= nil
 end
 
 local function is_void(type_name)
@@ -565,7 +584,7 @@ local function assignable(target, source, expr)
             return true
         end
     end
-    if table_element(target) ~= nil and table_element(source) == "nil" then
+    if is_table_type(target) and source == "nil" then
         return true
     end
     return false
@@ -625,12 +644,13 @@ local function scope_leave()
     check_scope_count = check_scope_count - 1
 end
 
-local function scope_declare(name, type_name, own, borrowed)
+local function scope_declare(name, type_name, own, borrowed, schema)
     local entry = {
         name = name,
         type = type_name,
         own = own == true,
-        borrowed = borrowed == true
+        borrowed = borrowed == true,
+        schema = schema
     }
     local scope = check_scopes[check_scope_count]
     scope.vars[name] = clone entry
@@ -692,6 +712,7 @@ end
 local check_expr
 local check_block
 local check_stmt
+local check_method_call
 
 local function check_mismatch(line, column, context, expected, found)
     type_fail("E0308", line, column, "mismatched types in " .. context,
@@ -805,9 +826,57 @@ local function check_call(expr)
     return expr, signature.ret
 end
 
+check_method_call = function(expr)
+    local checked_obj, obj_type = check_expr(expr.obj)
+    local receiver_tag = checked_obj.tag
+    local receiver_name = checked_obj.name
+    expr.obj = checked_obj
+    if not is_table_type(obj_type) then
+        check_mismatch(expr.line, expr.column, "method receiver",
+            "table", obj_type)
+    end
+    if receiver_tag ~= "Name" then
+        type_fail("E0318", expr.line, expr.column,
+            "method dispatch requires a named table receiver")
+    end
+    local key = receiver_name .. ":" .. expr.name
+    local signature = borrow check_functions[key]
+    if signature == nil then
+        type_fail("E0318", expr.line, expr.column,
+            "cannot find method `" .. tostring(expr.name)
+            .. "` for receiver `" .. tostring(receiver_name) .. "`")
+    end
+    local args = expr.args
+    if #args ~= #signature.params - 1 then
+        type_fail("E0311", expr.line, expr.column,
+            "method `" .. expr.name .. "` takes "
+            .. tostring(#signature.params - 1) .. " argument(s) but "
+            .. tostring(#args) .. " were supplied")
+    end
+    local i = 1
+    while i <= #args do
+        local checked_arg, arg_type = check_expr(args[i])
+        local param = borrow signature.params[i + 1]
+        if not assignable(param.type, arg_type, clone checked_arg) then
+            check_mismatch(checked_arg.line, checked_arg.column,
+                "argument " .. tostring(i) .. " of method `" .. expr.name .. "`",
+                param.type, arg_type)
+        end
+        args[i] = coerce_literal(checked_arg, param.type)
+        i = i + 1
+    end
+    expr.ctype = signature.ret
+    expr.fn_key = key
+    expr.args = args
+    return expr, signature.ret
+end
+
 local function check_table(expr)
     local items = expr.items
+    local keys = expr.keys or {}
+    local schema = {}
     local elem_type = nil
+    local has_keyed = false
     local i = 1
     while i <= #items do
         local checked_item, item_type = check_expr(items[i])
@@ -819,36 +888,53 @@ local function check_table(expr)
             type_fail("E0312", checked_item.line, checked_item.column,
                 "i128 table elements are not supported by the C ABI")
         end
-        if elem_type == nil then
-            if item_type == "nil" then
-                elem_type = "nil"
-            else
+        local key = keys[i]
+        if key ~= nil then
+            has_keyed = true
+            schema[key] = {
+                type = item_type,
+                schema = checked_item.schema
+            }
+        else
+            if elem_type == nil then
+                if item_type == "nil" then
+                    elem_type = "nil"
+                else
+                    elem_type = item_type
+                end
+            elseif elem_type == "nil" and item_type ~= "nil" then
                 elem_type = item_type
-            end
-        elseif elem_type == "nil" and item_type ~= "nil" then
-            elem_type = item_type
-        elseif item_type ~= elem_type then
-            if assignable(elem_type, item_type, clone checked_item) then
-                checked_item = coerce_literal(checked_item, elem_type)
-            else
-                check_mismatch(checked_item.line, checked_item.column,
-                    "table literal element", elem_type, item_type)
+            elseif item_type ~= elem_type then
+                if assignable(elem_type, item_type, clone checked_item) then
+                    checked_item = coerce_literal(checked_item, elem_type)
+                else
+                    check_mismatch(checked_item.line, checked_item.column,
+                        "table literal element", elem_type, item_type)
+                end
             end
         end
         items[i] = checked_item
         i = i + 1
     end
-    if elem_type == nil then
-        elem_type = "nil"
+    local result_type
+    if has_keyed then
+        result_type = "table"
+    else
+        if elem_type == nil then
+            elem_type = "nil"
+        end
+        if elem_type == "i128" then
+            type_fail("E0312", expr.line, expr.column,
+                "i128 table elements are not supported by the C ABI")
+        end
+        result_type = "table<" .. elem_type .. ">"
     end
-    if elem_type == "i128" then
-        type_fail("E0312", expr.line, expr.column,
-            "i128 table elements are not supported by the C ABI")
-    end
-    expr.ctype = "table<" .. elem_type .. ">"
+    expr.ctype = result_type
     expr.elem_type = elem_type
+    expr.schema = schema
     expr.items = items
-    return expr, "table<" .. elem_type .. ">"
+    expr.keys = keys
+    return expr, result_type
 end
 
 check_expr = function(expr)
@@ -904,6 +990,7 @@ check_expr = function(expr)
         expr.ctype = entry.type
         expr.own = entry.own
         expr.borrowed = entry.borrowed
+        expr.schema = entry.schema
         return expr, entry.type
     end
 
@@ -1069,8 +1156,35 @@ check_expr = function(expr)
 
     if tag == "Index" then
         local checked_table, table_type = check_expr(expr.table)
+        local table_schema = checked_table.schema
+        local table_elem_type = checked_table.elem_type
         expr.table = checked_table
+        local checked_index, index_type = check_expr(expr.index)
+        local index_tag = checked_index.tag
+        local index_value = checked_index.value
+        expr.index = checked_index
+        if index_tag == "String" and table_schema ~= nil then
+            local field = table_schema[index_value]
+            if field == nil then
+                type_fail("E0309", line, column,
+                    "table has no field `" .. tostring(index_value) .. "`")
+            end
+            expr.ctype = field.type
+            expr.schema = field.schema
+            expr.field_name = index_value
+            expr.own = false
+            return expr, field.type
+        end
+        if table_type == "table" and index_type == "string" then
+            expr.ctype = "value"
+            expr.dynamic_key = true
+            expr.own = false
+            return expr, "value"
+        end
         local element = table_element(table_type)
+        if element == nil and table_type == "table" then
+            element = table_elem_type
+        end
         if element == nil then
             check_mismatch(line, column, "index expression",
                 "table<...>", table_type)
@@ -1079,14 +1193,35 @@ check_expr = function(expr)
             type_fail("E0312", line, column,
                 "cannot index an empty table without an element type")
         end
-        local checked_index, index_type = check_expr(expr.index)
-        expr.index = checked_index
         if not is_integer_type(index_type) then
             check_mismatch(line, column, "table index", "integer", index_type)
         end
         expr.ctype = element
         expr.elem_type = element
         return expr, element
+    end
+
+    if tag == "Field" then
+        local checked_table, table_type = check_expr(expr.table)
+        local table_schema = checked_table.schema
+        expr.table = checked_table
+        if not is_table_type(table_type) then
+            check_mismatch(line, column, "field access", "table", table_type)
+        end
+        local field = table_schema ~= nil
+            and table_schema[expr.field_name] or nil
+        if field == nil then
+            type_fail("E0309", line, column,
+                "table has no field `" .. tostring(expr.field_name) .. "`")
+        end
+        expr.ctype = field.type
+        expr.schema = field.schema
+        expr.own = false
+        return expr, field.type
+    end
+
+    if tag == "MethodCall" then
+        return check_method_call(expr)
     end
 
     type_fail("E0312", line, column,
@@ -1105,6 +1240,7 @@ local function check_local(stmt)
     local resolved = {}
     local owns = {}
     local borrows = {}
+    local schemas = {}
     local i = 1
     while i <= #names do
         local declared = "auto"
@@ -1142,12 +1278,15 @@ local function check_local(stmt)
                 "local `" .. names[i] .. "` cannot have type `void`")
         end
         local own = is_heap_type(final_type)
-        if is_borrow then
+        if is_borrow or (checked ~= nil and checked.own == false) then
             own = false
         end
         resolved[i] = final_type
         owns[i] = own
         borrows[i] = is_borrow
+        if checked ~= nil then
+            schemas[i] = checked.schema
+        end
         if checked ~= nil then
             values[i] = checked
         end
@@ -1156,7 +1295,7 @@ local function check_local(stmt)
 
     i = 1
     while i <= #names do
-        scope_declare(names[i], resolved[i], owns[i], borrows[i])
+        scope_declare(names[i], resolved[i], owns[i], borrows[i], schemas[i])
         i = i + 1
     end
     stmt.names = names
@@ -1169,45 +1308,71 @@ end
 local function check_assign(stmt)
     local targets = stmt.targets
     local values = stmt.values
-    if #values > #targets then
+    local target_count = #targets
+    if #values > target_count then
         type_fail("E0311", stmt.line, stmt.column,
             "more values than assignment targets are not supported")
     end
     local target_types = {}
     local i = 1
-    while i <= #targets do
-        local target = borrow targets[i]
-        if target.tag ~= "Name" then
+    while i <= target_count do
+        local target = targets[i]
+        if target.tag ~= "Name" and target.tag ~= "Field" then
             type_fail("E0312", target.line, target.column,
-                "only name assignment targets are supported by the C backend")
+                "only name and field assignment targets are supported by the C backend")
         end
-        local entry = value_lookup(target.name)
+        local expected = nil
+        if target.tag == "Name" then
+            local entry = value_lookup(target.name)
+            if entry == nil then
+                if i <= #values then
+                    local _, actual = check_expr(clone values[i])
+                    entry = declare_global(target.name, actual,
+                        target.line, target.column)
+                else
+                    entry = declare_global(target.name, "nil",
+                        target.line, target.column)
+                end
+            end
+            if entry.borrowed and check_unsafe_depth == 0 then
+                type_fail("E0314", target.line, target.column,
+                    "cannot assign through borrowed alias `" .. target.name
+                    .. "` outside an `unsafe` block")
+            end
+            expected = entry.type
+            entry.own = is_heap_type(entry.type)
+        else
+            local checked_table, table_type = check_expr(target.table)
+            local table_schema = checked_table.schema
+            target.table = checked_table
+            if not is_table_type(table_type) then
+                check_mismatch(target.line, target.column,
+                    "field assignment", "table", table_type)
+            end
+            local field = table_schema ~= nil
+                and table_schema[target.field_name] or nil
+            if field == nil then
+                type_fail("E0309", target.line, target.column,
+                    "table has no field `" .. tostring(target.field_name) .. "`")
+            end
+            expected = field.type
+            target.own = false
+        end
+
         local actual = nil
         local checked = nil
         if i <= #values then
             checked, actual = check_expr(values[i])
-        else
-            actual = "nil"
-        end
-
-        if entry == nil then
-            entry = declare_global(target.name, actual, target.line, target.column)
-        end
-        if entry.borrowed and check_unsafe_depth == 0 then
-            type_fail("E0314", target.line, target.column,
-                "cannot assign through borrowed alias `" .. target.name
-                .. "` outside an `unsafe` block")
-        end
-        if checked ~= nil then
-            if not assignable(entry.type, actual, clone checked) then
+            if not assignable(expected, actual, clone checked) then
                 check_mismatch(target.line, target.column,
-                    "assignment to `" .. target.name .. "`", entry.type, actual)
+                    "assignment to `" .. tostring(target.name or target.field_name)
+                    .. "`", expected, actual)
             end
-            checked = coerce_literal(checked, entry.type)
+            checked = coerce_literal(checked, expected)
             values[i] = checked
         end
-        entry.own = is_heap_type(entry.type)
-        target_types[i] = entry.type
+        target_types[i] = expected
+        targets[i] = target
         i = i + 1
     end
     stmt.targets = targets
@@ -1228,12 +1393,27 @@ local function check_function(signature)
     check_unsafe_depth = 0
     check_in_function = true
     check_current_function = signature
+    if signature.receiver ~= nil then
+        local receiver = value_lookup(signature.receiver)
+        if receiver == nil then
+            type_fail("E0318", signature.node.line, signature.node.column,
+                "method receiver `" .. tostring(signature.receiver)
+                .. "` is not declared")
+        end
+        signature.params[1].schema = receiver.schema
+    end
     scope_enter()
     local i = 1
     while i <= #signature.params do
         local param = borrow signature.params[i]
-        scope_declare(param.name, param.type, false, true)
-        signature.node.params[i].type = param.type
+        scope_declare(param.name, param.type, false, true, param.schema)
+        local node_index = i
+        if signature.receiver ~= nil then
+            node_index = i - 1
+        end
+        if node_index >= 1 and node_index <= #signature.node.params then
+            signature.node.params[node_index].type = param.type
+        end
         i = i + 1
     end
     signature.node.body = check_block(signature.node.body, false)
@@ -1255,15 +1435,26 @@ local function scan_functions(body)
             local fname = stmt.name
             local fline = stmt.line
             local fcolumn = stmt.column
+            local receiver = stmt.receiver
+            local key = fname
+            if receiver ~= nil then
+                key = receiver .. ":" .. fname
+            end
             if fname == "print" then
                 type_fail("E0302", fline, fcolumn,
                     "`print` is a builtin function and cannot be redefined")
             end
-            if check_functions[fname] ~= nil then
+            if check_functions[key] ~= nil then
                 type_fail("E0302", fline, fcolumn,
-                    "duplicate definition of function `" .. fname .. "`")
+                    "duplicate definition of function `" .. key .. "`")
             end
             local params = {}
+            if receiver ~= nil then
+                params[#params + 1] = {
+                    name = "self", type = "table",
+                    line = fline, column = fcolumn
+                }
+            end
             local j = 1
             while j <= #stmt.params do
                 local param = borrow stmt.params[j]
@@ -1300,12 +1491,14 @@ local function scan_functions(body)
             end
             local signature = {
                 name = fname,
+                receiver = receiver,
+                key = key,
                 params = params,
                 ret = ret,
                 node = stmt
             }
-            check_functions[fname] = signature
-            check_function_order[#check_function_order + 1] = fname
+            check_functions[key] = signature
+            check_function_order[#check_function_order + 1] = key
         end
         i = i + 1
     end
@@ -1371,6 +1564,64 @@ check_stmt = function(stmt, top_level)
         stmt.cond = checked_cond
         scope_leave()
         check_loop_depth = check_loop_depth - 1
+        return stmt
+    end
+
+    if tag == "ForIn" then
+        local iter = stmt.iter
+        if iter.tag ~= "Call" or iter.callee.tag ~= "Name" then
+            type_fail("E0319", line, column,
+                "generic `for` requires a direct `pairs(table)` or `ipairs(table)` call")
+        end
+        local iter_name = iter.callee.name
+        if iter_name ~= "pairs" and iter_name ~= "ipairs" then
+            type_fail("E0319", line, column,
+                "unsupported iterator `" .. tostring(iter_name)
+                .. "`; use `pairs` or `ipairs`")
+        end
+        if #iter.args ~= 1 then
+            type_fail("E0311", line, column,
+                "`" .. iter_name .. "` takes one table argument")
+        end
+        if #stmt.vars < 1 or #stmt.vars > 2 then
+            type_fail("E0311", line, column,
+                "generic `for` supports one or two loop variables")
+        end
+        local checked_table, table_type = check_expr(iter.args[1])
+        iter.args[1] = checked_table
+        if not is_table_type(table_type) then
+            check_mismatch(line, column, "generic `for` iterator",
+                "table", table_type)
+        end
+        local key_type = "string"
+        local value_type = "value"
+        local iter_kind = iter_name
+        if iter_name == "ipairs" then
+            key_type = "i32"
+            value_type = table_element(table_type) or "value"
+            if table_element(table_type) == nil then
+                value_type = "value"
+            end
+        elseif table_element(table_type) ~= nil then
+            -- Dense arrays behave like ipairs for `pairs` in the native
+            -- subset; keyed records continue to use the hash-map iterator.
+            key_type = "i32"
+            value_type = table_element(table_type)
+            iter_kind = "ipairs"
+        end
+        stmt.iter = iter
+        stmt.iter_kind = iter_kind
+        stmt.key_type = key_type
+        stmt.value_type = value_type
+        scope_enter()
+        scope_declare(stmt.vars[1], key_type, false, false)
+        if #stmt.vars >= 2 then
+            scope_declare(stmt.vars[2], value_type, false, false)
+        end
+        check_loop_depth = check_loop_depth + 1
+        stmt.body = check_block(stmt.body, false)
+        check_loop_depth = check_loop_depth - 1
+        scope_leave()
         return stmt
     end
 
@@ -1460,7 +1711,6 @@ local function check_program(ast)
     scope_enter()
     check_return_type = "i32"
     ast.body = check_block(ast.body, true)
-    scope_leave()
 
     local i = 1
     while i <= #check_function_order do
@@ -1469,6 +1719,7 @@ local function check_program(ast)
         check_function(signature)
         i = i + 1
     end
+    scope_leave()
 
     ast.function_names = check_function_order
     ast.signatures = check_functions
@@ -1563,7 +1814,10 @@ local function c_type(type_name)
     if type_name == "string" then return "LusaString *" end
     if type_name == "nil" then return "void *" end
     if type_name == "void" then return "void" end
-    if table_element(type_name) ~= nil then return "LusaTable *" end
+    if type_name == "table" or table_element(type_name) ~= nil then
+        return "LusaTable *"
+    end
+    if type_name == "value" then return "LusaValue" end
     fail(0, 0, "internal: no C type for `" .. tostring(type_name) .. "`")
 end
 
@@ -1574,8 +1828,11 @@ local function default_c(type_name)
         return "0"
     end
     if type_name == "string" or type_name == "nil"
-        or table_element(type_name) ~= nil then
+        or type_name == "table" or table_element(type_name) ~= nil then
         return "NULL"
+    end
+    if type_name == "value" then
+        return "(LusaValue){LUSA_ELEM_UNKNOWN, 0u}"
     end
     return ""
 end
@@ -1587,7 +1844,10 @@ local function elem_kind(type_name)
     if type_name == "f32" then return "LUSA_ELEM_F32" end
     if type_name == "bool" then return "LUSA_ELEM_BOOL" end
     if type_name == "string" then return "LUSA_ELEM_STRING" end
-    if table_element(type_name) ~= nil then return "LUSA_ELEM_TABLE" end
+    if type_name == "table" or table_element(type_name) ~= nil then
+        return "LUSA_ELEM_TABLE"
+    end
+    if type_name == "value" then return "LUSA_ELEM_UNKNOWN" end
     return "LUSA_ELEM_UNKNOWN"
 end
 
@@ -1656,7 +1916,7 @@ local function emit_drop_entry(entry)
     end
     if entry.type == "string" then
         line("lusa_drop_string(&" .. entry.cname .. ");")
-    elseif table_element(entry.type) ~= nil then
+    elseif entry.type == "table" or table_element(entry.type) ~= nil then
         line("lusa_drop_table(&" .. entry.cname .. ");")
     end
 end
@@ -1815,11 +2075,25 @@ local RUNTIME = {
     "    char *data;",
     "} LusaString;",
     "",
+    "typedef struct LusaValue {",
+    "    uint64_t kind;",
+    "    uint64_t payload;",
+    "} LusaValue;",
+    "",
+    "typedef struct LusaEntry {",
+    "    LusaString *key;",
+    "    uint64_t value;",
+    "    uint64_t kind;",
+    "} LusaEntry;",
+    "",
     "typedef struct LusaTable {",
     "    LusaObj obj;",
     "    uint64_t elem_kind;",
     "    uint64_t capacity;",
     "    uint64_t *items;",
+    "    uint64_t key_count;",
+    "    uint64_t map_capacity;",
+    "    LusaEntry *entries;",
     "} LusaTable;",
     "",
     "#if defined(__SIZEOF_INT128__) && !defined(_MSC_VER)",
@@ -1859,6 +2133,7 @@ local RUNTIME = {
     "",
     "static void lusa_drop_string(LusaString **value);",
     "static void lusa_drop_table(LusaTable **value);",
+    "static void lusa_drop_value(uint64_t kind, uint64_t *payload);",
     "",
     "static LusaString *lusa_string_new(const char *bytes, uint64_t length) {",
     "    LusaString *value = (LusaString *)calloc(1, sizeof(LusaString));",
@@ -1937,11 +2212,139 @@ local RUNTIME = {
     "    table->elem_kind = kind;",
     "    table->capacity = 0u;",
     "    table->items = NULL;",
+    "    table->key_count = 0u;",
+    "    table->map_capacity = 0u;",
+    "    table->entries = NULL;",
     "    if (count != 0u) {",
     "        lusa_table_reserve(table, count);",
     "        memset(table->items, 0, (size_t)count * sizeof(uint64_t));",
     "    }",
     "    return table;",
+    "}",
+    "",
+    "static uint64_t lusa_string_hash(LusaString *key) {",
+    "    uint64_t hash = 1469598103934665603u;",
+    "    uint64_t i;",
+    "    if (key == NULL) return 0u;",
+    "    for (i = 0u; i < key->obj.length; i++) {",
+    "        hash ^= (uint64_t)(unsigned char)key->data[i];",
+    "        hash *= 1099511628211u;",
+    "    }",
+    "    return hash;",
+    "}",
+    "",
+    "static void lusa_table_map_reserve(LusaTable *table, uint64_t extra) {",
+    "    uint64_t capacity;",
+    "    uint64_t i;",
+    "    LusaEntry *old_entries;",
+    "    uint64_t old_capacity;",
+    "    if (table == NULL) return;",
+    "    capacity = table->map_capacity;",
+    "    while (capacity == 0u || (table->key_count + extra) * 4u >= capacity * 3u) {",
+    "        capacity = capacity == 0u ? 8u : capacity * 2u;",
+    "    }",
+    "    if (capacity == table->map_capacity) return;",
+    "    old_entries = table->entries;",
+    "    old_capacity = table->map_capacity;",
+    "    table->entries = (LusaEntry *)calloc((size_t)capacity, sizeof(LusaEntry));",
+    '    if (table->entries == NULL) lusa_panic("out of memory");',
+    "    table->map_capacity = capacity;",
+    "    for (i = 0u; i < old_capacity; i++) {",
+    "        LusaEntry entry = old_entries[i];",
+    "        if (entry.key != NULL) {",
+    "            uint64_t slot = lusa_string_hash(entry.key) & (capacity - 1u);",
+    "            while (table->entries[slot].key != NULL) {",
+    "                slot = (slot + 1u) & (capacity - 1u);",
+    "            }",
+    "            table->entries[slot] = entry;",
+    "        }",
+    "    }",
+    "    free(old_entries);",
+    "}",
+    "",
+    "static LusaEntry *lusa_table_map_slot(LusaTable *table, LusaString *key) {",
+    "    uint64_t mask;",
+    "    uint64_t slot;",
+    "    if (table == NULL || table->map_capacity == 0u || key == NULL) return NULL;",
+    "    mask = table->map_capacity - 1u;",
+    "    slot = lusa_string_hash(key) & mask;",
+    "    while (table->entries[slot].key != NULL) {",
+    "        if (lusa_string_eq(table->entries[slot].key, key)) {",
+    "            return &table->entries[slot];",
+    "        }",
+    "        slot = (slot + 1u) & mask;",
+    "    }",
+    "    return &table->entries[slot];",
+    "}",
+    "",
+    "static void lusa_table_set_string(LusaTable *table, LusaString *key,",
+    "                                  uint64_t value, uint64_t kind) {",
+    "    LusaEntry *slot;",
+    "    lusa_table_map_reserve(table, 1u);",
+    "    slot = lusa_table_map_slot(table, key);",
+    "    if (slot == NULL) return;",
+    "    if (slot->key == NULL) {",
+    "        slot->key = lusa_string_clone(key);",
+    "        table->key_count = table->key_count + 1u;",
+    "    } else {",
+    "        lusa_drop_value(slot->kind, &slot->value);",
+    "    }",
+    "    slot->value = value;",
+    "    slot->kind = kind;",
+    "}",
+    "",
+    "static LusaValue lusa_table_get_value(LusaTable *table, LusaString *key) {",
+    "    LusaValue out = { LUSA_ELEM_UNKNOWN, 0u };",
+    "    LusaEntry *slot = lusa_table_map_slot(table, key);",
+    "    if (slot != NULL && slot->key != NULL) {",
+    "        out.kind = slot->kind;",
+    "        out.payload = slot->value;",
+    "    }",
+    "    return out;",
+    "}",
+    "",
+    "static LusaString *lusa_table_get_string(LusaTable *table, LusaString *key) {",
+    "    LusaValue value = lusa_table_get_value(table, key);",
+    "    return value.kind == LUSA_ELEM_STRING ? (LusaString *)(uintptr_t)value.payload : NULL;",
+    "}",
+    "static int32_t lusa_table_get_i32_key(LusaTable *table, LusaString *key) {",
+    "    LusaValue value = lusa_table_get_value(table, key);",
+    "    return value.kind == LUSA_ELEM_I32 ? (int32_t)(uint32_t)value.payload : 0;",
+    "}",
+    "static uint32_t lusa_table_get_u32_key(LusaTable *table, LusaString *key) {",
+    "    LusaValue value = lusa_table_get_value(table, key);",
+    "    return value.kind == LUSA_ELEM_U32 ? (uint32_t)value.payload : 0u;",
+    "}",
+    "static bool lusa_table_get_bool_key(LusaTable *table, LusaString *key) {",
+    "    LusaValue value = lusa_table_get_value(table, key);",
+    "    return value.kind == LUSA_ELEM_BOOL ? value.payload != 0u : false;",
+    "}",
+    "static float lusa_table_get_f32_key(LusaTable *table, LusaString *key) {",
+    "    LusaValue value = lusa_table_get_value(table, key);",
+    "    uint32_t bits = (uint32_t)value.payload;",
+    "    float out = 0.0f;",
+    "    if (value.kind == LUSA_ELEM_F32) memcpy(&out, &bits, sizeof(out));",
+    "    return out;",
+    "}",
+    "static LusaTable *lusa_table_get_table_key(LusaTable *table, LusaString *key) {",
+    "    LusaValue value = lusa_table_get_value(table, key);",
+    "    return value.kind == LUSA_ELEM_TABLE ? (LusaTable *)(uintptr_t)value.payload : NULL;",
+    "}",
+    "",
+    "static bool lusa_table_next_pair(LusaTable *table, uint64_t *cursor,",
+    "                                 LusaString **key, LusaValue *value) {",
+    "    if (table == NULL) return false;",
+    "    while (*cursor < table->map_capacity) {",
+    "        LusaEntry *entry = &table->entries[*cursor];",
+    "        *cursor = *cursor + 1u;",
+    "        if (entry->key != NULL) {",
+    "            *key = entry->key;",
+    "            value->kind = entry->kind;",
+    "            value->payload = entry->value;",
+    "            return true;",
+    "        }",
+    "    }",
+    "    return false;",
     "}",
     "",
     "static LusaTable *lusa_table_clone(LusaTable *source) {",
@@ -1958,6 +2361,20 @@ local RUNTIME = {
     "            out->items[i] = (uint64_t)(uintptr_t)lusa_table_clone((LusaTable *)(uintptr_t)raw);",
     "        } else {",
     "            out->items[i] = raw;",
+    "        }",
+    "        i = i + 1u;",
+    "    }",
+    "    i = 0u;",
+    "    while (i < source->map_capacity) {",
+    "        LusaEntry *entry = &source->entries[i];",
+    "        if (entry->key != NULL) {",
+    "            uint64_t payload = entry->value;",
+    "            if (entry->kind == LUSA_ELEM_STRING) {",
+    "                payload = (uint64_t)(uintptr_t)lusa_string_clone((LusaString *)(uintptr_t)payload);",
+    "            } else if (entry->kind == LUSA_ELEM_TABLE) {",
+    "                payload = (uint64_t)(uintptr_t)lusa_table_clone((LusaTable *)(uintptr_t)payload);",
+    "            }",
+    "            lusa_table_set_string(out, entry->key, payload, entry->kind);",
     "        }",
     "        i = i + 1u;",
     "    }",
@@ -1991,10 +2408,32 @@ local RUNTIME = {
     "            }",
     "            i = i + 1u;",
     "        }",
+    "        i = 0u;",
+    "        while (i < table->map_capacity) {",
+    "            LusaEntry *entry = &table->entries[i];",
+    "            if (entry->key != NULL) {",
+    "                lusa_drop_string(&entry->key);",
+    "                lusa_drop_value(entry->kind, &entry->value);",
+    "            }",
+    "            i = i + 1u;",
+    "        }",
+    "        free(table->entries);",
     "        free(table->items);",
     "        free(table);",
     "    }",
     "    *value = NULL;",
+    "}",
+    "",
+    "static void lusa_drop_value(uint64_t kind, uint64_t *payload) {",
+    "    if (payload == NULL) return;",
+    "    if (kind == LUSA_ELEM_STRING) {",
+    "        LusaString *child = (LusaString *)(uintptr_t)*payload;",
+    "        lusa_drop_string(&child);",
+    "    } else if (kind == LUSA_ELEM_TABLE) {",
+    "        LusaTable *child = (LusaTable *)(uintptr_t)*payload;",
+    "        lusa_drop_table(&child);",
+    "    }",
+    "    *payload = 0u;",
     "}",
     "",
     "static uint64_t lusa_index(uint64_t length, int64_t index) {",
@@ -2002,31 +2441,41 @@ local RUNTIME = {
     "    return (uint64_t)index - 1u;",
     "}",
     "",
-    "static int32_t lusa_table_get_i32(LusaTable *table, int64_t index) {",
+    "static int32_t lusa_table_get_i32_at(LusaTable *table, int64_t index) {",
     "    return (int32_t)(uint32_t)table->items[lusa_index(table->obj.length, index)];",
     "}",
-    "static uint32_t lusa_table_get_u32(LusaTable *table, int64_t index) {",
+    "static uint32_t lusa_table_get_u32_at(LusaTable *table, int64_t index) {",
     "    return (uint32_t)table->items[lusa_index(table->obj.length, index)];",
     "}",
-    "static bool lusa_table_get_bool(LusaTable *table, int64_t index) {",
+    "static bool lusa_table_get_bool_at(LusaTable *table, int64_t index) {",
     "    return table->items[lusa_index(table->obj.length, index)] != 0u;",
     "}",
-    "static LusaString *lusa_table_get_string(LusaTable *table, int64_t index) {",
+    "static LusaString *lusa_table_get_string_at(LusaTable *table, int64_t index) {",
     "    return (LusaString *)(uintptr_t)table->items[lusa_index(table->obj.length, index)];",
     "}",
-    "static LusaTable *lusa_table_get_table(LusaTable *table, int64_t index) {",
+    "static LusaTable *lusa_table_get_table_at(LusaTable *table, int64_t index) {",
     "    return (LusaTable *)(uintptr_t)table->items[lusa_index(table->obj.length, index)];",
     "}",
-    "static float lusa_table_get_f32(LusaTable *table, int64_t index) {",
+    "static float lusa_table_get_f32_at(LusaTable *table, int64_t index) {",
     "    uint32_t bits = (uint32_t)table->items[lusa_index(table->obj.length, index)];",
     "    float value = 0.0f;",
     "    memcpy(&value, &bits, sizeof(value));",
     "    return value;",
     "}",
+    "static LusaValue lusa_table_get_value_at(LusaTable *table, int64_t index) {",
+    "    LusaValue out = { table == NULL ? LUSA_ELEM_UNKNOWN : table->elem_kind, 0u };",
+    "    if (table != NULL) out.payload = table->items[lusa_index(table->obj.length, index)];",
+    "    return out;",
+    "}",
     "static void lusa_table_set_f32(LusaTable *table, uint64_t position, float value) {",
     "    uint32_t bits = 0;",
     "    memcpy(&bits, &value, sizeof(bits));",
     "    table->items[position] = (uint64_t)bits;",
+    "}",
+    "static uint64_t lusa_f32_payload(float value) {",
+    "    uint32_t bits = 0;",
+    "    memcpy(&bits, &value, sizeof(bits));",
+    "    return (uint64_t)bits;",
     "}",
     "",
     'static void lusa_print_nil(void) { fputs("nil", stdout); }',
@@ -2040,7 +2489,24 @@ local RUNTIME = {
     "}",
     "static void lusa_print_table(LusaTable *value) {",
     '    if (value == NULL) { fputs("nil", stdout); return; }',
-    '    printf("<table:%" PRIu64 ">", value->obj.length);',
+    '    printf("<table:%" PRIu64 ">", value->obj.length + value->key_count);',
+    "}",
+    "static void lusa_print_value(LusaValue value) {",
+    "    switch (value.kind) {",
+    "        case LUSA_ELEM_I32: lusa_print_i32((int32_t)(uint32_t)value.payload); break;",
+    "        case LUSA_ELEM_U32: lusa_print_u32((uint32_t)value.payload); break;",
+    "        case LUSA_ELEM_F32: {",
+    "            uint32_t bits = (uint32_t)value.payload;",
+    "            float number = 0.0f;",
+    "            memcpy(&number, &bits, sizeof(number));",
+    "            lusa_print_f32(number);",
+    "            break;",
+    "        }",
+    "        case LUSA_ELEM_BOOL: lusa_print_bool(value.payload != 0u); break;",
+    "        case LUSA_ELEM_STRING: lusa_print_string((LusaString *)(uintptr_t)value.payload); break;",
+    "        case LUSA_ELEM_TABLE: lusa_print_table((LusaTable *)(uintptr_t)value.payload); break;",
+    '        default: fputs("nil", stdout); break;',
+    "    }",
     "}",
     "static void lusa_print_i128(lusa_i128 value) {",
     "#if LUSA_HAS_INT128",
@@ -2175,9 +2641,26 @@ collect_strings_expr = function(expr)
         end
         return
     end
+    if tag == "Field" then
+        add_string(expr.field_name)
+        collect_strings_expr(expr.table)
+        return
+    end
+    if tag == "MethodCall" then
+        collect_strings_expr(expr.obj)
+        local i = 1
+        while i <= #expr.args do
+            collect_strings_expr(expr.args[i])
+            i = i + 1
+        end
+        return
+    end
     if tag == "Table" then
         local i = 1
         while i <= #expr.items do
+            if expr.keys ~= nil and expr.keys[i] ~= nil then
+                add_string(expr.keys[i])
+            end
             collect_strings_expr(expr.items[i])
             i = i + 1
         end
@@ -2202,6 +2685,15 @@ collect_strings_block = function(body)
             end
         elseif tag == "Assign" then
             local j = 1
+            while j <= #stmt.targets do
+                local target = stmt.targets[j]
+                if target.tag == "Field" then
+                    add_string(target.field_name)
+                    collect_strings_expr(target.table)
+                end
+                j = j + 1
+            end
+            j = 1
             while j <= #stmt.values do
                 collect_strings_expr(stmt.values[j])
                 j = j + 1
@@ -2219,6 +2711,9 @@ collect_strings_block = function(body)
             if stmt.else_body ~= nil then
                 collect_strings_block(stmt.else_body)
             end
+        elseif tag == "ForIn" then
+            collect_strings_expr(stmt.iter.args[1])
+            collect_strings_block(stmt.body)
         elseif tag == "While" then
             collect_strings_expr(stmt.cond)
             collect_strings_block(stmt.body)
@@ -2294,6 +2789,32 @@ local function format_float(value)
 end
 
 local emit_expr
+
+local function emit_value_payload(expr, value)
+    local type_name = expr.ctype
+    if type_name == "f32" then
+        return "lusa_f32_payload(" .. value .. ")", "LUSA_ELEM_F32"
+    end
+    if type_name == "string" then
+        return "(uint64_t)(uintptr_t)(" .. value .. ")", "LUSA_ELEM_STRING"
+    end
+    if type_name == "table" or table_element(type_name) ~= nil then
+        return "(uint64_t)(uintptr_t)(" .. value .. ")", "LUSA_ELEM_TABLE"
+    end
+    if type_name == "u32" then
+        return "(uint64_t)(" .. value .. ")", "LUSA_ELEM_U32"
+    end
+    if type_name == "bool" then
+        return "(uint64_t)((" .. value .. ") ? 1u : 0u)", "LUSA_ELEM_BOOL"
+    end
+    if type_name == "i32" then
+        return "(uint64_t)(" .. value .. ")", "LUSA_ELEM_I32"
+    end
+    if type_name == "value" then
+        return "((" .. value .. ").payload)", "((" .. value .. ").kind)"
+    end
+    return "0u", "LUSA_ELEM_UNKNOWN"
+end
 
 local function emit_number(expr)
     local exact_int = expr.int
@@ -2498,50 +3019,144 @@ emit_expr = function(expr)
         return emit_expr(expr.value)
     end
     if tag == "Table" then
-        local count = #expr.items
+        local array_count = 0
+        local i = 1
+        while i <= #expr.items do
+            if expr.keys == nil or expr.keys[i] == nil then
+                array_count = array_count + 1
+            end
+            i = i + 1
+        end
         local kind = elem_kind(expr.elem_type or "nil")
         local table_name = fresh("table")
         line("LusaTable *" .. table_name .. " = lusa_table_new("
-            .. tostring(count) .. "u, " .. kind .. ");")
-        local i = 1
+            .. tostring(array_count) .. "u, " .. kind .. ");")
+        local position = 0
+        i = 1
         while i <= #expr.items do
             local item = expr.items[i]
             local item_type = item.ctype
             local value = emit_expr(clone item)
-            local position = tostring(i - 1)
-            if item_type == "f32" then
-                line("lusa_table_set_f32(" .. table_name .. ", " .. position
-                    .. ", " .. value .. ");")
-            elseif is_heap_type(item_type) then
-                line(table_name .. "->items[" .. position
-                    .. "] = (uint64_t)(uintptr_t)(" .. value .. ");")
+            local key = expr.keys ~= nil and expr.keys[i] or nil
+            if key ~= nil then
+                local string_id = emit_string_ids[key]
+                if string_id == nil then
+                    fail(item.line, item.column,
+                        "internal: table key was not collected")
+                end
+                local payload, value_kind = emit_value_payload(
+                    { ctype = item_type }, value)
+                line("lusa_table_set_string(" .. table_name
+                    .. ", &lusa_str_" .. tostring(string_id) .. ", "
+                    .. payload .. ", " .. value_kind .. ");")
             else
-                line(table_name .. "->items[" .. position
-                    .. "] = (uint64_t)(" .. value .. ");")
+                local pos_text = tostring(position)
+                if item_type == "f32" then
+                    line("lusa_table_set_f32(" .. table_name .. ", "
+                        .. pos_text .. ", " .. value .. ");")
+                elseif is_heap_type(item_type) then
+                    line(table_name .. "->items[" .. pos_text
+                        .. "] = (uint64_t)(uintptr_t)(" .. value .. ");")
+                else
+                    line(table_name .. "->items[" .. pos_text
+                        .. "] = (uint64_t)(" .. value .. ");")
+                end
+                position = position + 1
             end
             null_moved_source(item, nil)
             i = i + 1
         end
         return table_name
     end
+    if tag == "Field" then
+        local table_value = emit_expr(expr.table)
+        local string_id = emit_string_ids[expr.field_name]
+        if string_id == nil then
+            fail(expr.line, expr.column,
+                "internal: field key was not collected")
+        end
+        local key = "&lusa_str_" .. tostring(string_id)
+        local field_type = expr.ctype
+        if field_type == "string" then
+            return "lusa_table_get_string(" .. table_value .. ", " .. key .. ")"
+        elseif field_type == "i32" then
+            return "lusa_table_get_i32_key(" .. table_value .. ", " .. key .. ")"
+        elseif field_type == "u32" then
+            return "lusa_table_get_u32_key(" .. table_value .. ", " .. key .. ")"
+        elseif field_type == "f32" then
+            return "lusa_table_get_f32_key(" .. table_value .. ", " .. key .. ")"
+        elseif field_type == "bool" then
+            return "lusa_table_get_bool_key(" .. table_value .. ", " .. key .. ")"
+        elseif field_type == "table" or table_element(field_type) ~= nil then
+            return "lusa_table_get_table_key(" .. table_value .. ", " .. key .. ")"
+        elseif field_type == "value" then
+            return "lusa_table_get_value(" .. table_value .. ", " .. key .. ")"
+        end
+        fail(expr.line, expr.column,
+            "internal: unsupported field type `" .. tostring(field_type) .. "`")
+    end
+    if tag == "MethodCall" then
+        local cname = emit_function_cnames[expr.fn_key]
+        if cname == nil then
+            fail(expr.line, expr.column, "internal: method has no function name")
+        end
+        local args = { emit_expr(expr.obj) }
+        local i = 1
+        while i <= #expr.args do
+            args[#args + 1] = emit_expr(expr.args[i])
+            i = i + 1
+        end
+        return cname .. "(" .. table.concat(args, ", ") .. ")"
+    end
     if tag == "Index" then
         local table_type = expr.table.ctype
         local table_value = emit_expr(expr.table)
         local index_value = emit_expr(expr.index)
+        if expr.field_name ~= nil then
+            local string_id = emit_string_ids[expr.field_name]
+            if string_id == nil then
+                fail(expr.line, expr.column,
+                    "internal: field key was not collected")
+            end
+            local key = "&lusa_str_" .. tostring(string_id)
+            local field_type = expr.ctype
+            if field_type == "string" then
+                return "lusa_table_get_string(" .. table_value .. ", " .. key .. ")"
+            elseif field_type == "i32" then
+                return "lusa_table_get_i32_key(" .. table_value .. ", " .. key .. ")"
+            elseif field_type == "u32" then
+                return "lusa_table_get_u32_key(" .. table_value .. ", " .. key .. ")"
+            elseif field_type == "f32" then
+                return "lusa_table_get_f32_key(" .. table_value .. ", " .. key .. ")"
+            elseif field_type == "bool" then
+                return "lusa_table_get_bool_key(" .. table_value .. ", " .. key .. ")"
+            elseif field_type == "table" or table_element(field_type) ~= nil then
+                return "lusa_table_get_table_key(" .. table_value .. ", " .. key .. ")"
+            elseif field_type == "value" then
+                return "lusa_table_get_value(" .. table_value .. ", " .. key .. ")"
+            else
+                fail(expr.line, expr.column,
+                    "internal: unsupported indexed field type `"
+                    .. tostring(field_type) .. "`")
+            end
+        end
+        if expr.dynamic_key then
+            return "lusa_table_get_value(" .. table_value .. ", " .. index_value .. ")"
+        end
         local element = expr.elem_type or table_element(table_type)
         local call
         if element == "i32" then
-            call = "lusa_table_get_i32"
+            call = "lusa_table_get_i32_at"
         elseif element == "u32" then
-            call = "lusa_table_get_u32"
+            call = "lusa_table_get_u32_at"
         elseif element == "f32" then
-            call = "lusa_table_get_f32"
+            call = "lusa_table_get_f32_at"
         elseif element == "bool" then
-            call = "lusa_table_get_bool"
+            call = "lusa_table_get_bool_at"
         elseif element == "string" then
-            call = "lusa_table_get_string"
-        elseif table_element(element) ~= nil then
-            call = "lusa_table_get_table"
+            call = "lusa_table_get_string_at"
+        elseif element == "table" or table_element(element) ~= nil then
+            call = "lusa_table_get_table_at"
         else
             fail(expr.line, expr.column,
                 "internal: unsupported table element type `" .. tostring(element) .. "`")
@@ -2581,8 +3196,10 @@ local function emit_print_call(call)
             line("lusa_print_f32(" .. value .. ");")
         elseif type_name == "bool" then
             line("lusa_print_bool(" .. value .. ");")
-        elseif table_element(type_name) ~= nil then
+        elseif type_name == "table" or table_element(type_name) ~= nil then
             line("lusa_print_table(" .. value .. ");")
+        elseif type_name == "value" then
+            line("lusa_print_value(" .. value .. ");")
         elseif type_name == "nil" then
             line("lusa_print_nil();")
         else
@@ -2649,15 +3266,17 @@ local function emit_assign(stmt)
 
     i = 1
     while i <= #targets do
-        local entry = emit_value_lookup(targets[i].name)
-        if entry == nil then
-            fail(targets[i].line, targets[i].column,
-                "internal: assignment target `" .. targets[i].name
-                .. "` was not declared")
+        if targets[i].tag == "Name" then
+            local entry = emit_value_lookup(targets[i].name)
+            if entry == nil then
+                fail(targets[i].line, targets[i].column,
+                    "internal: assignment target `" .. targets[i].name
+                    .. "` was not declared")
+            end
+            local cname = entry.cname
+            entries[i] = entry
+            targets_seen[cname] = true
         end
-        local cname = entry.cname
-        entries[i] = entry
-        targets_seen[cname] = true
         i = i + 1
     end
 
@@ -2676,23 +3295,45 @@ local function emit_assign(stmt)
         i = i + 1
     end
 
-    -- Drop the old owned value unless that same slot was moved into the
-    -- right-hand side first (for example `x = {x}`).
     i = 1
     while i <= #targets do
-        local entry = clone entries[i]
-        if moved_seen[entry.cname] ~= true then
-            if entry.own and not entry.moved then
-                emit_drop_entry(entry)
+        local target = targets[i]
+        if target.tag == "Name" then
+            local entry = clone entries[i]
+            if moved_seen[entry.cname] ~= true then
+                if entry.own and not entry.moved then
+                    emit_drop_entry(entry)
+                end
+            end
+            line(entry.cname .. " = " .. temporaries[i] .. ";")
+        else
+            local table_value = emit_expr(target.table)
+            local string_id = emit_string_ids[target.field_name]
+            if string_id == nil then
+                fail(target.line, target.column,
+                    "internal: field key was not collected")
+            end
+            local value_expr = temporaries[i]
+            if is_heap_type(target_types[i])
+                and values[i] ~= nil
+                and values[i].own == false
+                and values[i].tag ~= "String" then
+                if target_types[i] == "string" then
+                    value_expr = "lusa_string_clone(" .. value_expr .. ")"
+                elseif target_types[i] == "table"
+                    or table_element(target_types[i]) ~= nil then
+                    value_expr = "lusa_table_clone(" .. value_expr .. ")"
+                end
+            end
+            local payload, value_kind = emit_value_payload(
+                { ctype = target_types[i] }, value_expr)
+            line("lusa_table_set_string(" .. table_value
+                .. ", &lusa_str_" .. tostring(string_id) .. ", "
+                .. payload .. ", " .. value_kind .. ");")
+            if i <= #values then
+                null_moved_source(values[i], nil)
             end
         end
-        i = i + 1
-    end
-
-    i = 1
-    while i <= #targets do
-        local entry = clone entries[i]
-        line(entry.cname .. " = " .. temporaries[i] .. ";")
         i = i + 1
     end
 
@@ -2707,12 +3348,74 @@ local function emit_assign(stmt)
                 line(source.cname .. " = NULL;")
                 source.moved = true
             end
-        else
-            -- Table literals already cleared their direct name elements when
-            -- they were constructed.
         end
         i = i + 1
     end
+end
+
+local function table_getter_for_type(type_name)
+    if type_name == "i32" then return "lusa_table_get_i32_at" end
+    if type_name == "u32" then return "lusa_table_get_u32_at" end
+    if type_name == "f32" then return "lusa_table_get_f32_at" end
+    if type_name == "bool" then return "lusa_table_get_bool_at" end
+    if type_name == "string" then return "lusa_table_get_string_at" end
+    if type_name == "table" or table_element(type_name) ~= nil then
+        return "lusa_table_get_table_at"
+    end
+    return "lusa_table_get_value_at"
+end
+
+local function emit_for_in(stmt)
+    local iter_table = fresh("iter")
+    line("LusaTable *" .. iter_table .. " = "
+        .. emit_expr(clone stmt.iter.args[1]) .. ";")
+    local loop_scope = emit_scope_count
+    emit_loop_stack[#emit_loop_stack + 1] = loop_scope
+    if stmt.iter_kind == "ipairs" then
+        local index = fresh("i")
+        line("for (int64_t " .. index .. " = 1; " .. index
+            .. " <= (int64_t)(" .. iter_table .. "->obj.length); "
+            .. index .. "++) {")
+        emit_indent = emit_indent + 1
+        emit_scope_enter()
+        local key_entry = emit_scope_declare(stmt.vars[1], stmt.key_type,
+            false, false)
+        line(c_type(stmt.key_type) .. " " .. key_entry.cname
+            .. " = (int32_t)(" .. index .. ");")
+        if #stmt.vars >= 2 then
+            local value_entry = emit_scope_declare(stmt.vars[2],
+                stmt.value_type, false, false)
+            line(c_type(stmt.value_type) .. " " .. value_entry.cname .. " = "
+                .. table_getter_for_type(stmt.value_type) .. "("
+                .. iter_table .. ", " .. index .. ");")
+        end
+        emit_block_statements(stmt.body)
+        emit_leave_scope()
+        emit_indent = emit_indent - 1
+        line("}")
+    else
+        local cursor = fresh("cursor")
+        local key_value = fresh("key")
+        local item_value = fresh("value")
+        line("uint64_t " .. cursor .. " = 0u;")
+        line("LusaString *" .. key_value .. " = NULL;")
+        line("LusaValue " .. item_value .. " = {LUSA_ELEM_UNKNOWN, 0u};")
+        line("while (lusa_table_next_pair(" .. iter_table .. ", &" .. cursor
+            .. ", &" .. key_value .. ", &" .. item_value .. ")) {")
+        emit_indent = emit_indent + 1
+        emit_scope_enter()
+        local key_entry = emit_scope_declare(stmt.vars[1], "string", false, false)
+        line("LusaString *" .. key_entry.cname .. " = " .. key_value .. ";")
+        if #stmt.vars >= 2 then
+            local value_entry = emit_scope_declare(stmt.vars[2], "value", false, false)
+            line("LusaValue " .. value_entry.cname .. " = " .. item_value .. ";")
+        end
+        emit_block_statements(stmt.body)
+        emit_leave_scope()
+        emit_indent = emit_indent - 1
+        line("}")
+    end
+    emit_loop_stack[#emit_loop_stack] = nil
 end
 
 local function emit_if(stmt)
@@ -2867,6 +3570,10 @@ emit_stmt = function(stmt)
     end
     if tag == "Repeat" then
         emit_repeat(stmt)
+        return
+    end
+    if tag == "ForIn" then
+        emit_for_in(stmt)
         return
     end
     if tag == "Do" then
@@ -3108,7 +3815,10 @@ function Compiler.memory_layout()
             payload = "the C struct begins at +0"
         },
         string = "LusaString { LusaObj obj; char *data; } with UTF-8 + NUL data",
-        table = "LusaTable { LusaObj obj; elem_kind; capacity; uint64_t *items; } with 1-based access",
+        table = "LusaTable { LusaObj obj; elem_kind; capacity; items; key_count; map_capacity; LusaEntry *entries; } with 1-based array access and string-keyed open addressing",
+        keyed_table = "LusaEntry { LusaString *key; uint64_t value; uint64_t kind; } with linear probing and FNV-1a hashing",
+        methods = "colon methods lower to static C functions; `self` is a non-owning LusaTable pointer",
+        iterators = "ipairs walks the 1-based array part; pairs walks the keyed hash entries",
         table_kinds = {
             unknown = 0, i32 = 1, u32 = 2, i128 = 3,
             f32 = 4, bool = 5, string = 6, table = 7

@@ -61,7 +61,7 @@ fn functions_tables_and_raii_are_emitted() {
     assert_has(&c, "static LusaTable * f");
     assert_has(&c, "LusaTable *table");
     assert_has(&c, "lusa_table_new(");
-    assert_has(&c, "lusa_table_get_i32(");
+    assert_has(&c, "lusa_table_get_i32_at(");
     assert_has(&c, "lusa_string_clone(");
     assert_has(&c, "lusa_drop_string(&");
     assert_has(&c, "lusa_drop_table(&");

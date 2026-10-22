@@ -205,6 +205,9 @@ The intermediate C file contains:
 - `uint32_t`, `int32_t`, `lusa_i128`, and `float` numeric mappings;
 - exact integer literals lowered through `lusa_i128_parse("...")` so digits
   above 2^53 are not rounded by f64;
+- heterogeneous string-keyed tables backed by a native open-addressing map;
+- colon methods compiled to static functions with a non-owning `self` receiver;
+- `pairs`/`ipairs` generic loops with a fresh RAII scope per iteration;
 - `unsafe do ... end` lowered to `*(volatile uint32_t *)(uintptr_t)address`
   reads/writes for registers and memory-mapped hardware.
 

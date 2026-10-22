@@ -41,17 +41,17 @@ before optimizing so a caller can retain its own copy.
 ### Supported statements and expressions
 
 Statements: `local` (with optional `: type`), assignment, call statements,
-`if`/`elseif`/`else`, `while`, `repeat`, `do`, `unsafe do`, `function`,
-`return`, and `break`.
+`if`/`elseif`/`else`, `while`, `repeat`, generic `for ... in ... do`,
+`do`, `unsafe do`, `function` (including colon methods), `return`, and `break`.
 
 Expressions: `nil`, booleans, decimal and hexadecimal numbers, strings,
-names, calls, parentheses, unary `-`/`not`/`#`, arithmetic/concatenation/
-comparison operators, `and`/`or`, `clone`, `borrow`, array table constructors,
-and one-based index reads (`t[1]`, nested `t[1][2]`).
+names, calls, colon method calls, field reads (`t.name`), parentheses, unary
+`-`/`not`/`#`, arithmetic/concatenation/comparison operators, `and`/`or`,
+`clone`, `borrow`, array/keyed table constructors, and one-based index reads.
 
-The reference parser intentionally rejects keyed constructors (`{k = v}`),
-field/method access, assignment through a field/index, numeric/generic `for`,
-and varargs.
+The reference parser intentionally rejects numeric `for`, dynamic key
+constructors (`{[expr] = value}` except string literals), assignment through a
+dynamic index, and varargs.
 
 ### AST schema
 
@@ -61,12 +61,13 @@ Every node carries `tag`, `line`, and `column`.
 |------|--------|
 | `Program` | `body = { stmt... }` |
 | `Local` | `names`, `types`, `values` |
-| `Assign` | `targets = { Name... }`, `values` |
-| `Function` | `name`, `params = { {name,type}... }`, `return_type`, `body` |
-| `CallStmt` | `value = Call` |
+| `Assign` | `targets = { Name | Field... }`, `values` |
+| `Function` | `name`, `receiver` (method table, or nil), `params = { {name,type}... }`, `return_type`, `body` |
+| `CallStmt` | `value = Call | MethodCall` |
 | `If` | `branches = { {cond, body}... }`, `else_body` |
 | `While` | `cond`, `body` |
 | `Repeat` | `body`, `cond` |
+| `ForIn` | `vars`, `iter = pairs(table) | ipairs(table)`, `body` |
 | `Do` | `body` |
 | `Unsafe` | `body` (raw-pointer block) |
 | `Return` | `values` |
@@ -77,7 +78,9 @@ Every node carries `tag`, `line`, and `column`.
 | `Unary` | `op`, `value` |
 | `Binary` / `Logical` | `op`, `lhs`, `rhs` |
 | `Call` | `callee`, `args` |
-| `Table` | `items` (array entries only) |
+| `MethodCall` | `obj`, `name`, `args` |
+| `Field` | `table`, `field_name` |
+| `Table` | `items`, `keys` (`string | nil` per entry) |
 | `Index` | `table`, `index` |
 | `Clone` / `Borrow` | `value` |
 
@@ -224,16 +227,33 @@ typedef struct LusaObj {
 } LusaObj;
 
 typedef struct LusaString { LusaObj obj; char *data; } LusaString;
+typedef struct LusaValue { uint64_t kind; uint64_t payload; } LusaValue;
+typedef struct LusaEntry {
+    LusaString *key;
+    uint64_t value;
+    uint64_t kind;
+} LusaEntry;
 typedef struct LusaTable {
     LusaObj obj;
     uint64_t elem_kind;
     uint64_t capacity;
     uint64_t *items;
+    uint64_t key_count;
+    uint64_t map_capacity;
+    LusaEntry *entries;
 } LusaTable;
 ```
 
 - Allocation uses `malloc`/`calloc`/`realloc`; release uses `free`.
-- Table access is one-based in Lusa and lowered to zero-based C indices.
+- The array part is one-based in Lusa and lowered to zero-based C indices.
+- The keyed part uses FNV-1a hashing with linear probing; string keys are
+  cloned into the table and released during deep drop.
+- `lusa_table_set_string`, `lusa_table_get_string`, and typed keyed getters
+  implement field access. `LusaValue` carries heterogeneous `pairs` values.
+- Colon methods compile to static C functions whose first parameter is a
+  non-owning `LusaTable *self`; field writes mutate the receiver in place.
+- `ipairs` walks the array part; `pairs` walks the keyed map. Each iteration
+  enters a fresh RAII scope, so temporary heap values are dropped per loop.
 - `lusa_drop_string`/`lusa_drop_table` check the owned flag and recursively
   release string/table elements before `free`.
 - Owned locals/globals are dropped in reverse declaration order at every
@@ -293,21 +313,25 @@ necessary.
 compiler on the shared parser. `tests/lexer_self_hosted.rs` validates token
 locations, exact integer fields, and literals. `tests/module9.rs` checks typed
 annotations and unsafe simulation on both dynamic engines, plus exact integer
-AST tokens.
+AST tokens. `tests/module10.rs` covers native keyed tables, nested field
+writes, colon methods, `pairs`, `ipairs`, and per-iteration RAII.
 
 ### Current limits
 
 The C emitter supports the typed subset above, not the full dynamic language:
-keyed constructors, field/method access, assignment through an index/field,
-heterogeneous tables, numeric/generic `for`, varargs, interpolated strings, and
-closures/nested functions are rejected with diagnostics. The dynamic
-interpreter and bytecode VM remain the complete-language engines; they accept
-typed/`unsafe` source but use f64 arithmetic and simulated memory, so exact
-128-bit arithmetic is a C11-backend feature.
+numeric `for`, dynamic key construction in table literals, assignment through a
+dynamic index, varargs, interpolated strings, and closures/nested functions are
+rejected with diagnostics. Native colon methods are static functions rather
+than table fields, so `pairs` does not enumerate method names; use a separate
+data table when enumerating. The dynamic interpreter and bytecode VM remain the
+complete-language engines; they accept typed/`unsafe` source but use f64
+arithmetic and simulated memory, so exact 128-bit arithmetic is a C11-backend
+feature.
 
 ## Extension points
 
-The next steps are keyed/hash tables, field/index assignment, heap-table
-mutation, closures/upvalues, numeric and generic `for`, and varargs in the C
-emitter. The runtime already has deep clone/drop and volatile raw-memory
-support; those features mainly need AST schema and lowering extensions.
+The next steps are dynamic key construction, assignment through dynamic
+indices, closures/upvalues, numeric `for`, varargs, and interpolated strings in
+the C emitter. The runtime already has keyed tables, deep clone/drop, methods,
+generic iterators, and volatile raw-memory support; those features mainly need
+AST and lowering extensions.
