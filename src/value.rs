@@ -306,15 +306,19 @@ impl Value {
                 Value::Table(Rc::new(obj))
             }
             Value::Alias(a) => {
-                let (tag, by, span, base) = with_reg(|r| {
+                // Clone the base first: recursive deep_clone calls take the
+                // ownership registry mutably, so doing that inside with_reg
+                // would re-enter the RefCell and panic.
+                let base = a.base.deep_clone();
+                let (tag, by, span) = with_reg(|r| {
                     let tag = r.next_tag();
-                    if let Some(vid) = a.base.vid() {
+                    if let Some(vid) = base.vid() {
                         r.add_borrower(
                             vid,
                             Borrower { tag, by: a.by.clone(), span: a.span, kind: AliasKind::Imm },
                         );
                     }
-                    (tag, a.by.clone(), a.span, a.base.deep_clone())
+                    (tag, a.by.clone(), a.span)
                 });
                 Value::Alias(Box::new(AliasBox { base, tag, kind: AliasKind::Imm, by, span }))
             }

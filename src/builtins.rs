@@ -103,6 +103,140 @@ fn b_io_read_file(_i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<
     Ok(vec![Value::Str(Arc::from(contents.as_str()))])
 }
 
+/// `io_write_binary(path, bytes)`: writes a dense byte table (or a string) to
+/// a file.  This is the output side of the self-hosted native bootstrap.
+fn b_io_write_binary(_i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    let path = match args.first().map(Value::base_value) {
+        Some(Value::Str(s)) => s,
+        Some(other) => {
+            return Err(LusaError::new(
+                E_INDEX,
+                Some(span),
+                format!(
+                    "io_write_binary: expected a string path, got {} ({})",
+                    other.type_name(),
+                    other.fmt_value()
+                ),
+            ))
+        }
+        None => {
+            return Err(LusaError::new(
+                E_INDEX,
+                Some(span),
+                "io_write_binary: missing argument `path`",
+            ))
+        }
+    };
+
+    let bytes: Vec<u8> = match args.get(1).map(Value::base_value) {
+        Some(Value::Str(s)) => s.as_bytes().to_vec(),
+        Some(Value::Table(t)) => {
+            let len = t.len();
+            let mut out = Vec::with_capacity(len);
+            for i in 1..=len {
+                let key = Value::Number(i as f64);
+                let value = t.get(&key).ok_or_else(|| {
+                    LusaError::new(
+                        E_INDEX,
+                        Some(span),
+                        format!("io_write_binary: missing byte at index {}", i),
+                    )
+                })?;
+                let n = match value {
+                    Value::Number(n) => n,
+                    other => {
+                        return Err(LusaError::new(
+                            E_INDEX,
+                            Some(span),
+                            format!(
+                                "io_write_binary: byte {} must be a number, got {} ({})",
+                                i,
+                                other.type_name(),
+                                other.fmt_value()
+                            ),
+                        ))
+                    }
+                };
+                if !n.is_finite() || n.fract() != 0.0 || !(0.0..=255.0).contains(&n) {
+                    return Err(LusaError::new(
+                        E_INDEX,
+                        Some(span),
+                        format!("io_write_binary: byte {} is out of range: {}", i, n),
+                    ));
+                }
+                out.push(n as u8);
+            }
+            out
+        }
+        Some(other) => {
+            return Err(LusaError::new(
+                E_INDEX,
+                Some(span),
+                format!(
+                    "io_write_binary: expected a byte table or string, got {} ({})",
+                    other.type_name(),
+                    other.fmt_value()
+                ),
+            ))
+        }
+        None => {
+            return Err(LusaError::new(
+                E_INDEX,
+                Some(span),
+                "io_write_binary: missing argument `bytes`",
+            ))
+        }
+    };
+
+    std::fs::write(path.as_ref(), &bytes).map_err(|e| {
+        LusaError::new(
+            E_IO,
+            Some(span),
+            format!("io_write_binary: cannot write `{}`: {}", path, e),
+        )
+    })?;
+    Ok(vec![Value::Bool(true)])
+}
+
+/// `io_read_binary(path)`: reads raw bytes into a dense 1-based table.
+fn b_io_read_binary(_i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    let path = match args.first().map(Value::base_value) {
+        Some(Value::Str(s)) => s,
+        Some(other) => {
+            return Err(LusaError::new(
+                E_INDEX,
+                Some(span),
+                format!(
+                    "io_read_binary: expected a string path, got {} ({})",
+                    other.type_name(),
+                    other.fmt_value()
+                ),
+            ))
+        }
+        None => {
+            return Err(LusaError::new(
+                E_INDEX,
+                Some(span),
+                "io_read_binary: missing argument `path`",
+            ))
+        }
+    };
+    let raw = std::fs::read(path.as_ref()).map_err(|e| {
+        LusaError::new(
+            E_IO,
+            Some(span),
+            format!("io_read_binary: cannot read `{}`: {}", path, e),
+        )
+    })?;
+    let table = Rc::new(TableObj::new());
+    for (i, b) in raw.into_iter().enumerate() {
+        table
+            .set(Value::Number((i + 1) as f64), Value::Number(b as f64))
+            .map_err(|e| LusaError::new(e.code, Some(span), e.msg))?;
+    }
+    Ok(vec![Value::Table(table)])
+}
+
 fn b_type(_i: &mut Interp, args: Vec<Value>, _span: Span) -> LResult<Vec<Value>> {
     let t = args.first().map(|v| v.type_name().to_string()).unwrap_or("no value".into());
     one(Value::Str(Arc::from(t.as_str())))
@@ -341,6 +475,8 @@ pub fn all() -> Vec<(&'static str, BF)> {
         ("pairs", Box::new(b_pairs)),
         ("ipairs", Box::new(b_ipairs)),
         ("io_read_file", Box::new(b_io_read_file)),
+        ("io_write_binary", Box::new(b_io_write_binary)),
+        ("io_read_binary", Box::new(b_io_read_binary)),
         ("require", Box::new(b_require)),
     ]
 }

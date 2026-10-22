@@ -144,7 +144,7 @@ Requires Rust (cargo) ≥ 1.70. Commands, from the project root:
 ```sh
 cargo build             # debug build (fast to compile, slow to run)
 cargo build --release   # release turbo: lto + codegen-units=1 + opt-level=3
-cargo test              # 59 tests (6 unit + 51 integration + 2 self-hosted)
+cargo test              # 60 tests (6 unit + 51 integration + 3 self-hosted)
 cargo run               # opens the REPL straight from source
 ```
 

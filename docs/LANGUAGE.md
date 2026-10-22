@@ -140,7 +140,8 @@ local c = t         -- ok: the borrow already ended
 
 Base: `print msg...`, `type v`, `tostring v`, `tonumber s (base)`,
 `error msg`, `assert ok, msg`, `pcall f, args...`, `pairs t`, `ipairs t`,
-`io_read_file path`, `require name`.
+`io_read_file path`, `io_write_binary path, bytes`, `io_read_binary path`,
+`require name`.
 
 ### File I/O - `io_read_file(path)`
 
@@ -158,6 +159,29 @@ local ok, err = pcall(io_read_file, "missing.lusa")
 
 The same native function is installed in the global environment used by both
 the tree-walking interpreter and the bytecode VM.
+
+### Binary I/O - `io_write_binary(path, bytes)` / `io_read_binary(path)`
+
+`io_write_binary` writes raw bytes and returns `true`. `bytes` may be a dense
+1-based table of integers in `0..255` (the form used by the native backend) or
+a string, whose UTF-8 bytes are written unchanged. Missing entries, non-number
+bytes, and out-of-range values raise `E2006`; filesystem failures raise
+`E2009`.
+
+`io_read_binary` reads any file and returns a dense 1-based table of byte
+numbers, so images round-trip exactly:
+
+```lusa
+local compiled = Compiler.emit_binary(borrow ast, "windows")
+io_write_binary("program.exe", compiled)
+
+local check = io_read_binary("program.exe")
+assert(#check == #compiled)
+assert(check[1] == 0x4D and check[2] == 0x5A) -- "MZ"
+```
+
+Both functions are available in the interpreter and the VM. They are ordinary
+native builtins, so they do not need `require`.
 
 ### Protected calls — `pcall`
 
@@ -237,10 +261,10 @@ Codes `E{category}{n}`, like rustc:
 | E2003  | type     | comparison of incomparable types |
 | E2004  | type     | length `#` of a value without length |
 | E2005  | type     | calling a non-function |
-| E2006  | type     | indexing (`t.x`/`t[k]`) a non-table |
+| E2006  | type     | indexing (`t.x`/`t[k]`) a non-table; invalid binary byte table |
 | E2007  | key      | `nil`/NaN key in `t[k] = v` |
 | E2008  | value    | invalid `tonumber`/`format` |
-| E2009  | I/O      | `io_read_file` cannot read the file (missing, unreadable, or non-UTF-8) |
+| E2009  | I/O      | file I/O cannot read/write (missing, unreadable, non-UTF-8, permissions) |
 | E9000  | runtime  | `error(msg)` |
 | E9100  | runtime  | `assert(false, msg)` |
 | E9999  | runtime  | internal error (umbrella; includes stack overflow for calls > 200 — catchable with `pcall`) |

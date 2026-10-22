@@ -51,7 +51,7 @@ See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full toolchain guide
 ```sh
 cargo build             # debug
 cargo build --release   # release turbo (opt-level 3 + LTO) — use this to install
-cargo test              # 59 tests (6 unit + 51 integration + 2 self-hosted)
+cargo test              # 60 tests (6 unit + 51 integration + 3 self-hosted)
 ```
 
 The resulting binary (`target\release\lusa.exe`) is standalone: **running
@@ -105,7 +105,7 @@ cargo run -- examples/basics.lusa
 - **Methods**: `o:m()` passes the receiver as a *mutable borrow* —
   `function o:m() self.x = ... end` works naturally (mutating `self`).
 - **stdlib**: `print type tostring tonumber error assert pairs ipairs io_read_file`
-  + `string` `table` `math` modules.
+  `io_write_binary` `io_read_binary` + `string` `table` `math` `json` modules.
 - **Errors** in cargo style (`error[E1001]: ...`, `note:` and `help:`),
   E-codes: lexer (E0001), parser (E0101), ownership (E1001–E1005),
   runtime types and I/O (E2001–E2009), `error`/`assert` (E9000/E9100).
@@ -126,14 +126,17 @@ src/
 lexer.lusa                # self-hosted lexer written in Lusa
 parser.lusa               # self-hosted recursive-descent parser
 compiler.lusa             # self-hosted bytecode compiler
-docs/SELF_HOSTING.md      # self-hosted front-end reference
+compiler_bootstrap.lusa   # Module-7 optimizer + native PE/ELF emitter
+docs/SELF_HOSTING.md      # self-hosted front-end and native backend reference
 ```
 
 Pipeline:
 
 ```text
 lexer → parser → AST → tree-walking interpreter (default)
-                    └→ compiler → bytecode chunks → VM (`--vm`)
+                    ├→ compiler → bytecode chunks → VM (`--vm`)
+                    └→ Compiler.optimize → Compiler.emit_binary
+                                           → PE32+ / ELF64 image
 ```
 
 ## Self-hosted lexer (`lexer.lusa`)
@@ -199,6 +202,56 @@ zero-based constant/local slots, and absolute 1-based byte-offset jumps. See
 [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) for the AST schema, full opcode
 table, exact byte example, ownership rules and test coverage.
 
+## Native bootstrap backend (`compiler_bootstrap.lusa`)
+
+Module 7 adds the first native-code stage. It consumes an AST for optimization
+and emits a complete x86_64 executable directly, with no external linker and no
+Rust runtime on the target:
+
+```lua
+local ast = Parser.parse(Lexer.lex(source))
+
+local optimized = Compiler.optimize(clone ast)       -- consumes the clone
+local pe = Compiler.emit_binary(borrow ast, "windows") -- read-only borrow
+local elf = Compiler.emit_binary(clone ast, "linux")
+io_write_binary("program.exe", pe)
+```
+
+- `Compiler.optimize(move_ast)` consumes its argument and returns a new AST with
+  constant folding, logical pruning, constant-`if` elimination, and unreachable
+  code removal.
+- `Compiler.emit_binary(borrow_ast, target_os)` snapshots the borrowed body and
+  optimizes a private copy; the caller's AST is unchanged after emission.
+- `Compiler.bootstrap(lexer, parser, source, target_os)` runs the self-hosted
+  front end, optimizer, and native emitter in one call.
+- `Compiler.verify_fixpoint(...)` compiles the same source twice and reports
+  byte equality plus both images.
+- `Compiler.self_compile(...)` reports the remaining front-end gap honestly:
+  the Module-6 parser is scalar, so it rejects this module's tables/functions/
+  `for` loops and returns `{ok=false, stage="frontend", error=...}`.
+
+The accepted native subset is scalar: integers, booleans, `nil`, static
+strings, locals/globals, arithmetic/comparisons/logical operators,
+`if`/`while`/`repeat`/`do`/`return`/`break`, and `print` (the ELF path prints
+static string literals; Windows also formats integers/bools/nil). Tables, closures,
+field/index access, function definitions, numeric/generic `for`, varargs,
+interpolation, floating-point arithmetic, and dynamic string concatenation are
+rejected with `bootstrap:line:column:` diagnostics.
+
+Windows output is a hand-built PE32+ image importing only `ExitProcess`
+(kernel32) and `printf` (msvcrt); Linux output uses direct `write`/`exit`
+syscalls in an ELF64 with a single RWX load segment. `Compiler.memory_layout()`
+records the planned heap ABI: object headers, table/closure layout, clone and
+borrow rules, and the RAII drop rule (deep-drop at lexical scope exit and before
+slot reuse). The scalar images allocate no heap, so their drop list is empty by
+construction.
+
+Tests run the same bootstrap pipeline on the interpreter and VM, require
+byte-identical PE/ELF images, execute the generated PE, exercise loops and
+bool/nil printing, exercise `self_compile` on supported and unsupported files,
+and validate the ELF64 headers and RWX load segment without executing it. See
+[`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) for the full layout and ABI.
+
 ## Bytecode VM: registers and source lines
 
 `compiler.rs` resolves every local binding to a numeric register at compile
@@ -237,6 +290,9 @@ lusalang run main.lusa --vm
 - pcall / coroutines
 - string patterns (gmatch/find with patterns, today literal-only)
 - explicit `move`/`copy` labels and a complete borrow checker
+- full native self-hosting: table/function/`for` parser coverage, a native heap
+  runtime with automatic RAII drops, and self-compilation of the bootstrap
+  module
 - linter-style analysis-time errors (rustc-friendly)
 
 ## License

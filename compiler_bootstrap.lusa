@@ -1,0 +1,1701 @@
+-- compiler_bootstrap.lusa — Stage-7 native bootstrap backend.
+--
+-- This is the first native-code stage of the Lusa bootstrap.  It deliberately
+-- keeps the trusted core small:
+--
+--   * optimize(move_ast) consumes an AST and returns a folded/pruned AST;
+--   * emit_binary(borrow_ast, target_os) reads an AST without consuming it
+--     (the caller may pass `borrow ast`) and returns a byte table containing
+--     a complete PE32+ or ELF64 executable;
+--   * bootstrap(lexer, parser, source, target_os) runs the self-hosted
+--     lexer/parser, optimizes, and emits a native image;
+--   * verify_fixpoint(...) compiles the same source twice and compares bytes;
+--   * self_compile(...) runs the current self-hosted front end and reports a
+--     lexer/frontend/backend gap instead of pretending that full self-hosting
+--     already works.
+--
+-- The native backend currently accepts the *scalar* core: integers, booleans,
+-- nil, static strings, locals/globals, arithmetic/comparison/logical
+-- expressions, if/while/repeat/do/return/break, and `print` (the ELF print
+-- path currently formats static string literals; PE also formats int/bool/nil).
+-- Tables, closures, fields, loops over tables and dynamic strings are rejected
+-- with a `bootstrap:line:column:` diagnostic.  The memory ABI for future heap values
+-- is documented by `memory_layout()`; the scalar image allocates no heap
+-- objects, so its drop list is empty by construction.
+--
+-- Windows output uses a hand-built PE32+ image importing only
+-- `ExitProcess` (kernel32) and `printf` (msvcrt).  Linux output uses direct
+-- x86_64 syscalls (`write` and `exit`), so the produced image needs neither
+-- the Rust runtime nor a system linker.
+
+local Compiler = {}
+
+Compiler.Version = 1
+Compiler.Targets = { windows = "pe64", linux = "elf64" }
+
+local function move(value)
+    return value
+end
+
+local function fail(line, column, message)
+    error(string.format("bootstrap:%d:%d: %s",
+        line or 0, column or 0, message))
+end
+
+local function is_integer(n)
+    return type(n) == "number" and n == math.floor(n)
+end
+
+local function number_node(value, line, column)
+    return {tag = "Number", value = value, line = line, column = column}
+end
+
+local function bool_node(value, line, column)
+    return {tag = "Bool", value = value, line = line, column = column}
+end
+
+local function string_node(value, raw, interpolated, line, column)
+    return {
+        tag = "String",
+        value = value,
+        raw = raw,
+        interpolated = interpolated,
+        line = line,
+        column = column
+    }
+end
+
+-- =========================================================================
+-- AST optimizer (ownership: every helper consumes its node argument)
+-- =========================================================================
+
+local function opt_expr(expr)
+    local tag = expr.tag
+    local line = expr.line
+    local column = expr.column
+
+    if tag == "Nil" or tag == "Bool" or tag == "Number"
+        or tag == "String" or tag == "Name" then
+        return expr
+    end
+
+    if tag == "Paren" then
+        return opt_expr(expr.value)
+    end
+
+    if tag == "Unary" then
+        local op = expr.op
+        local value = opt_expr(expr.value)
+        if op == "-" and value.tag == "Number" then
+            return number_node(-value.value, line, column)
+        end
+        if op == "not" and value.tag == "Bool" then
+            return bool_node(not value.value, line, column)
+        end
+        if op == "not" and value.tag == "Nil" then
+            return bool_node(true, line, column)
+        end
+        if op == "#" and value.tag == "String" then
+            return number_node(#value.value, line, column)
+        end
+        return {
+            tag = "Unary", op = op, value = value,
+            line = line, column = column
+        }
+    end
+
+    if tag == "Binary" then
+        local op = expr.op
+        local lhs = opt_expr(expr.lhs)
+        local rhs = opt_expr(expr.rhs)
+
+        if lhs.tag == "Number" and rhs.tag == "Number" then
+            local a = lhs.value
+            local b = rhs.value
+            if op == "+" then return number_node(a + b, line, column) end
+            if op == "-" then return number_node(a - b, line, column) end
+            if op == "*" then return number_node(a * b, line, column) end
+            if op == "/" and b ~= 0 then return number_node(a / b, line, column) end
+            if op == "//" and b ~= 0 then
+                return number_node(math.floor(a / b), line, column)
+            end
+            if op == "%" and b ~= 0 then
+                return number_node(a - math.floor(a / b) * b, line, column)
+            end
+            if op == "^" then return number_node(a ^ b, line, column) end
+            if op == "==" then return bool_node(a == b, line, column) end
+            if op == "~=" then return bool_node(a ~= b, line, column) end
+            if op == "<" then return bool_node(a < b, line, column) end
+            if op == "<=" then return bool_node(a <= b, line, column) end
+            if op == ">" then return bool_node(a > b, line, column) end
+            if op == ">=" then return bool_node(a >= b, line, column) end
+        end
+
+        if op == ".." and lhs.tag == "String" and rhs.tag == "String" then
+            return string_node(lhs.value .. rhs.value, nil, false, line, column)
+        end
+
+        if op == "==" or op == "~=" then
+            local known = false
+            local equal = false
+            local lt = lhs.tag
+            local rt = rhs.tag
+            if lt == rt then
+                if lt == "Bool" or lt == "String" then
+                    known = true
+                    equal = lhs.value == rhs.value
+                elseif lt == "Nil" then
+                    known = true
+                    equal = true
+                end
+            end
+            if known then
+                if op == "==" then return bool_node(equal, line, column) end
+                return bool_node(not equal, line, column)
+            end
+        end
+
+        return {
+            tag = "Binary", op = op, lhs = lhs, rhs = rhs,
+            line = line, column = column
+        }
+    end
+
+    if tag == "Logical" then
+        local op = expr.op
+        local lhs = opt_expr(expr.lhs)
+        if lhs.tag == "Bool" then
+            if op == "and" then
+                if lhs.value then return opt_expr(expr.rhs) end
+                return lhs
+            end
+            if op == "or" then
+                if lhs.value then return lhs end
+                return opt_expr(expr.rhs)
+            end
+        end
+        local rhs = opt_expr(expr.rhs)
+        return {
+            tag = "Logical", op = op, lhs = lhs, rhs = rhs,
+            line = line, column = column
+        }
+    end
+
+    if tag == "Call" then
+        local callee = opt_expr(expr.callee)
+        local args = expr.args
+        local out = {}
+        local i = 1
+        while i <= #args do
+            out[#out + 1] = opt_expr(args[i])
+            i = i + 1
+        end
+        return {
+            tag = "Call", callee = callee, args = out,
+            line = line, column = column
+        }
+    end
+
+    if tag == "Clone" or tag == "Borrow" then
+        local value = opt_expr(expr.value)
+        return {
+            tag = tag, value = value, line = line, column = column
+        }
+    end
+
+    -- Index/Field/Method/Table/Function nodes are intentionally left alone;
+    -- the native backend will reject them with a targeted diagnostic.
+    return expr
+end
+
+local opt_stmt
+
+local function opt_block(body)
+    local out = {}
+    local i = 1
+    while i <= #body do
+        local stmt = body[i]
+        local tag = stmt.tag
+        out[#out + 1] = opt_stmt(stmt)
+        if tag == "Return" or tag == "Break" then
+            break
+        end
+        i = i + 1
+    end
+    return out
+end
+
+opt_stmt = function(stmt)
+    local tag = stmt.tag
+    local line = stmt.line
+    local column = stmt.column
+
+    if tag == "Local" then
+        local values = stmt.values
+        local out = {}
+        local i = 1
+        while i <= #values do
+            out[#out + 1] = opt_expr(values[i])
+            i = i + 1
+        end
+        return {
+            tag = "Local", names = stmt.names, values = out,
+            line = line, column = column
+        }
+    end
+
+    if tag == "Assign" then
+        local values = stmt.values
+        local out = {}
+        local i = 1
+        while i <= #values do
+            out[#out + 1] = opt_expr(values[i])
+            i = i + 1
+        end
+        return {
+            tag = "Assign", targets = stmt.targets, values = out,
+            line = line, column = column
+        }
+    end
+
+    if tag == "CallStmt" then
+        local value = opt_expr(stmt.value)
+        return {tag = "CallStmt", value = value, line = line, column = column}
+    end
+
+    if tag == "If" then
+        local branches = stmt.branches
+        local first_cond = opt_expr(branches[1].cond)
+        if first_cond.tag == "Bool" then
+            if first_cond.value then
+                return {
+                    tag = "Do", body = opt_block(branches[1].body),
+                    line = line, column = column
+                }
+            end
+            if #branches == 1 then
+                if stmt.else_body == nil then
+                    return {tag = "Do", body = {}, line = line, column = column}
+                end
+                return {
+                    tag = "Do", body = opt_block(stmt.else_body),
+                    line = line, column = column
+                }
+            end
+            -- Drop only the statically false first arm; later arms still
+            -- need their own condition evaluation.
+            local rest = {}
+            local j = 2
+            while j <= #branches do
+                rest[#rest + 1] = branches[j]
+                j = j + 1
+            end
+            return opt_stmt({
+                tag = "If", branches = rest, else_body = stmt.else_body,
+                line = line, column = column
+            })
+        end
+
+        local out = {}
+        local i = 1
+        while i <= #branches do
+            local branch = branches[i]
+            local cond
+            if i == 1 then
+                cond = first_cond
+            else
+                cond = opt_expr(branch.cond)
+            end
+            out[#out + 1] = {
+                cond = cond,
+                body = opt_block(branch.body)
+            }
+            i = i + 1
+        end
+        local else_body = nil
+        if stmt.else_body ~= nil then
+            else_body = opt_block(stmt.else_body)
+        end
+        return {
+            tag = "If", branches = out, else_body = else_body,
+            line = line, column = column
+        }
+    end
+
+    if tag == "While" then
+        local cond = opt_expr(stmt.cond)
+        if cond.tag == "Bool" and not cond.value then
+            return {tag = "Do", body = {}, line = line, column = column}
+        end
+        return {
+            tag = "While", cond = cond, body = opt_block(stmt.body),
+            line = line, column = column
+        }
+    end
+
+    if tag == "Repeat" then
+        return {
+            tag = "Repeat", body = opt_block(stmt.body),
+            cond = opt_expr(stmt.cond), line = line, column = column
+        }
+    end
+
+    if tag == "Do" then
+        return {tag = "Do", body = opt_block(stmt.body), line = line, column = column}
+    end
+
+    if tag == "Return" then
+        local values = stmt.values
+        local out = {}
+        local i = 1
+        while i <= #values do
+            out[#out + 1] = opt_expr(values[i])
+            i = i + 1
+        end
+        return {tag = "Return", values = out, line = line, column = column}
+    end
+
+    if tag == "Break" then
+        return stmt
+    end
+
+    return stmt
+end
+
+local function optimize_impl(move_ast)
+    if type(move_ast) ~= "table" or move_ast.tag ~= "Program" then
+        error("bootstrap: optimize expects a Program AST")
+    end
+    local line = move_ast.line
+    local column = move_ast.column
+    local body = opt_block(move_ast.body)
+    return {
+        tag = "Program", body = body, line = line, column = column
+    }
+end
+
+function Compiler.optimize(move_ast)
+    return optimize_impl(move_ast)
+end
+
+-- =========================================================================
+-- Memory ABI (documented here; the scalar backend allocates no heap values)
+-- =========================================================================
+
+function Compiler.memory_layout()
+    return {
+        scalar = "i64 in a register/stack slot",
+        value_header = {
+            length = "u64 at object-16",
+            flags = "u64 at object-8 (1 = owned, 0 = static)",
+            payload = "object itself"
+        },
+        table = "header + insertion-ordered key/value pairs (tagged) + length",
+        closure = "header + prototype id + captured upvalue array",
+        drop_rule = "end of lexical scope and before slot reuse; deep-drop tables/closures",
+        clone_rule = "allocate a new object with flags=1 and copy/deep-copy payload",
+        borrow_rule = "no allocation; the compiler records the alias lifetime"
+    }
+end
+
+-- =========================================================================
+-- Native x86_64 backend
+-- =========================================================================
+--
+-- Windows PE32+: .text RVA 0x1000.  The first 0x1000 bytes of the section are
+-- the static data area; generated code begins at section offset 0x1000, so the
+-- entry point is RVA 0x2000.  Imports live in .rdata.
+-- Linux ELF64: static data at image offset 0x1000, code at 0x2000, loaded at
+-- 0x400000.  Output uses write(2) and exit(2) directly.
+--
+-- Values in this scalar stage are raw signed 64-bit integers.  false/nil are
+-- 0, true is 1.  Static strings are pointers to NUL-terminated bytes and are
+-- never freed.  No table/closure allocation reaches this backend yet, so the
+-- RAII drop list is empty; memory_layout() records the ABI used when those
+-- nodes are enabled.
+
+local target = "windows"
+local data_base = 0x1000
+local code_base = 0x1000
+local data = {}
+local strings = {}
+local formats = {}
+local globals = {}
+local global_kinds = {}
+local body = {}
+local labels = {}
+local jumps = {}
+local refs = {}
+local label_seq = 0
+local scopes = {}
+local scope_count = 0
+local slot_count = 0
+local slot_kinds = {}
+local loop_depth = 0
+local break_labels = {}
+local epilogue = 0
+local rdata = {}
+local iat_exit = 0
+local iat_printf = 0
+local desc_off = 0
+local ilt_k_off = 0
+local ilt_m_off = 0
+local iat_k_off = 0
+local iat_m_off = 0
+local hn_exit_off = 0
+local hn_printf_off = 0
+local dll_k_off = 0
+local dll_m_off = 0
+
+local function align_up(value, alignment)
+    return math.floor((value + alignment - 1) / alignment) * alignment
+end
+
+local out_file = {}
+
+local function body_put_u32(pos, value)
+    local v = math.floor(value)
+    if v < 0 then v = v + 4294967296 end
+    v = v % 4294967296
+    local i = 0
+    while i < 4 do
+        body[pos + i] = math.floor(v / (256 ^ i)) % 256
+        i = i + 1
+    end
+end
+
+local function rdata_put_u32(pos, value)
+    local v = math.floor(value)
+    if v < 0 then v = v + 4294967296 end
+    v = v % 4294967296
+    local i = 0
+    while i < 4 do
+        rdata[pos + i + 1] = math.floor(v / (256 ^ i)) % 256
+        i = i + 1
+    end
+end
+
+local function rdata_put_u64(pos, value)
+    local v = math.floor(value)
+    if v < 0 then v = v + 18446744073709551616 end
+    v = v % 18446744073709551616
+    local i = 0
+    while i < 8 do
+        rdata[pos + i + 1] = math.floor(v / (256 ^ i)) % 256
+        i = i + 1
+    end
+end
+
+local function file_u8(pos, value)
+    out_file[pos + 1] = value % 256
+end
+
+local function file_u16(pos, value)
+    local v = value
+    if v < 0 then v = v + 65536 end
+    v = v % 65536
+    file_u8(pos, v % 256)
+    file_u8(pos + 1, math.floor(v / 256) % 256)
+end
+
+local function file_u32(pos, value)
+    local v = math.floor(value)
+    if v < 0 then v = v + 4294967296 end
+    v = v % 4294967296
+    local i = 0
+    while i < 4 do
+        file_u8(pos + i, math.floor(v / (256 ^ i)) % 256)
+        i = i + 1
+    end
+end
+
+local function file_u64(pos, value)
+    local v = math.floor(value)
+    if v < 0 then v = v + 18446744073709551616 end
+    v = v % 18446744073709551616
+    local i = 0
+    while i < 8 do
+        file_u8(pos + i, math.floor(v / (256 ^ i)) % 256)
+        i = i + 1
+    end
+end
+
+local function new_zero_table(size)
+    local tbl = {}
+    local i = 1
+    while i <= size do
+        tbl[i] = 0
+        i = i + 1
+    end
+    return tbl
+end
+
+local function data_u8(value)
+    if #data >= 0x1000 then
+        fail(0, 0, "static data area exceeds the 4 KiB native image budget")
+    end
+    data[#data + 1] = value % 256
+end
+
+local function data_c_string(value)
+    if strings[value] ~= nil then
+        return strings[value]
+    end
+    local offset = #data
+    local i = 1
+    while i <= #value do
+        data_u8(string.byte(value, i))
+        i = i + 1
+    end
+    data_u8(0)
+    strings[value] = offset
+    return offset
+end
+
+local function data_format(value)
+    if formats[value] ~= nil then
+        return formats[value]
+    end
+    local offset = #data
+    local i = 1
+    while i <= #value do
+        data_u8(string.byte(value, i))
+        i = i + 1
+    end
+    data_u8(0)
+    formats[value] = offset
+    return offset
+end
+
+local function global_offset(name)
+    if globals[name] ~= nil then
+        return globals[name]
+    end
+    local offset = #data
+    local i = 1
+    while i <= 8 do
+        data_u8(0)
+        i = i + 1
+    end
+    globals[name] = offset
+    return offset
+end
+
+local function code_u8(value)
+    body[#body + 1] = value % 256
+end
+
+local function code_u32(value)
+    local v = math.floor(value)
+    if v < 0 then v = v + 4294967296 end
+    v = v % 4294967296
+    local i = 0
+    while i < 4 do
+        code_u8(math.floor(v / (256 ^ i)) % 256)
+        i = i + 1
+    end
+end
+
+local function code_u64(value)
+    local v = math.floor(value)
+    if v < 0 then v = v + 18446744073709551616 end
+    v = v % 18446744073709551616
+    local i = 0
+    while i < 8 do
+        code_u8(math.floor(v / (256 ^ i)) % 256)
+        i = i + 1
+    end
+end
+
+local function add_ref(target_offset, kind)
+    local pos = #body + 1
+    code_u32(0)
+    refs[#refs + 1] = {pos = pos, target = target_offset, kind = kind}
+end
+
+local function lea_rip(reg, target_offset)
+    code_u8(0x48)
+    code_u8(0x8D)
+    if reg == "rax" then
+        code_u8(0x05)
+    elseif reg == "rcx" then
+        code_u8(0x0D)
+    elseif reg == "rdx" then
+        code_u8(0x15)
+    elseif reg == "rsi" then
+        code_u8(0x35)
+    elseif reg == "rdi" then
+        code_u8(0x3D)
+    else
+        fail(0, 0, "internal: unsupported RIP-relative register " .. reg)
+    end
+    add_ref(target_offset, "data")
+end
+
+local function load_global(name)
+    local offset = global_offset(name)
+    code_u8(0x48)
+    code_u8(0x8B)
+    code_u8(0x05)
+    add_ref(offset, "data")
+end
+
+local function store_global(name)
+    local offset = global_offset(name)
+    code_u8(0x48)
+    code_u8(0x89)
+    code_u8(0x05)
+    add_ref(offset, "data")
+end
+
+local function emit_imm(value)
+    code_u8(0x48)
+    code_u8(0xB8)
+    code_u64(value)
+end
+
+local function new_label()
+    label_seq = label_seq + 1
+    return label_seq
+end
+
+local function mark(label)
+    labels[label] = #body
+end
+
+local function emit_jmp(label)
+    code_u8(0xE9)
+    local pos = #body + 1
+    code_u32(0)
+    jumps[#jumps + 1] = {pos = pos, label = label}
+end
+
+local function emit_jz(label)
+    code_u8(0x0F)
+    code_u8(0x84)
+    local pos = #body + 1
+    code_u32(0)
+    jumps[#jumps + 1] = {pos = pos, label = label}
+end
+
+local function emit_jnz(label)
+    code_u8(0x0F)
+    code_u8(0x85)
+    local pos = #body + 1
+    code_u32(0)
+    jumps[#jumps + 1] = {pos = pos, label = label}
+end
+
+local function emit_test_rax()
+    code_u8(0x48)
+    code_u8(0x85)
+    code_u8(0xC0)
+end
+
+local function emit_mov_rdx_rax()
+    code_u8(0x48)
+    code_u8(0x89)
+    code_u8(0xC2)
+end
+
+local function call_iat(offset)
+    code_u8(0xFF)
+    code_u8(0x15)
+    add_ref(offset, "call")
+end
+
+local function local_disp(slot)
+    return -(40 + 8 * slot)
+end
+
+local function load_local(slot)
+    code_u8(0x48)
+    code_u8(0x8B)
+    code_u8(0x85)
+    code_u32(local_disp(slot))
+end
+
+local function store_local(slot)
+    code_u8(0x48)
+    code_u8(0x89)
+    code_u8(0x85)
+    code_u32(local_disp(slot))
+end
+
+local function enter_scope()
+    scope_count = scope_count + 1
+    scopes[scope_count] = {names = {}}
+end
+
+local function leave_scope()
+    -- Scalar locals need no generated drop.  Heap locals will call the ABI
+    -- drop hook here once table/closure allocation is enabled.
+    scope_count = scope_count - 1
+end
+
+local function declare(name, kind)
+    local slot = slot_count
+    slot_count = slot_count + 1
+    scopes[scope_count].names[name] = slot
+    slot_kinds[slot] = kind
+    return slot
+end
+
+local function find_local(name)
+    local i = scope_count
+    while i >= 1 do
+        local slot = scopes[i].names[name]
+        if slot ~= nil then
+            return slot
+        end
+        i = i - 1
+    end
+    return nil
+end
+
+local function expr_kind(expr)
+    local tag = expr.tag
+    if tag == "Number" then return "number" end
+    if tag == "Bool" then return "bool" end
+    if tag == "Nil" then return "nil" end
+    if tag == "String" then return "string" end
+    if tag == "Name" then
+        local slot = find_local(expr.name)
+        if slot ~= nil then
+            return slot_kinds[slot] or "unknown"
+        end
+        return global_kinds[expr.name] or "unknown"
+    end
+    if tag == "Paren" then return expr_kind(expr.value) end
+    if tag == "Clone" or tag == "Borrow" then
+        return expr_kind(expr.value)
+    end
+    if tag == "Unary" then
+        if expr.op == "not" then return "bool" end
+        if expr.op == "#" then return "number" end
+        return "number"
+    end
+    if tag == "Binary" then
+        local op = expr.op
+        if op == ".." then return "string" end
+        if op == "==" or op == "~=" or op == "<" or op == "<="
+            or op == ">" or op == ">=" then
+            return "bool"
+        end
+        return "number"
+    end
+    return "unknown"
+end
+
+local function string_literal(expr)
+    if expr.tag == "String" and not expr.interpolated then
+        return expr.value
+    end
+    if expr.tag == "Paren" then
+        return string_literal(expr.value)
+    end
+    return nil
+end
+
+local compile_expr
+local compile_stmt
+local compile_block
+local emit_print_call
+
+local function emit_print_value_pe(kind, suffix)
+    if kind == "bool" then
+        local true_label = new_label()
+        local done_label = new_label()
+        emit_test_rax()
+        emit_jnz(true_label)
+        lea_rip("rdx", data_c_string("false"))
+        emit_jmp(done_label)
+        mark(true_label)
+        lea_rip("rdx", data_c_string("true"))
+        mark(done_label)
+    elseif kind == "nil" then
+        lea_rip("rdx", data_c_string("nil"))
+    else
+        emit_mov_rdx_rax()
+    end
+
+    local fmt
+    if kind == "string" or kind == "bool" or kind == "nil" then
+        fmt = "%s" .. suffix
+    else
+        fmt = "%lld" .. suffix
+    end
+    lea_rip("rcx", data_format(fmt))
+    code_u8(0x31)
+    code_u8(0xC0)
+    call_iat(iat_printf)
+end
+
+local function emit_write_static_elf(offset, length)
+    code_u8(0xB8)
+    code_u32(1)             -- mov eax, SYS_write
+    code_u8(0xBF)
+    code_u32(1)             -- mov edi, stdout
+    lea_rip("rsi", offset)
+    code_u8(0xBA)
+    code_u32(length)        -- mov edx, length
+    code_u8(0x0F)
+    code_u8(0x05)           -- syscall
+end
+
+local function emit_print_value_elf(literal, suffix, line, column)
+    if literal == nil then
+        fail(line, column, "ELF native print currently requires a string literal")
+    end
+    local offset = data_c_string(literal)
+    emit_write_static_elf(offset, #literal)
+    if suffix == "\n" then
+        emit_write_static_elf(data_c_string("\n"), 1)
+    elseif suffix == " " then
+        emit_write_static_elf(data_c_string(" "), 1)
+    end
+end
+
+emit_print_call = function(call)
+    local args = call.args
+    local count = #args
+    if count == 0 then
+        if target == "windows" then
+            lea_rip("rcx", data_format("\n"))
+            code_u8(0x31)
+            code_u8(0xC0)
+            call_iat(iat_printf)
+        else
+            emit_write_static_elf(data_c_string("\n"), 1)
+        end
+        return
+    end
+    local i = 1
+    while i <= count do
+        local arg = args[i]
+        local line = arg.line
+        local column = arg.column
+        local kind = expr_kind(clone arg)
+        local literal = nil
+        if target == "linux" then
+            literal = string_literal(clone arg)
+            if literal == nil then
+                fail(line, column, "ELF native print currently requires a string literal")
+            end
+        end
+        compile_expr(arg)
+        local suffix = "\n"
+        if i < count then suffix = " " end
+        if target == "windows" then
+            emit_print_value_pe(kind, suffix)
+        else
+            emit_print_value_elf(literal, suffix, line, column)
+        end
+        i = i + 1
+    end
+end
+
+compile_expr = function(expr)
+    local tag = expr.tag
+    local line = expr.line
+    local column = expr.column
+
+    if tag == "Number" then
+        if not is_integer(expr.value) then
+            fail(line, column, "native backend supports integer numbers only")
+        end
+        emit_imm(expr.value)
+        return
+    end
+    if tag == "Bool" then
+        if expr.value then emit_imm(1) else emit_imm(0) end
+        return
+    end
+    if tag == "Nil" then
+        emit_imm(0)
+        return
+    end
+    if tag == "String" then
+        if expr.interpolated then
+            fail(line, column, "interpolated strings are not in the native subset")
+        end
+        if string.find(expr.value, string.char(0), 1, true) ~= nil then
+            fail(line, column, "native strings cannot contain NUL bytes")
+        end
+        lea_rip("rax", data_c_string(expr.value))
+        return
+    end
+    if tag == "Name" then
+        local slot = find_local(expr.name)
+        if slot ~= nil then
+            load_local(slot)
+        else
+            load_global(expr.name)
+        end
+        return
+    end
+    if tag == "Paren" then
+        compile_expr(expr.value)
+        return
+    end
+    if tag == "Unary" then
+        local literal = nil
+        local inner = expr.value
+        if expr.op == "#" then
+            literal = string_literal(clone inner)
+        end
+        compile_expr(inner)
+        if expr.op == "-" then
+            code_u8(0x48)
+            code_u8(0xF7)
+            code_u8(0xD8)
+        elseif expr.op == "not" then
+            emit_test_rax()
+            code_u8(0x0F)
+            code_u8(0x94)
+            code_u8(0xC0)
+            code_u8(0x48)
+            code_u8(0x0F)
+            code_u8(0xB6)
+            code_u8(0xC0)
+        elseif expr.op == "#" then
+            if literal == nil then
+                fail(line, column, "native # requires a string literal")
+            end
+            emit_imm(#literal)
+        else
+            fail(line, column, "native unary operator " .. tostring(expr.op) .. " is unsupported")
+        end
+        return
+    end
+    if tag == "Binary" then
+        local op = expr.op
+        if op == ".." then
+            fail(line, column, "dynamic string concatenation needs the heap runtime; fold literals first")
+        end
+        compile_expr(expr.lhs)
+        code_u8(0x50)       -- push rax
+        compile_expr(expr.rhs)
+        code_u8(0x59)       -- pop rcx
+
+        if op == "+" then
+            code_u8(0x48); code_u8(0x01); code_u8(0xC8)
+        elseif op == "-" then
+            code_u8(0x48); code_u8(0x29); code_u8(0xC1)
+            code_u8(0x48); code_u8(0x89); code_u8(0xC8)
+        elseif op == "*" then
+            code_u8(0x48); code_u8(0x0F); code_u8(0xAF); code_u8(0xC1)
+        elseif op == "/" or op == "%" then
+            code_u8(0x49); code_u8(0x89); code_u8(0xC2) -- mov r10, rax
+            code_u8(0x48); code_u8(0x89); code_u8(0xC8) -- mov rax, rcx
+            code_u8(0x48); code_u8(0x99)             -- cqo
+            code_u8(0x49); code_u8(0xF7); code_u8(0xFA) -- idiv r10
+            if op == "%" then
+                code_u8(0x48); code_u8(0x89); code_u8(0xD0) -- mov rax, rdx
+            end
+        elseif op == "//" then
+            fail(line, column, "native floor division is not implemented")
+        elseif op == "^" then
+            fail(line, column, "native exponentiation is not implemented")
+        elseif op == "==" or op == "~=" or op == "<" or op == "<="
+            or op == ">" or op == ">=" then
+            code_u8(0x48); code_u8(0x39); code_u8(0xC1) -- cmp rcx, rax
+            local cc = 0x94
+            if op == "~=" then cc = 0x95
+            elseif op == "<" then cc = 0x9C
+            elseif op == "<=" then cc = 0x9E
+            elseif op == ">" then cc = 0x9F
+            elseif op == ">=" then cc = 0x9D end
+            code_u8(0x0F); code_u8(cc); code_u8(0xC0)
+            code_u8(0x48); code_u8(0x0F); code_u8(0xB6); code_u8(0xC0)
+        else
+            fail(line, column, "native binary operator " .. tostring(op) .. " is unsupported")
+        end
+        return
+    end
+    if tag == "Logical" then
+        compile_expr(expr.lhs)
+        emit_test_rax()
+        local end_label = new_label()
+        if expr.op == "and" then
+            emit_jz(end_label)
+        elseif expr.op == "or" then
+            emit_jnz(end_label)
+        else
+            fail(line, column, "native logical operator " .. tostring(expr.op) .. " is unsupported")
+        end
+        compile_expr(expr.rhs)
+        mark(end_label)
+        return
+    end
+    if tag == "Call" then
+        if expr.callee.tag == "Name" and expr.callee.name == "print" then
+            emit_print_call(expr)
+            code_u8(0x31)
+            code_u8(0xC0)
+            return
+        end
+        fail(line, column, "native calls support only print")
+    end
+    if tag == "Clone" or tag == "Borrow" then
+        compile_expr(expr.value)
+        return
+    end
+
+    fail(line, column, "native backend does not support AST node " .. tostring(tag))
+end
+
+compile_stmt = function(stmt)
+    local tag = stmt.tag
+    local line = stmt.line
+    local column = stmt.column
+
+    if tag == "Local" then
+        local names = stmt.names
+        local values = stmt.values
+        local target_count = #names
+        local provided = #values
+        if provided > target_count then
+            fail(line, column, "native locals do not support extra initializers")
+        end
+        local kinds = {}
+        local i = 1
+        while i <= target_count do
+            if i <= provided then
+                local value = values[i]
+                kinds[i] = expr_kind(clone value)
+                compile_expr(value)
+            else
+                kinds[i] = "nil"
+                emit_imm(0)
+            end
+            code_u8(0x50)
+            i = i + 1
+        end
+        local slots = {}
+        i = 1
+        while i <= target_count do
+            slots[i] = declare(names[i], kinds[i])
+            i = i + 1
+        end
+        i = target_count
+        while i >= 1 do
+            code_u8(0x58)
+            store_local(slots[i])
+            slot_kinds[slots[i]] = kinds[i]
+            i = i - 1
+        end
+        return
+    end
+
+    if tag == "Assign" then
+        local targets = stmt.targets
+        local values = stmt.values
+        local target_count = #targets
+        local provided = #values
+        if provided > target_count then
+            fail(line, column, "native assignment has more values than targets")
+        end
+        local kinds = {}
+        local i = 1
+        while i <= target_count do
+            if i <= provided then
+                local value = values[i]
+                kinds[i] = expr_kind(clone value)
+                compile_expr(value)
+            else
+                kinds[i] = "nil"
+                emit_imm(0)
+            end
+            code_u8(0x50)
+            i = i + 1
+        end
+        i = target_count
+        while i >= 1 do
+            code_u8(0x58)
+            local target = targets[i]
+            if target.tag ~= "Name" then
+                fail(target.line, target.column,
+                    "native assignment supports only local/global names")
+            end
+            local slot = find_local(target.name)
+            if slot ~= nil then
+                store_local(slot)
+                slot_kinds[slot] = kinds[i]
+            else
+                store_global(target.name)
+                global_kinds[target.name] = kinds[i]
+            end
+            i = i - 1
+        end
+        return
+    end
+
+    if tag == "CallStmt" then
+        compile_expr(stmt.value)
+        return
+    end
+
+    if tag == "If" then
+        local branches = stmt.branches
+        local end_label = new_label()
+        local i = 1
+        while i <= #branches do
+            local branch = branches[i]
+            local next_label = new_label()
+            compile_expr(branch.cond)
+            emit_test_rax()
+            emit_jz(next_label)
+            compile_block(branch.body)
+            emit_jmp(end_label)
+            mark(next_label)
+            i = i + 1
+        end
+        if stmt.else_body ~= nil then
+            compile_block(stmt.else_body)
+        end
+        mark(end_label)
+        return
+    end
+
+    if tag == "While" then
+        local start_label = new_label()
+        local end_label = new_label()
+        mark(start_label)
+        compile_expr(stmt.cond)
+        emit_test_rax()
+        emit_jz(end_label)
+        loop_depth = loop_depth + 1
+        break_labels[loop_depth] = end_label
+        compile_block(stmt.body)
+        loop_depth = loop_depth - 1
+        emit_jmp(start_label)
+        mark(end_label)
+        return
+    end
+
+    if tag == "Repeat" then
+        local start_label = new_label()
+        local end_label = new_label()
+        mark(start_label)
+        loop_depth = loop_depth + 1
+        break_labels[loop_depth] = end_label
+        compile_block(stmt.body)
+        loop_depth = loop_depth - 1
+        compile_expr(stmt.cond)
+        emit_test_rax()
+        emit_jz(start_label)
+        mark(end_label)
+        return
+    end
+
+    if tag == "Do" then
+        compile_block(stmt.body)
+        return
+    end
+
+    if tag == "Return" then
+        if #stmt.values > 1 then
+            fail(line, column, "native executable entry point returns one integer")
+        end
+        if #stmt.values == 0 then
+            emit_imm(0)
+        else
+            compile_expr(stmt.values[1])
+        end
+        emit_jmp(epilogue)
+        return
+    end
+
+    if tag == "Break" then
+        if loop_depth == 0 then
+            fail(line, column, "break outside a native loop")
+        end
+        emit_jmp(break_labels[loop_depth])
+        return
+    end
+
+    fail(line, column, "native backend does not support statement " .. tostring(tag))
+end
+
+compile_block = function(block)
+    enter_scope()
+    local i = 1
+    while i <= #block do
+        compile_stmt(block[i])
+        i = i + 1
+    end
+    leave_scope()
+end
+
+local function reset_state(target_os)
+    target = target_os
+    if target == "windows" then
+        data_base = 0x1000
+        code_base = 0x2000
+    else
+        data_base = 0x1000
+        code_base = 0x2000
+    end
+    data = {}
+    strings = {}
+    formats = {}
+    globals = {}
+    global_kinds = {}
+    body = {}
+    labels = {}
+    jumps = {}
+    refs = {}
+    label_seq = 0
+    scopes = {}
+    scope_count = 0
+    slot_count = 0
+    slot_kinds = {}
+    loop_depth = 0
+    break_labels = {}
+    epilogue = 0
+    rdata = {}
+    iat_exit = 0
+    iat_printf = 0
+    desc_off = 0
+    ilt_k_off = 0
+    ilt_m_off = 0
+    iat_k_off = 0
+    iat_m_off = 0
+    hn_exit_off = 0
+    hn_printf_off = 0
+    dll_k_off = 0
+    dll_m_off = 0
+end
+
+local function patch_jumps()
+    local i = 1
+    while i <= #jumps do
+        local jump = jumps[i]
+        local target_pos = labels[jump.label]
+        if target_pos == nil then
+            fail(0, 0, "internal: unresolved native jump")
+        end
+        body_put_u32(jump.pos, target_pos - (jump.pos + 3))
+        i = i + 1
+    end
+end
+
+local function patch_refs(prologue_len, rdata_rva)
+    local i = 1
+    while i <= #refs do
+        local ref = refs[i]
+        local end_pos = code_base + prologue_len + (ref.pos - 1) + 4
+        local target_pos
+        if ref.kind == "call" then
+            target_pos = rdata_rva + ref.target
+        else
+            target_pos = data_base + ref.target
+        end
+        body_put_u32(ref.pos, target_pos - end_pos)
+        i = i + 1
+    end
+end
+
+local function build_prologue()
+    local frame = align_up(64 + 8 * slot_count, 16) + 8
+    local prologue = {}
+    prologue[#prologue + 1] = 0x48
+    prologue[#prologue + 1] = 0x83
+    prologue[#prologue + 1] = 0xE4
+    prologue[#prologue + 1] = 0xF0       -- and rsp, -16
+    prologue[#prologue + 1] = 0x55       -- push rbp
+    prologue[#prologue + 1] = 0x48
+    prologue[#prologue + 1] = 0x89
+    prologue[#prologue + 1] = 0xE5       -- mov rbp, rsp
+    prologue[#prologue + 1] = 0x48
+    prologue[#prologue + 1] = 0x81
+    prologue[#prologue + 1] = 0xEC       -- sub rsp, imm32
+    local v = frame % 4294967296
+    local i = 0
+    while i < 4 do
+        prologue[#prologue + 1] = math.floor(v / (256 ^ i)) % 256
+        i = i + 1
+    end
+    return prologue
+end
+
+local function emit_exit_pe()
+    code_u8(0x89)
+    code_u8(0xC1)                   -- mov ecx, eax
+    call_iat(iat_exit)
+end
+
+local function emit_exit_elf()
+    code_u8(0x48)
+    code_u8(0x89)
+    code_u8(0xC7)                   -- mov rdi, rax
+    code_u8(0xB8)
+    code_u32(60)                    -- mov eax, SYS_exit
+    code_u8(0x0F)
+    code_u8(0x05)                   -- syscall
+end
+
+-- PE import tables -------------------------------------------------------
+
+local function rdata_u8(value)
+    rdata[#rdata + 1] = value % 256
+end
+
+local function rdata_bytes(value)
+    local i = 1
+    while i <= #value do
+        rdata_u8(string.byte(value, i))
+        i = i + 1
+    end
+end
+
+local function rdata_hint_name(name)
+    local offset = #rdata
+    rdata_u8(0)
+    rdata_u8(0)
+    rdata_bytes(name)
+    rdata_u8(0)
+    if #rdata % 2 ~= 0 then rdata_u8(0) end
+    return offset
+end
+
+local function setup_rdata()
+    rdata = {}
+    local i = 1
+    while i <= 60 do rdata_u8(0); i = i + 1 end
+    desc_off = 0
+    ilt_k_off = #rdata; i = 1; while i <= 16 do rdata_u8(0); i = i + 1 end
+    ilt_m_off = #rdata; i = 1; while i <= 16 do rdata_u8(0); i = i + 1 end
+    iat_k_off = #rdata; i = 1; while i <= 16 do rdata_u8(0); i = i + 1 end
+    iat_m_off = #rdata; i = 1; while i <= 16 do rdata_u8(0); i = i + 1 end
+    hn_exit_off = rdata_hint_name("ExitProcess")
+    hn_printf_off = rdata_hint_name("printf")
+    dll_k_off = #rdata
+    rdata_bytes("kernel32.dll")
+    rdata_u8(0)
+    dll_m_off = #rdata
+    rdata_bytes("msvcrt.dll")
+    rdata_u8(0)
+    iat_exit = iat_k_off
+    iat_printf = iat_m_off
+end
+
+local function fix_rdata(rdata_rva)
+    rdata_put_u32(desc_off + 0, rdata_rva + ilt_k_off)
+    rdata_put_u32(desc_off + 12, rdata_rva + dll_k_off)
+    rdata_put_u32(desc_off + 16, rdata_rva + iat_k_off)
+    rdata_put_u32(desc_off + 20, rdata_rva + ilt_m_off)
+    rdata_put_u32(desc_off + 32, rdata_rva + dll_m_off)
+    rdata_put_u32(desc_off + 36, rdata_rva + iat_m_off)
+    rdata_put_u64(ilt_k_off, rdata_rva + hn_exit_off)
+    rdata_put_u64(iat_k_off, rdata_rva + hn_exit_off)
+    rdata_put_u64(ilt_m_off, rdata_rva + hn_printf_off)
+    rdata_put_u64(iat_m_off, rdata_rva + hn_printf_off)
+end
+
+local function emit_pe(ast)
+    setup_rdata()
+    epilogue = new_label()
+    compile_block(ast.body)
+    emit_imm(0)
+    mark(epilogue)
+    emit_exit_pe()
+    patch_jumps()
+    if #data > 0x1000 then
+        fail(ast.line, ast.column, "static data exceeds the 4096-byte PE data area")
+    end
+
+    local prologue = build_prologue()
+    local prologue_len = #prologue
+    local text_vsize = 0x1000 + prologue_len + #body
+    local text_raw_size = align_up(text_vsize, 0x200)
+    local rdata_rva = align_up(0x1000 + text_vsize, 0x1000)
+    fix_rdata(rdata_rva)
+    patch_refs(prologue_len, rdata_rva)
+
+    local rdata_raw_size = align_up(#rdata, 0x200)
+    local rdata_raw_off = 0x200 + text_raw_size
+    local size_image = align_up(rdata_rva + #rdata, 0x1000)
+    local file_size = rdata_raw_off + rdata_raw_size
+    out_file = new_zero_table(file_size)
+
+    -- DOS header and PE signature.
+    file_u16(0, 0x5A4D)
+    file_u32(0x3C, 0x40)
+    file_u8(0x40, 0x50)
+    file_u8(0x41, 0x45)
+    file_u8(0x42, 0)
+    file_u8(0x43, 0)
+
+    local coff = 0x44
+    file_u16(coff, 0x8664)
+    file_u16(coff + 2, 2)
+    file_u16(coff + 16, 0xF0)
+    file_u16(coff + 18, 0x22)
+
+    local opt = coff + 20
+    file_u16(opt, 0x20B)
+    file_u8(opt + 2, 1)
+    file_u8(opt + 3, 0)
+    file_u32(opt + 4, text_raw_size)
+    file_u32(opt + 8, rdata_raw_size)
+    file_u32(opt + 16, 0x2000) -- entry: text RVA + 0x1000 data area
+    file_u32(opt + 20, 0x1000)
+    file_u64(opt + 24, 0x140000000)
+    file_u32(opt + 32, 0x1000)
+    file_u32(opt + 36, 0x200)
+    file_u16(opt + 40, 6)
+    file_u16(opt + 42, 0)
+    file_u16(opt + 44, 6)
+    file_u16(opt + 46, 0)
+    file_u16(opt + 48, 6)
+    file_u16(opt + 50, 0)
+    file_u32(opt + 56, size_image)
+    file_u32(opt + 60, 0x200)
+    file_u16(opt + 68, 3)
+    file_u16(opt + 70, 0x8100)
+    file_u64(opt + 72, 0x100000)
+    file_u64(opt + 80, 0x1000)
+    file_u64(opt + 88, 0x100000)
+    file_u64(opt + 96, 0x1000)
+    file_u32(opt + 104, 0)
+    file_u32(opt + 108, 16)
+    local dd = opt + 112
+    file_u32(dd + 8, rdata_rva + desc_off)
+    file_u32(dd + 12, 60)
+
+    local sh = 0x148
+    local function put_section(offset, name, vsize, rva, rawsize, rawptr, chars)
+        local i = 1
+        while i <= #name do
+            file_u8(offset + i - 1, string.byte(name, i))
+            i = i + 1
+        end
+        file_u32(offset + 8, vsize)
+        file_u32(offset + 12, rva)
+        file_u32(offset + 16, rawsize)
+        file_u32(offset + 20, rawptr)
+        file_u32(offset + 36, chars)
+    end
+    put_section(sh, ".text", text_vsize, 0x1000, text_raw_size, 0x200, 0x60000020)
+    put_section(sh + 40, ".rdata", #rdata, rdata_rva, rdata_raw_size,
+        rdata_raw_off, 0x40000040)
+
+    local i = 1
+    while i <= 0x1000 do
+        file_u8(0x200 + i - 1, data[i] or 0)
+        i = i + 1
+    end
+    i = 1
+    while i <= #prologue do
+        file_u8(0x200 + 0x1000 + i - 1, prologue[i])
+        i = i + 1
+    end
+    i = 1
+    while i <= #body do
+        file_u8(0x200 + 0x1000 + prologue_len + i - 1, body[i])
+        i = i + 1
+    end
+    i = 1
+    while i <= #rdata do
+        file_u8(rdata_raw_off + i - 1, rdata[i])
+        i = i + 1
+    end
+    local result = out_file
+    out_file = {}
+    return result
+end
+
+local function emit_elf(ast)
+    epilogue = new_label()
+    compile_block(ast.body)
+    emit_imm(0)
+    mark(epilogue)
+    emit_exit_elf()
+    patch_jumps()
+    if #data > 0x1000 then
+        fail(ast.line, ast.column, "static data exceeds the 4096-byte ELF data area")
+    end
+
+    local prologue = build_prologue()
+    local prologue_len = #prologue
+    patch_refs(prologue_len, 0)
+
+    local total = 0x2000 + prologue_len + #body
+    out_file = new_zero_table(total)
+    file_u8(0, 0x7F)
+    file_u8(1, 0x45)
+    file_u8(2, 0x4C)
+    file_u8(3, 0x46)
+    file_u8(4, 2)       -- ELFCLASS64
+    file_u8(5, 1)       -- ELFDATA2LSB
+    file_u8(6, 1)       -- EV_CURRENT
+    file_u16(16, 2)       -- ET_EXEC
+    file_u16(18, 0x3E)    -- EM_X86_64
+    file_u32(20, 1)
+    file_u64(24, 0x400000 + 0x2000)
+    file_u64(32, 0x40)
+    file_u16(52, 64)
+    file_u16(54, 56)
+    file_u16(56, 1)
+
+    local ph = 0x40
+    file_u32(ph, 1)       -- PT_LOAD
+    file_u32(ph + 4, 7)   -- R|W|X
+    file_u64(ph + 8, 0)
+    file_u64(ph + 16, 0x400000)
+    file_u64(ph + 24, 0x400000)
+    file_u64(ph + 32, total)
+    file_u64(ph + 40, total)
+    file_u64(ph + 48, 0x1000)
+
+    local i = 1
+    while i <= #data do
+        file_u8(0x1000 + i - 1, data[i])
+        i = i + 1
+    end
+    i = 1
+    while i <= prologue_len do
+        file_u8(0x2000 + i - 1, prologue[i])
+        i = i + 1
+    end
+    i = 1
+    while i <= #body do
+        file_u8(0x2000 + prologue_len + i - 1, body[i])
+        i = i + 1
+    end
+    local result = out_file
+    out_file = {}
+    return result
+end
+
+local function normalize_target(target_os)
+    if target_os == "windows" or target_os == "win" or target_os == "pe64" then
+        return "windows"
+    end
+    if target_os == "linux" or target_os == "elf64" or target_os == "elf" then
+        return "linux"
+    end
+    fail(0, 0, "unsupported native target: " .. tostring(target_os))
+end
+
+local function emit_binary_impl(borrow_ast, target_os)
+    local target_name = normalize_target(target_os)
+    if type(borrow_ast) ~= "table" or borrow_ast.tag ~= "Program" then
+        fail(0, 0, "emit_binary expects a Program AST")
+    end
+    -- The public parameter is read-only.  Lowering itself needs ownership,
+    -- so snapshot only its body and never mutate the caller's AST.  Cloning
+    -- the top-level value here would clone a `borrow` handle; snapshotting the
+    -- body avoids that alias and keeps the API usable from read-only contexts.
+    local snapshot = {
+        tag = "Program",
+        body = clone borrow_ast.body,
+        line = borrow_ast.line,
+        column = borrow_ast.column
+    }
+    local optimized = optimize_impl(snapshot)
+    reset_state(target_name)
+    local image
+    if target_name == "windows" then
+        image = emit_pe(optimized)
+    else
+        image = emit_elf(optimized)
+    end
+    -- Release the scratch tables (data/body/rdata/...) immediately so a long
+    -- sequence of emissions does not retain the previous image's lowering
+    -- state.  The returned image is independent of these module tables.
+    reset_state(target_name)
+    return image
+end
+
+function Compiler.emit_binary(borrow_ast, target_os)
+    return emit_binary_impl(borrow_ast, target_os)
+end
+
+local function bootstrap_impl(lexer, parser, source, target_os)
+    local tokens = lexer.lex(source)
+    local ast = parser.parse(tokens)
+    local optimized = optimize_impl(ast)
+    local image = emit_binary_impl(optimized, target_os)
+    return {
+        target = target_os,
+        source_bytes = #source,
+        image_bytes = #image,
+        image = image
+    }
+end
+
+function Compiler.bootstrap(lexer, parser, source, target_os)
+    return bootstrap_impl(lexer, parser, source, target_os)
+end
+
+function Compiler.write_image(path, image)
+    return io_write_binary(path, image)
+end
+
+function Compiler.verify_fixpoint(lexer, parser, source, target_os)
+    -- Each bootstrap run consumes its front-end tables; clone them so the
+    -- two runs are independent and the caller's handles stay valid.
+    local first = bootstrap_impl(clone lexer, clone parser, source, target_os)
+    local second = bootstrap_impl(clone lexer, clone parser, source, target_os)
+    local equal = #first.image == #second.image
+    if equal then
+        local i = 1
+        while i <= #first.image do
+            if first.image[i] ~= second.image[i] then
+                equal = false
+                break
+            end
+            i = i + 1
+        end
+    end
+    return {
+        equal = equal,
+        first = first,
+        second = second
+    }
+end
+
+function Compiler.self_compile(lexer, parser, target_os, path)
+    local source = io_read_file(path or "compiler_bootstrap.lusa")
+    local source_bytes = #source
+    local lex_ok, tokens = pcall(function()
+        return lexer.lex(source)
+    end)
+    if not lex_ok then
+        return {
+            ok = false, stage = "lexer", error = tokens,
+            note = "the self-hosted lexer could not process the compiler source"
+        }
+    end
+    local parse_ok, ast = pcall(function()
+        return parser.parse(tokens)
+    end)
+    if not parse_ok then
+        return {
+            ok = false, stage = "frontend", error = ast,
+            note = "the Module-6 parser is intentionally scalar; full self-parsing needs tables, functions and for-loops"
+        }
+    end
+    local emit_ok, image = pcall(function()
+        local optimized = optimize_impl(ast)
+        return emit_binary_impl(optimized, target_os)
+    end)
+    if not emit_ok then
+        return {
+            ok = false, stage = "backend", error = image,
+            note = "the native scalar backend does not yet lower every node in the compiler source"
+        }
+    end
+    return {
+        ok = true,
+        target = target_os,
+        source_bytes = source_bytes,
+        image_bytes = #image,
+        image = image
+    }
+end
+
+return move(Compiler)
