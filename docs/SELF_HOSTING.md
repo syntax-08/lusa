@@ -54,18 +54,20 @@ Expressions:
 - binary arithmetic, concatenation, comparison and equality operators
 - `and` / `or`
 - `clone` and `borrow`
+- array table constructors (`{}`, `{1, 2}`, trailing comma allowed)
+- integer index reads (`t[1]`, including nested `t[1][2]`)
 
-Intentionally unsupported in this reference stage: table constructors,
-field/index/method access, function definitions, numeric/generic `for`,
-varargs, and compilation of interpolated strings.  The parser reports a
-`parser:line:column:` error instead of silently building a partial AST.  The
-compiler reports unsupported AST nodes with a `compiler:line:column:` error.
-`borrow` is parsed and compiled to the bytecode `BorrowErr` opcode, matching
-the native compiler's VM behavior.  Calls are compiled as single-value
-`CallOne` expressions; multi-return expansion from calls and vararg
-propagation are not part of this reference subset.  A declaration or
-assignment with more initializers than targets is rejected rather than
-silently dropping the extras.
+Intentionally unsupported in this reference stage: keyed table constructors
+(`{k = v}`), field/method access (`.`, `:`), assignment through a field/index,
+function definitions, numeric/generic `for`, varargs, and compilation of
+interpolated strings. The parser reports a `parser:line:column:` error instead
+of silently building a partial AST. The compiler reports unsupported AST nodes
+with a `compiler:line:column:` error. `borrow` is parsed and compiled to the
+bytecode `BorrowErr` opcode, matching the native compiler's VM behavior. Calls
+are compiled as single-value `CallOne` expressions; multi-return expansion from
+calls and vararg propagation are not part of this reference subset. A
+declaration or assignment with more initializers than targets is rejected
+rather than silently dropping the extras.
 
 ## AST schema
 
@@ -93,11 +95,14 @@ Every node is a fresh table with `tag`, `line` and `column` fields.
 | `Binary` | `op = string`, `lhs = expr`, `rhs = expr` |
 | `Logical` | `op = "and" or "or"`, `lhs = expr`, `rhs = expr` |
 | `Call` | `callee = expr`, `args = { expr... }` |
+| `Table` | `items = { expr... }` (array entries only) |
+| `Index` | `table = expr`, `index = expr` |
 | `Clone` | `value = expr` |
 | `Borrow` | `value = expr` |
 
-`Assign` targets are restricted to `Name` nodes.  The parser rejects
-`a.b = ...`, `a[i] = ...` and call targets with an explicit error.
+`Assign` targets are restricted to `Name` nodes. The parser accepts `t[i]` as
+an expression but rejects `a.b = ...`, `a[i] = ...`, and call targets with an
+explicit error.
 
 ## Ownership strategy
 
@@ -209,12 +214,14 @@ separate `do ... end` blocks, checks AST shape, verifies the exact 19-byte image
 above, decodes instruction boundaries and jump targets, asserts clone-based AST
 preservation, and exercises parser/compiler error paths on both engines.
 
-## Module 7: optimizer and native backend
+## Modules 7–8: native backend, heap objects and RAII
 
 `compiler_bootstrap.lusa` is the first native-code stage. It does not emit VM
 bytecode: it builds complete x86_64 executable images with hand-written PE32+
 and ELF64 headers, so an emitted program needs neither the Rust runtime nor an
-external linker.
+external linker. Module 7 established the scalar backend; Module 8 adds native
+heap strings/tables, OS-backed allocation, deep scope drops, and move/borrow
+tracking.
 
 ### Public API
 
@@ -253,38 +260,57 @@ performs:
 
 ### Native subset
 
-Accepted scalar core:
+Accepted core:
 
-- integer/boolean/`nil`/static-string literals;
+- integer/boolean/`nil`/static-string literals, plus dynamic strings produced
+  by `..`;
 - locals, globals, assignment, arithmetic and comparison operators, `and`/`or`,
   unary `-`/`not`/`#`;
 - `if`/`elseif`/`else`, `while`, `repeat`, `do`, `return`, `break`;
-- `print` with multiple arguments (Windows formats integers/bools/nil; the ELF
-  path currently prints static string literals only).
+- homogeneous array tables (`{}`, `{1, 2}`, `{"a", "b"}`, nested tables),
+  one-based integer index reads (`t[1]`), and `#t`;
+- `move` by plain assignment and immutable `borrow` aliases;
+- `print` with multiple arguments; Windows and ELF both format strings, tables
+  (`<table>`), integers, booleans, and `nil`.
+
+Owned locals and globals are dropped automatically at lexical scope exits,
+including `if`/`while` blocks and the early `return`/`break` paths. Moving a
+value clears its source slot and cancels that slot's drop; borrowing keeps a
+non-owning alias alive and blocks moving or overwriting the owner until the
+alias leaves scope. Reassigning a heap global or local drops the previous value
+first.
 
 Rejected nodes produce a `bootstrap:line:column:` error rather than a partial
-image: tables, closures/functions, field or index access, methods, numeric and
-generic `for`, varargs, interpolation, floating-point arithmetic, and dynamic
-string concatenation. The scalar backend represents values as signed 64-bit
-integers; `false`/`nil` are `0` and `true` is `1`.
+image: keyed or heterogeneous tables, field access, assignment through an index
+or field, heap `clone`, closures/functions, methods, numeric and generic `for`,
+varargs, interpolation, floating-point arithmetic, and borrowed/moved
+heap-valued table elements. Table values are homogeneous and integer-indexed;
+the reserved hash-capacity field is not yet used. The backend represents raw
+scalars as signed 64-bit integers; `false`/`nil` are `0` and `true` is `1`, while
+strings and tables are payload pointers.
 
 ### PE32+ layout (Windows)
 
 - DOS/PE headers occupy the first `0x200` bytes.
 - `.text` is at RVA `0x1000`, file offset `0x200`; its first `0x1000` bytes are
-  the static data area, including NUL-terminated strings.
+  the static data area (NUL-terminated strings and writable global slots).
 - Generated code begins at section offset `0x1000`, so the entry point is RVA
   `0x2000`.
 - `.rdata` starts at RVA `0x3000` and contains the import descriptor, ILT/IAT,
   and hint/name entries.
-- Imports are only `ExitProcess` from `kernel32.dll` and `printf` from
-  `msvcrt.dll`. Calls use RIP-relative `FF 15` through the IAT.
-- The prologue aligns the stack, establishes `rbp`, and reserves
-  `align16(64 + 8*slots) + 8` bytes. Slot `i` lives at `[rbp - 40 - 8*i]`; the
-  low area is Windows shadow space.
+- Imports are `ExitProcess`, `VirtualAlloc`, and `VirtualFree` from
+  `kernel32.dll`, plus `printf` from `msvcrt.dll`. Calls use RIP-relative
+  `FF 15` through the IAT.
+- Because globals currently share the data/code section, `.text` is mapped
+  read/write/execute (`0xE0000020`). A future layout can split globals into a
+  dedicated writable `.data` section and keep code read/execute-only.
+- Every Windows API call reserves the required 32-byte shadow space and keeps
+  `rsp` 16-byte aligned. The prologue aligns the stack, establishes `rbp`, and
+  reserves `align16(64 + 8*slots) + 8` bytes. Slot `i` lives at
+  `[rbp - 40 - 8*i]`.
 - Top-level `return` reaches `ExitProcess`, so the process exit code is the
-  returned scalar. `print` formats integers with `%lld` and booleans/nil as
-  static strings.
+  returned scalar. `print` uses `%s` for strings, booleans, `nil`, and tables
+  (`<table>`), and `%lld` for integers.
 
 ### ELF64 layout (Linux)
 
@@ -293,40 +319,66 @@ integers; `false`/`nil` are `0` and `true` is `1`.
   `0x2000`.
 - One `PT_LOAD` segment carries `R|W|X` flags; there is no dynamic loader,
   interpreter, relocation, or symbol table.
-- `print` uses the `write(2)` syscall and exit uses `exit(2)` directly.
+- `print` uses the `write(2)` syscall and supports static/dynamic strings,
+  tables (`<table>`), integers, booleans, and `nil`; exit uses `exit(2)`
+  directly.
 
 ### Heap lifecycle and RAII ABI
 
-`Compiler.memory_layout()` documents the representation intended for the next
-native stage:
+`Compiler.memory_layout()` describes the live Module-8 representation:
 
 ```lua
 {
     scalar = "i64 in a register/stack slot",
     value_header = {
-        length = "u64 at object-16",
-        flags  = "u64 at object-8 (1 = owned, 0 = static)",
-        payload = "object itself"
+        size = 32,
+        type = "u64 at object-32 (1 = string, 2 = table)",
+        length = "u64 at object-24",
+        flags = "u64 at object-16 (bit 0 = owned)",
+        allocation = "u64 at object-8",
+        payload = "object itself (header + 32)"
     },
-    table   = "header + insertion-ordered key/value pairs (tagged) + length",
-    closure = "header + prototype id + captured upvalue array",
-    drop_rule = "end of lexical scope and before slot reuse; deep-drop tables/closures",
-    clone_rule = "allocate a new object with flags=1 and copy/deep-copy payload",
-    borrow_rule = "no allocation; the compiler records the alias lifetime"
+    table = {
+        element_kind = "u64 at payload+0",
+        hash_capacity = "u64 at payload+8 (reserved)",
+        entries = "u64 at payload+16, one-based array values"
+    },
+    allocator = {
+        windows = "VirtualAlloc / VirtualFree",
+        linux = "mmap(2) / munmap(2)"
+    }
 }
 ```
 
-The planned lowering inserts a drop at every lexical scope exit, including
-early `return`/`break` paths, and before a local slot is reused by a sibling
-scope. Dropping a table or closure is recursive: owned payloads are dropped,
-while static/borrowed payloads are not. `clone` allocates a fresh owned object;
-`borrow` only records an alias and never allocates.
+The 32-byte header immediately precedes the value pointer stored in a native
+slot. Static strings embedded in the image carry the same header with
+`flags = 0`; dynamic strings and tables carry `flags = 1` and are returned to
+the OS by `rt_drop`.
 
-This is the RAII analogue of Rust: the scope owns its heap values, and the
-compiler inserts the release at the end of that scope rather than relying on a
-garbage collector. The current scalar images allocate no heap values, so their
-drop list is empty by construction; the ABI is documented ahead of enabling
-tables/closures in the native subset.
+- String payload: UTF-8 bytes followed by a NUL. Dynamic concatenation computes
+  the combined byte length, allocates `header + length + 1`, copies both
+  payloads, and returns the new payload pointer.
+- Table payload: `elem_kind` (0 unknown, 1 number, 2 bool, 3 nil, 4 string,
+  5 table), a reserved hash-capacity slot, then the one-based entries.
+  `#t` reads the header length; `t[i]` performs a bounds check and loads entry
+  `i`. The native subset currently supports homogeneous array tables only.
+- Deep drop: `rt_drop` checks the owned flag, recursively drops table entries
+  whose element kind is string or table, then releases the object. Strings are
+  released directly.
+- RAII lowering: owned locals are dropped in reverse declaration order at every
+  lexical scope exit, including `if`/`while` blocks, `return`, and `break`.
+  Heap globals are dropped at program exit; assigning over an owned local or
+  global drops the old value first.
+- Move: the source slot/global is cleared and its pending drop is cancelled.
+  Borrow: the compiler records a non-owning alias, suppresses the owner's drop
+  while the alias lives, and rejects moving or overwriting the owner. The alias
+  itself is never dropped.
+- `clone` of a heap value is intentionally rejected with a
+  `bootstrap:line:column:` diagnostic; scalar `clone` is a copy. A deep-copying
+  heap clone remains future work.
+
+This is the RAII analogue of Rust: the scope owns its heap values and the
+compiler inserts release calls rather than relying on a garbage collector.
 
 ### Self-compilation status
 
@@ -334,21 +386,23 @@ tables/closures in the native subset.
 it through the self-hosted lexer/parser and native pipeline. Full self-hosting
 is deliberately not claimed yet:
 
-- the Module-6 parser rejects this file's tables, function definitions, and
-  `for` loops;
-- the native scalar backend would reject those nodes even if parsed;
+- the Module-6 parser now accepts array tables and index reads, but still
+  rejects this file's function definitions, keyed/field access, and `for`
+  loops;
+- the native backend would also reject closures/functions and `for` even if
+  the parser accepted them;
 - the Module-5 lexer is character-by-character and is very slow on the full
-  ~50 KiB source.
+  ~70 KiB source.
 
 On success it returns
 `{ok=true, target, source_bytes, image_bytes, image}`. For this file the API
 therefore returns `{ok=false, stage="frontend", error=...}`, with the parser
 diagnostic. If lexing fails first the stage is `"lexer"`; if a future parser
-accepts the source but the scalar emitter cannot lower it, the stage is
-`"backend"`. The integration test exercises both sides of the contract: a tiny supported
-source must produce a PE through `self_compile`, while a tiny unsupported file
-must report the front-end gap without spending minutes in the lexer.
-`verify_fixpoint` and the AST-to-image comparison validate deterministic
+accepts the source but the native emitter cannot lower it, the stage is
+`"backend"`. The integration test exercises both sides of the contract: a tiny
+supported source must produce a PE through `self_compile`, while a tiny
+unsupported file must report the front-end gap without spending minutes in the
+lexer. `verify_fixpoint` and the AST-to-image comparison validate deterministic
 emission on the supported subset.
 
 ### Tests
@@ -360,8 +414,8 @@ emission on the supported subset.
   without re-entering the ownership registry;
 - checks constant folding, false-head `elseif` preservation, constant
   `if`/`while` pruning, dead-code removal, and the memory ABI;
-- rejects an invalid target and an unsupported `Table` node with the documented
-  diagnostics;
+- rejects an invalid target with the documented diagnostic, and verifies that
+  an array `Table` AST node now emits a valid PE;
 - compiles the same seed through `bootstrap` and the AST path and requires the
   same bytes; checks `verify_fixpoint`;
 - exercises `self_compile` on a supported file and on an unsupported file that
@@ -373,13 +427,26 @@ emission on the supported subset.
 - validates ELF class/type/machine/entry/program-header and the single RWX
   `PT_LOAD` segment.
 
+`tests/bootstrap_heap.rs` compiles a dedicated seed and executes its generated
+PE. It covers dynamic concatenation, string and table lifetimes, array tables
+and one-based indexing, nested tables, `if`/`while` scope drops, moves,
+borrows, assignment drops, global heap values, and a nonzero process exit. The
+same seed is emitted as ELF64 and structurally validated (there is no Linux
+runtime in the current test environment).
+
+`tests/parser_compiler_self_hosted.rs` additionally asserts the new `Table`
+and `Index` AST shapes and retains explicit errors for field access and index
+assignment.
+
 ## Extension points
 
-The next stage can add table/field nodes, function prototypes/upvalues, numeric
-and generic `for`, and varargs by extending the AST schema, the parser
-precedence/suffix handling, and the compiler's instruction emission.  The
-native backend needs the corresponding heap/table/closure lowering, actual drop
-insertion at scope exits, and a full-file self-parse before it can replace the
-current scalar subset.  The module-level state design is single-threaded and
-non-reentrant by choice; a future version can thread an explicit
-parser/compiler context table instead.
+The next stage can add keyed/hash tables, field/index assignment, heap `clone`,
+function prototypes/upvalues, numeric and generic `for`, and varargs by
+extending the AST schema, the parser precedence/suffix handling, and the
+compiler's lowering. The heap drop/borrow machinery is already in place for
+owned strings and homogeneous array tables; keyed entries still need hashing,
+key lookup, and the corresponding drop traversal. Full-file self-parse also
+requires functions and `for` before this module can replace the remaining Rust
+stages. The module-level state design is single-threaded and non-reentrant by
+choice; a future version can thread an explicit parser/compiler context table
+instead.

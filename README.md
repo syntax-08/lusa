@@ -51,7 +51,7 @@ See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full toolchain guide
 ```sh
 cargo build             # debug
 cargo build --release   # release turbo (opt-level 3 + LTO) — use this to install
-cargo test              # 60 tests (6 unit + 51 integration + 3 self-hosted)
+cargo test              # 61 tests (6 unit + 51 integration + 4 self-hosted/native bootstrap)
 ```
 
 The resulting binary (`target\release\lusa.exe`) is standalone: **running
@@ -126,7 +126,7 @@ src/
 lexer.lusa                # self-hosted lexer written in Lusa
 parser.lusa               # self-hosted recursive-descent parser
 compiler.lusa             # self-hosted bytecode compiler
-compiler_bootstrap.lusa   # Module-7 optimizer + native PE/ELF emitter
+compiler_bootstrap.lusa   # Modules 7–8 optimizer + heap/native PE/ELF emitter
 docs/SELF_HOSTING.md      # self-hosted front-end and native backend reference
 ```
 
@@ -204,9 +204,8 @@ table, exact byte example, ownership rules and test coverage.
 
 ## Native bootstrap backend (`compiler_bootstrap.lusa`)
 
-Module 7 adds the first native-code stage. It consumes an AST for optimization
-and emits a complete x86_64 executable directly, with no external linker and no
-Rust runtime on the target:
+Modules 7–8 add a native-code stage that emits a complete x86_64 executable
+directly, with no external linker and no Rust runtime on the target:
 
 ```lua
 local ast = Parser.parse(Lexer.lex(source))
@@ -227,29 +226,38 @@ io_write_binary("program.exe", pe)
 - `Compiler.verify_fixpoint(...)` compiles the same source twice and reports
   byte equality plus both images.
 - `Compiler.self_compile(...)` reports the remaining front-end gap honestly:
-  the Module-6 parser is scalar, so it rejects this module's tables/functions/
-  `for` loops and returns `{ok=false, stage="frontend", error=...}`.
+  the parser still rejects function definitions, keyed/field access, and `for`,
+  so full self-compilation returns `{ok=false, stage="frontend", error=...}`.
 
-The accepted native subset is scalar: integers, booleans, `nil`, static
-strings, locals/globals, arithmetic/comparisons/logical operators,
-`if`/`while`/`repeat`/`do`/`return`/`break`, and `print` (the ELF path prints
-static string literals; Windows also formats integers/bools/nil). Tables, closures,
-field/index access, function definitions, numeric/generic `for`, varargs,
-interpolation, floating-point arithmetic, and dynamic string concatenation are
-rejected with `bootstrap:line:column:` diagnostics.
+The native subset now includes heap strings and homogeneous array tables,
+one-based index reads, `#`, dynamic concatenation, and automatic RAII drops:
 
-Windows output is a hand-built PE32+ image importing only `ExitProcess`
-(kernel32) and `printf` (msvcrt); Linux output uses direct `write`/`exit`
-syscalls in an ELF64 with a single RWX load segment. `Compiler.memory_layout()`
-records the planned heap ABI: object headers, table/closure layout, clone and
-borrow rules, and the RAII drop rule (deep-drop at lexical scope exit and before
-slot reuse). The scalar images allocate no heap, so their drop list is empty by
-construction.
+- owned locals are dropped in reverse order at scope exits (including
+  `if`/`while` blocks, `return`, and `break`), and heap globals are dropped at
+  program exit;
+- moving clears the source slot and cancels its drop; borrowing suppresses the
+  owner's move/drop while the alias lives;
+- strings/tables use a 32-byte header and are allocated per object with
+  `VirtualAlloc`/`VirtualFree` on Windows or `mmap`/`munmap` on Linux;
+- table/string drops are recursive, and dynamic concatenation computes the
+  combined length before copying both payloads.
 
-Tests run the same bootstrap pipeline on the interpreter and VM, require
-byte-identical PE/ELF images, execute the generated PE, exercise loops and
-bool/nil printing, exercise `self_compile` on supported and unsupported files,
-and validate the ELF64 headers and RWX load segment without executing it. See
+Keyed/heterogeneous tables, field or index assignment, heap `clone`, closures
+or function definitions, methods, numeric/generic `for`, varargs,
+interpolation, and floating-point arithmetic are rejected with
+`bootstrap:line:column:` diagnostics.
+
+Windows output is a hand-built PE32+ image importing `ExitProcess`,
+`VirtualAlloc`, and `VirtualFree` (kernel32) plus `printf` (msvcrt); Linux output
+uses direct `mmap`/`munmap`/`write`/`exit` syscalls in an ELF64 with a single RWX
+load segment. `Compiler.memory_layout()` documents the object header, table
+payload, allocator, and move/borrow/drop rules.
+
+`tests/bootstrap_native.rs` runs the same bootstrap pipeline on the interpreter
+and VM, requires byte-identical PE/ELF images, executes the generated PE, and
+exercises loops/`print`. `tests/bootstrap_heap.rs` compiles and executes a heap
+seed covering concatenation, tables, nested scope drops, moves, borrows, and
+globals; its ELF output is structurally validated. See
 [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) for the full layout and ABI.
 
 ## Bytecode VM: registers and source lines
@@ -290,9 +298,10 @@ lusalang run main.lusa --vm
 - pcall / coroutines
 - string patterns (gmatch/find with patterns, today literal-only)
 - explicit `move`/`copy` labels and a complete borrow checker
-- full native self-hosting: table/function/`for` parser coverage, a native heap
-  runtime with automatic RAII drops, and self-compilation of the bootstrap
-  module
+- full native self-hosting: keyed/heterogeneous tables, field/index
+  assignment, heap `clone`, closures/functions, and numeric/generic `for`
+  parser coverage, then self-compilation of the bootstrap module (the native
+  heap runtime and RAII drops are already in place)
 - linter-style analysis-time errors (rustc-friendly)
 
 ## License

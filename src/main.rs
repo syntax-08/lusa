@@ -31,7 +31,11 @@ fn main() {
             println!("  (short aliases: lusa [file.lusa] | lusa -e \"<code>\")");
         }
         Some("-v") | Some("--version") | Some("version") => {
-            println!(concat!("lusa ", env!("CARGO_PKG_VERSION"), " (runtime RC2: json + self-update)"));
+            println!(concat!(
+                "lusa ",
+                env!("CARGO_PKG_VERSION"),
+                " (runtime RC3: native heap bootstrap)"
+            ));
         }
         Some("repl") => {
             std::process::exit(repl());

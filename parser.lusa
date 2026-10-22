@@ -42,9 +42,9 @@
 -- Supported statements: local declarations, name assignments, calls, `if`,
 -- `while`, `repeat`, `do`, `return`, `break`.  Expressions cover literals,
 -- names, calls, parentheses, unary and binary operators, `and`/`or`,
--- `clone` and `borrow`.  Table constructors, fields/indexes, methods,
--- functions and numeric/generic `for` are intentionally left as extension
--- points for the next stage.
+-- `clone` and `borrow`, plus array table constructors and integer index
+-- expressions (`t[1]`).  Keyed fields, methods, functions and
+-- numeric/generic `for` remain extension points for the next stage.
 --
 -- Errors use E9000 with a `parser:line:column:` prefix.
 
@@ -658,9 +658,22 @@ parse_suffixes = function(e)
                 line = line,
                 column = column
             }
-        elseif at_value(".") or at_value("[") or at_value(":") then
+        elseif at_value("[") then
+            local line = e.line
+            local column = e.column
+            advance() -- [
+            local index = parse_expr()
+            expect_value("]", "`]`")
+            e = {
+                tag = "Index",
+                table = e,
+                index = index,
+                line = line,
+                column = column
+            }
+        elseif at_value(".") or at_value(":") then
             fail_at(e.line, e.column,
-                "field/index/method access is not supported by this reference parser")
+                "field/method access is not supported by this reference parser")
         else
             return e
         end
@@ -775,7 +788,25 @@ parse_primary = function()
     end
 
     if value == "{" then
-        fail("table constructors are not supported by this reference parser")
+        advance()
+        local items = {}
+        if not at_value("}") then
+            items[#items + 1] = parse_expr()
+            while at_value(",") do
+                advance()
+                if at_value("}") then
+                    break
+                end
+                items[#items + 1] = parse_expr()
+            end
+        end
+        expect_value("}", "`}` to close the table")
+        return {
+            tag = "Table",
+            items = items,
+            line = line,
+            column = column
+        }
     end
     if value == "..." then
         fail("varargs are not supported by this reference parser")

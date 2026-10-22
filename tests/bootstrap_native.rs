@@ -207,12 +207,11 @@ local bad_ast = {
         }}
     }
 }
-local ok_node, err_node = pcall(function()
-    M7Compiler.emit_binary(bad_ast, "windows")
+local ok_node, table_image = pcall(function()
+    return M7Compiler.emit_binary(bad_ast, "windows")
 end)
-assert(ok_node == false)
-assert(string.find(err_node, "native backend does not support AST node Table",
-    1, true) ~= nil)
+assert(ok_node == true)
+assert(table_image[1] == 0x4D and table_image[2] == 0x5A)
 
 local gap_ok, gap_result = pcall(function()
     return M7Compiler.self_compile(clone M7Lexer, clone M7Parser, "windows", "__GAP__")
@@ -324,10 +323,10 @@ fn bootstrap_emits_runnable_pe_and_well_formed_elf_on_both_engines() {
     let feature = base.join("lusa_bootstrap_features.exe");
     // Full self_compile() intentionally exercises the front-end gap.  Use a
     // tiny unsupported source instead of the 50 KiB compiler: the Module-5
-    // lexer is quadratic over long sources, and the parser rejects the table
-    // constructor immediately anyway.
+    // lexer is quadratic over long sources, and the parser still rejects
+    // function definitions and numeric/generic `for`.
     let gap = base.join("lusa_self_compile_gap.lusa");
-    std::fs::write(&gap, "local Compiler = {}\nreturn Compiler\n").expect("write gap source");
+    std::fs::write(&gap, "local function f() end\nreturn 0\n").expect("write gap source");
     let self_ok = base.join("lusa_self_compile_ok.lusa");
     std::fs::write(&self_ok, "print(\"self ok\")\nreturn 0\n").expect("write supported source");
     let exe_path = exe.to_string_lossy().replace('\\', "/");

@@ -344,8 +344,19 @@ local function expect_parser_error(text)
     assert(string.find(err, "parser:1:", 1, true) ~= nil, err)
 end
 
-expect_parser_error("local x = {}")
+local table_ast = M6Parser.parse(M6Lexer.lex("local x = {}"))
+local table_node = table_ast.body[1].values[1]
+assert(table_node.tag == "Table")
+assert(#table_node.items == 0)
+
+local index_ast = M6Parser.parse(M6Lexer.lex("local x = t[1]"))
+local index_node = index_ast.body[1].values[1]
+assert(index_node.tag == "Index")
+local index_table = index_node.table
+assert(index_table.tag == "Name")
+
 expect_parser_error("local x = a.b")
+expect_parser_error("t[1] = 2")
 
 local ok, err = pcall(function()
     local a = M6Parser.parse(M6Lexer.lex(

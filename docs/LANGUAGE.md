@@ -297,3 +297,38 @@ help: `d` no longer holds the value; use `clone d` (copy) or
 - Strings are `Arc<str>` (cheap Clone). Single `RefCell` re-entrancy:
   cloning an alias takes `base` **outside** `with_reg` (documented fix).
 - Max call depth: 200 (E9999 above that).
+
+---
+
+## 9. Native bootstrap subset (experimental)
+
+`compiler_bootstrap.lusa` can emit standalone x86_64 PE32+/ELF64 images without
+the Rust runtime. That native subset is intentionally smaller than the
+interpreter/VM language described above:
+
+- values are signed 64-bit scalars, plus native strings and homogeneous array
+  tables. Strings and tables are pointers to a 32-byte object header at
+  `object-32`; static string literals are non-owned, while dynamic strings and
+  tables are owned and released by the generated RAII code.
+- Native ownership is stricter for strings than the interpreter's Copy model:
+  assigning a string name in a consuming context can move the source slot.
+  Static literals remain safe because their header is marked non-owned.
+- Array tables use `{}`/`{1, 2}` and one-based integer index reads (`t[1]`).
+  `#` works on strings and tables. Table elements must be homogeneous and must
+  own their heap values, so `borrow`/index expressions cannot be table
+  elements.
+- Dynamic string concatenation (`a .. b`) allocates a new owned string. Owned
+  locals, table entries, and globals are deep-dropped at scope exit, on
+  `return`/`break`, and before an assignment overwrites the old value.
+- `move` transfers ownership and clears the source; `borrow` creates a
+  non-owning alias and blocks moving or overwriting the owner until the alias
+  dies. Scalar `clone` is a copy; heap `clone` reports an explicit
+  `bootstrap:line:column:` diagnostic.
+- Not yet supported: keyed table constructors (`{k = v}`), field or method
+  access, assignment through an index/field, heterogeneous tables, closures or
+  function definitions, numeric/generic `for`, varargs, interpolated strings,
+  floating-point arithmetic, and heap cloning.
+
+These limitations apply only to the experimental native emitter. The normal
+`lusalang run` interpreter and `--vm` engine continue to implement the full
+language semantics in the preceding sections.

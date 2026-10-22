@@ -144,7 +144,7 @@ Requires Rust (cargo) ≥ 1.70. Commands, from the project root:
 ```sh
 cargo build             # debug build (fast to compile, slow to run)
 cargo build --release   # release turbo: lto + codegen-units=1 + opt-level=3
-cargo test              # 60 tests (6 unit + 51 integration + 3 self-hosted)
+cargo test              # 61 tests (6 unit + 51 integration + 4 self-hosted/native bootstrap)
 cargo run               # opens the REPL straight from source
 ```
 
@@ -178,6 +178,33 @@ Measure with PowerShell:
 $d = Measure-Command { & .\target\debug\lusa.exe bench.lusa > $null }
 $r = Measure-Command { & .\target\release\lusa.exe bench.lusa > $null }
 ```
+
+### Native bootstrap backend (Modules 7–8)
+
+`compiler_bootstrap.lusa` is an experimental direct-code emitter that runs
+inside the interpreter/VM. It consumes the self-hosted parser AST and writes a
+complete executable image with no external linker:
+
+```lua
+local ast = Parser.parse(Lexer.lex(source))
+local pe = Compiler.emit_binary(borrow ast, "windows")
+io_write_binary("program.exe", pe)
+```
+
+- Windows images are hand-built PE32+ files importing `ExitProcess`,
+  `VirtualAlloc`, `VirtualFree`, and `printf`.
+- Linux images are static ELF64 files using direct `mmap`/`munmap`, `write`,
+  and `exit` syscalls.
+- Module 8 adds heap strings and homogeneous array tables, OS-backed
+  allocation, dynamic concatenation, deep RAII drops at scope exits, and
+  move/borrow tracking. Keyed tables, field/index assignment, heap `clone`,
+  closures/functions, and `for` remain future work.
+- `cargo test --test bootstrap_heap` exercises the generated Windows PE;
+  generated ELF files are structurally validated because the CI host is
+  Windows-only.
+
+This backend is not yet the `lusalang build` command; it is the foundation for
+the standalone native path.
 
 ---
 
