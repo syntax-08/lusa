@@ -164,13 +164,24 @@ impl Parser {
                 self.expect(TK::End, "`end` to close the `do`")?;
                 St { kind: StKind::Do { body }, span: tk.span }
             }
+            TK::Unsafe => {
+                self.bump();
+                // `unsafe do ... end` and the shorter `unsafe ... end` both
+                // work.  The dynamic engines execute the block normally; raw
+                // pointer intrinsics use their simulated-memory builtins.
+                self.eat(TK::Do);
+                let body = self.parse_block()?;
+                self.expect(TK::End, "`end` to close the `unsafe` block")?;
+                St { kind: StKind::Do { body }, span: tk.span }
+            }
             TK::Function => self.parse_func_st()?,
             TK::Break => {
                 self.bump();
                 St { kind: StKind::Break, span: tk.span }
             }
-            TK::Borrow | TK::Clone | TK::LParen | TK::Num(_) | TK::Str(_) | TK::Nil | TK::True
-            | TK::False | TK::Minus | TK::Not | TK::Len | TK::DotDotDot | TK::LBrace => {
+            TK::Borrow | TK::Clone | TK::LParen | TK::Num(_) | TK::Int(_) | TK::Str(_)
+            | TK::Nil | TK::True | TK::False | TK::Minus | TK::Not | TK::Len
+            | TK::DotDotDot | TK::LBrace => {
                 let e = self.parse_expr()?;
                 St { kind: StKind::ExprSt(e), span: tk.span }
             }
@@ -234,6 +245,23 @@ impl Parser {
         Ok(St { kind: StKind::ExprSt(first), span: first_span })
     }
 
+    /// Consumes a runtime-irrelevant type annotation.  The dynamic engines
+    /// deliberately ignore `u32`, `i128`, `[T]`, `table<T>` and friends; the
+    /// C11 backend performs the actual static checking.
+    fn parse_type_annotation(&mut self) -> LResult<()> {
+        if self.eat(TK::LBracket) {
+            self.parse_type_annotation()?;
+            self.expect(TK::RBracket, "`]` to close the table type")?;
+            return Ok(());
+        }
+        let (name, _) = self.expect_name()?;
+        if name == "table" && self.eat(TK::Lt) {
+            self.parse_type_annotation()?;
+            self.expect(TK::Gt, "`>` to close the table type")?;
+        }
+        Ok(())
+    }
+
     fn parse_local_st(&mut self) -> LResult<St> {
         let kw = self.bump();
         if self.at(TK::Function) {
@@ -247,9 +275,15 @@ impl Parser {
             });
         }
         let (n0, _) = self.expect_name()?;
+        if self.eat(TK::Colon) {
+            self.parse_type_annotation()?;
+        }
         let mut targets = vec![n0];
         while self.eat(TK::Comma) {
             let (n, _) = self.expect_name()?;
+            if self.eat(TK::Colon) {
+                self.parse_type_annotation()?;
+            }
             targets.push(n);
         }
         let mut values = Vec::new();
@@ -380,6 +414,9 @@ impl Parser {
                     break;
                 }
                 let (n, _) = self.expect_name()?;
+                if self.eat(TK::Colon) {
+                    self.parse_type_annotation()?;
+                }
                 params.push(n);
                 if !self.eat(TK::Comma) {
                     break;
@@ -387,6 +424,9 @@ impl Parser {
             }
         }
         self.expect(TK::RParen, "`)`")?;
+        if self.eat(TK::Colon) {
+            self.parse_type_annotation()?;
+        }
         let body = self.parse_block()?;
         let end = self.expect(TK::End, "`end` to close the `function`")?;
         Ok(FuncLit { params, has_vararg, body, span_body: end.span })
@@ -556,6 +596,7 @@ impl Parser {
             TK::True => ExprKind::True,
             TK::False => ExprKind::False,
             TK::Num(n) => ExprKind::Num(n),
+            TK::Int(s) => ExprKind::Int(s),
             TK::Str(segs) => self.parse_str_segs(segs, tk.span)?,
             TK::DotDotDot => ExprKind::Vararg,
             TK::Name(n) => ExprKind::Var(Box::new(n)),

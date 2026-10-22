@@ -66,6 +66,8 @@ pub enum ExprKind {
     True,
     False,
     Num(f64),
+    /// Exact pure-integer literal (decimal or `0x` hex digits preserved).
+    Int(String),
     Str(Vec<StrAstSeg>),
     /// plain variable / global
     Var(Box<String>),

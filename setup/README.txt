@@ -16,9 +16,10 @@ Build Tools and run:
    lusalang build myproject\main.lusa
 
 `lusalang build --emit-c` writes the portable C11 intermediate instead. The
-interpreter and `--vm` never need a C compiler. Unsafe hardware access uses
-`unsafe do ... end` + unsafe_ptr_cast/unsafe_read_mem/unsafe_write_mem and is
-only available through `lusalang build` / `run --native`.
+interpreter and `--vm` never need a C compiler. Typed code and
+`unsafe do ... end` blocks also run there; unsafe memory operations are
+safely simulated. Use `lusalang build` / `run --native` for real volatile
+hardware access.
 
 If you prefer NOT to install (portable mode): just run lusa.exe directly
 from the unzipped folder, without touching the PATH:

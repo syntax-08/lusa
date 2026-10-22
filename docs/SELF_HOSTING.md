@@ -154,6 +154,30 @@ conditions, table elements, and operator operands. Errors use Cargo-style
 The checker annotates the optimized AST with `ctype`, `own`, `borrowed`, and
 `moved` so the emitter never guesses.
 
+### Exact integer literals
+
+The self-hosted lexer stores a separate `int` field on pure integer tokens with
+the original decimal or `0x` spelling. The parser carries it on `Number` nodes,
+and the emitter lowers large i128 values through a runtime parser:
+
+```c
+static lusa_i128 lusa_i128_parse(const char *text);
+```
+
+```lusa
+local big: i128 = 123456789012345678901234567890
+```
+
+```c
+static const char lusa_int_1[] = "123456789012345678901234567890";
+lusa_i128 init = lusa_i128_parse(lusa_int_1);
+```
+
+Floating literals remain `f64`/`f32` values. The Rust lexer uses the same
+split (`TokenKind::Int(String)` vs `TokenKind::Num(f64)`), so the dynamic
+engines still run, while the C11 pipeline preserves every bit up to
+`__int128`.
+
 ### Unsafe blocks and raw pointers
 
 `unsafe do ... end` is a lexical block that disables the checker's
@@ -178,9 +202,14 @@ uint32_t read = (*(volatile uint32_t *)(uintptr_t)(v));
 ```
 
 Intrinsics (`unsafe_ptr_cast`, `unsafe_read_mem`, `unsafe_write_mem`) are
-rejected outside an unsafe block with `E0316`. They perform no bounds checks or
-memory sandboxing: the caller is responsible for using valid hardware or
-process addresses.
+rejected outside an unsafe block with `E0316` by the C backend. They perform no
+bounds checks or memory sandboxing: the caller is responsible for using valid
+hardware or process addresses.
+
+The interpreter and bytecode VM implement the same names as safe builtins over
+a process-local `HashMap<u64, u32>`. `lusalang run` and `lusalang run --vm`
+therefore simulate register writes/reads without dereferencing memory; the
+`build`/`run --native` path emits the volatile pointer access shown above.
 
 ### C runtime and heap ABI
 
@@ -262,7 +291,9 @@ necessary.
 
 `tests/parser_compiler_self_hosted.rs` continues to validate the bytecode
 compiler on the shared parser. `tests/lexer_self_hosted.rs` validates token
-locations and literals.
+locations, exact integer fields, and literals. `tests/module9.rs` checks typed
+annotations and unsafe simulation on both dynamic engines, plus exact integer
+AST tokens.
 
 ### Current limits
 
@@ -270,7 +301,9 @@ The C emitter supports the typed subset above, not the full dynamic language:
 keyed constructors, field/method access, assignment through an index/field,
 heterogeneous tables, numeric/generic `for`, varargs, interpolated strings, and
 closures/nested functions are rejected with diagnostics. The dynamic
-interpreter and bytecode VM remain the complete-language engines.
+interpreter and bytecode VM remain the complete-language engines; they accept
+typed/`unsafe` source but use f64 arithmetic and simulated memory, so exact
+128-bit arithmetic is a C11-backend feature.
 
 ## Extension points
 

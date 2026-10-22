@@ -88,6 +88,23 @@ fn strings_with_quotes_and_newlines_are_encoded_safely() {
 }
 
 #[test]
+fn exact_i128_literals_use_the_digit_string_parser() {
+    let decimal = "123456789012345678901234567890";
+    let hex = "0x1FFFFFFFFFFFFFFFFFFFFFFFF";
+    let c = emit(&format!(
+        "local a: i128 = {decimal}\n\
+         local b: i128 = {hex}\n\
+         local c: i128 = -{decimal}\n\
+         print(a, b, c)\n\
+         return 0\n"
+    ));
+    assert_has(&c, "lusa_i128_parse(");
+    assert_has(&c, decimal);
+    assert_has(&c, hex);
+    assert!(!c.contains(&format!("(lusa_i128){decimal}")));
+}
+
+#[test]
 fn unsafe_block_emits_volatile_pointer_access() {
     let c = emit(
         "unsafe do\n\
@@ -125,6 +142,42 @@ fn type_errors_use_cargo_style_diagnostics() {
     assert!(err.contains("--> lusa:1:"), "diagnostic: {err}");
     assert!(err.contains("expected `u32`"), "diagnostic: {err}");
     assert!(err.contains("found    `string`"), "diagnostic: {err}");
+}
+
+#[test]
+fn native_i128_literal_is_bit_exact_when_the_compiler_has_int128() {
+    let compiler = match cbackend::find_compiler(None) {
+        Ok(cc) => cc,
+        Err(e) => {
+            eprintln!("skipping native i128 test: {e}");
+            return;
+        }
+    };
+    if compiler.kind != cbackend::CompilerKind::Gnu
+        || compiler.display_name().to_ascii_lowercase().contains("tcc")
+    {
+        eprintln!(
+            "skipping native i128 test: {} does not provide __int128",
+            compiler.display_name()
+        );
+        return;
+    }
+
+    let out_dir = std::env::temp_dir().join("opencode");
+    std::fs::create_dir_all(&out_dir).expect("temp dir");
+    let exe = out_dir.join(format!("lusa-i128-{}.exe", std::process::id()));
+    let _ = std::fs::remove_file(&exe);
+    let decimal = "123456789012345678901234567890";
+    let source = format!(
+        "local big: i128 = {decimal}\nprint(big)\nreturn 0\n"
+    );
+    cbackend::build(&source, &exe, None)
+        .unwrap_or_else(|e| panic!("native i128 build failed:\n{e}"));
+    let run = Command::new(&exe).output().expect("run i128 executable");
+    let _ = std::fs::remove_file(&exe);
+    assert!(run.status.success(), "i128 executable failed: {run:?}");
+    let stdout = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+    assert_eq!(stdout, format!("{decimal}\n"));
 }
 
 #[test]

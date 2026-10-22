@@ -91,6 +91,17 @@ local function node_float(expr)
     return expr.float == true or not is_integer(expr.value)
 end
 
+-- Literals above the f64 exact-integer range must not be folded: the C
+-- emitter keeps their original digit string for an exact lusa_i128.
+local function exact_big_int(expr)
+    if expr == nil or expr.tag ~= "Number" or expr.int == nil then
+        return false
+    end
+    -- 15 decimal digits always fit in f64's exact-integer range; any longer
+    -- literal (or a hex spelling with the same length) is kept unfolded.
+    return #expr.int > 15
+end
+
 -- =========================================================================
 -- AST optimizer (ownership: every helper consumes its node argument)
 -- =========================================================================
@@ -110,24 +121,9 @@ local function opt_expr(expr)
     end
 
     if tag == "Unary" then
-        local op = expr.op
-        local value = opt_expr(expr.value)
-        if op == "-" and value.tag == "Number" then
-            return number_node(-value.value, line, column, node_float(value))
-        end
-        if op == "not" and value.tag == "Bool" then
-            return bool_node(not value.value, line, column)
-        end
-        if op == "not" and value.tag == "Nil" then
-            return bool_node(true, line, column)
-        end
-        if op == "#" and value.tag == "String" then
-            return number_node(#value.value, line, column, false)
-        end
-        return {
-            tag = "Unary", op = op, value = value,
-            line = line, column = column
-        }
+        -- Do not rewrite unary nodes: exact integer literals must retain their
+        -- `int` spelling, and the checker/emitter handle `-`, `not` and `#`.
+        return expr
     end
 
     if tag == "Binary" then
@@ -135,7 +131,8 @@ local function opt_expr(expr)
         local lhs = opt_expr(expr.lhs)
         local rhs = opt_expr(expr.rhs)
 
-        if lhs.tag == "Number" and rhs.tag == "Number" then
+        if lhs.tag == "Number" and rhs.tag == "Number"
+            and not exact_big_int(lhs) and not exact_big_int(rhs) then
             local a = lhs.value
             local b = rhs.value
             local float_kind = node_float(lhs) or node_float(rhs)
@@ -579,12 +576,12 @@ local function coerce_literal(expr, target)
         return nil
     end
     if expr.tag == "Paren" then
-        coerce_literal(expr.value, target)
+        expr.value = coerce_literal(expr.value, target)
         expr.ctype = target
         return expr
     end
     if expr.tag == "Unary" and expr.op == "-" then
-        coerce_literal(expr.value, target)
+        expr.value = coerce_literal(expr.value, target)
         expr.ctype = target
         return expr
     end
@@ -870,11 +867,16 @@ check_expr = function(expr)
     end
 
     if tag == "Number" then
-        local is_float = expr.float == true or not is_integer(expr.value)
+        local exact_int = expr.int
+        local numeric_value = expr.value
+        local is_float = expr.float == true
+        if exact_int == nil then
+            is_float = is_float or not is_integer(numeric_value)
+        end
         if is_float then
             expr.ctype = "f32"
         else
-            if not integer_fits("i32", expr.value) then
+            if not integer_fits("i32", numeric_value) then
                 expr.ctype = "i128"
             else
                 expr.ctype = "i32"
@@ -913,35 +915,40 @@ check_expr = function(expr)
     end
 
     if tag == "Unary" then
-        local checked_operand, operand = check_expr(expr.value)
-        expr.value = checked_operand
-        if expr.op == "not" then
+        local op = expr.op
+        local operand_node = clone expr
+        local checked_operand, operand = check_expr(operand_node.value)
+        local result = {
+            tag = "Unary", op = op, value = checked_operand,
+            line = line, column = column
+        }
+        if op == "not" then
             if operand ~= "bool" then
                 check_mismatch(line, column, "unary `not`", "bool", operand)
             end
-            expr.ctype = "bool"
-            return expr, "bool"
+            result.ctype = "bool"
+            return result, "bool"
         end
-        if expr.op == "#" then
+        if op == "#" then
             if operand ~= "string" and table_element(operand) == nil then
                 type_fail("E0308", line, column,
                     "the length operator requires a string or table",
                     "string | table", operand)
             end
-            expr.ctype = "i32"
-            return expr, "i32"
+            result.ctype = "i32"
+            return result, "i32"
         end
-        if expr.op == "-" then
+        if op == "-" then
             if not is_numeric(operand) or operand == "u32" then
                 type_fail("E0308", line, column,
                     "unary `-` requires a signed numeric value",
                     "i32 | i128 | f32", operand)
             end
-            expr.ctype = operand
-            return expr, operand
+            result.ctype = operand
+            return result, operand
         end
         type_fail("E0312", line, column,
-            "unsupported unary operator `" .. tostring(expr.op) .. "`")
+            "unsupported unary operator `" .. tostring(op) .. "`")
     end
 
     if tag == "Binary" then
@@ -1503,6 +1510,8 @@ local emit_functions = {}
 local emit_function_cnames = {}
 local emit_strings = {}
 local emit_string_ids = {}
+local emit_ints = {}
+local emit_int_ids = {}
 local emit_loop_stack = {}
 local emit_is_main = false
 local emit_return_type = "i32"
@@ -1519,6 +1528,8 @@ local function reset_emitter()
     emit_function_cnames = {}
     emit_strings = {}
     emit_string_ids = {}
+    emit_ints = {}
+    emit_int_ids = {}
     emit_loop_stack = {}
     emit_is_main = false
     emit_return_type = "i32"
@@ -1819,6 +1830,25 @@ local RUNTIME = {
     "#define LUSA_HAS_INT128 0",
     "#endif",
     "",
+    "/* Exact decimal/hex i128 literal parser.  The lexer keeps the original",
+    "   digits, avoiding an f64 round-trip above 2^53. */",
+    "static lusa_i128 lusa_i128_parse(const char *text) {",
+    "    const char *p = text;",
+    "    lusa_i128 value = 0;",
+    "    int base = 10;",
+    "    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; p += 2; }",
+    "    while (*p != 0) {",
+    "        int digit;",
+    "        if (*p >= '0' && *p <= '9') digit = (int)(*p - '0');",
+    "        else if (*p >= 'a' && *p <= 'f') digit = (int)(*p - 'a') + 10;",
+    "        else if (*p >= 'A' && *p <= 'F') digit = (int)(*p - 'A') + 10;",
+    "        else break;",
+    "        value = value * (lusa_i128)base + (lusa_i128)digit;",
+    "        p++;",
+    "    }",
+    "    return value;",
+    "}",
+    "",
     "static void lusa_panic(const char *message) {",
     "    fflush(stdout);",
     '    fputs("lusa runtime: ", stderr);',
@@ -2100,6 +2130,15 @@ local function add_string(value)
     end
 end
 
+local function add_int(value)
+    if emit_int_ids[value] == nil then
+        local id = #emit_ints + 1
+        local key = value
+        emit_ints[id] = value
+        emit_int_ids[key] = id
+    end
+end
+
 local collect_strings_expr
 local collect_strings_block
 
@@ -2110,6 +2149,12 @@ collect_strings_expr = function(expr)
     local tag = expr.tag
     if tag == "String" then
         add_string(expr.value)
+        return
+    end
+    if tag == "Number" then
+        if expr.int ~= nil then
+            add_int(expr.int)
+        end
         return
     end
     if tag == "Paren" or tag == "Unary" or tag == "Clone" or tag == "Borrow" then
@@ -2219,6 +2264,18 @@ local function emit_static_strings()
     end
 end
 
+local function emit_static_ints()
+    local i = 1
+    while i <= #emit_ints do
+        line('static const char lusa_int_' .. tostring(i)
+            .. '[] = "' .. emit_ints[i] .. '";')
+        i = i + 1
+    end
+    if #emit_ints > 0 then
+        line("")
+    end
+end
+
 -- ---- expression lowering -------------------------------------------------
 
 local function format_integer(value)
@@ -2239,8 +2296,12 @@ end
 local emit_expr
 
 local function emit_number(expr)
+    local exact_int = expr.int
+    local literal_float = expr.float == true
     local value = expr.value
     local type_name = expr.ctype
+    local line_number = expr.line
+    local column_number = expr.column
     if type_name == "f32" then
         if is_integer(value) then
             return "((float)" .. format_integer(value) .. ")"
@@ -2251,6 +2312,16 @@ local function emit_number(expr)
         return "((uint32_t)" .. format_integer(value) .. ")"
     end
     if type_name == "i128" then
+        -- Pure integer literals carry their exact decimal/hex spelling; never
+        -- round-trip them through f64 (the IEEE-754 precision limit).
+        if exact_int ~= nil and not literal_float then
+            local id = emit_int_ids[exact_int]
+            if id == nil then
+                fail(line_number, column_number,
+                    "internal: exact integer literal was not collected")
+            end
+            return "lusa_i128_parse(lusa_int_" .. tostring(id) .. ")"
+        end
         return "((lusa_i128)" .. format_integer(value) .. ")"
     end
     return "((int32_t)" .. format_integer(value) .. ")"
@@ -3002,6 +3073,7 @@ local function emit_c_impl(ast)
     end
     put("")
     emit_static_strings()
+    emit_static_ints()
     emit_globals_declarations()
     emit_function_prototypes()
 
@@ -3050,7 +3122,7 @@ function Compiler.memory_layout()
         move_rule = "the destination takes the pointer, the source slot is cleared, and the source drop is cancelled",
         borrow_rule = "no allocation and no drop; the alias is only valid while the owner lives",
         clone_rule = "deep clone for strings and tables; scalar clone is a copy",
-        unsafe = {
+        ["unsafe"] = {
             block = "`unsafe do ... end`; disables the local borrow-assignment rule",
             pointer_cast = "unsafe_ptr_cast(address) -> i128 (C uintptr_t)",
             read_mem = "unsafe_read_mem(address) -> u32",

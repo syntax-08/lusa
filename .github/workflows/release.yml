@@ -93,15 +93,24 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Validate curated release notes
+        shell: bash
+        run: |
+          notes=".github/release-notes/${GITHUB_REF_NAME}.md"
+          test -s "$notes"
+          grep -Fq "## Introdução de Impacto" "$notes"
+          grep -Fq "## Mapeamento de Features" "$notes"
+          grep -Fq "## Como Usar" "$notes"
       - name: List assets
         run: ls -lh dist
       - name: Create or update release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: .github/release-notes/${{ github.ref_name }}.md
           files: dist/*
-          generate_release_notes: true
           fail_on_unmatched_files: true

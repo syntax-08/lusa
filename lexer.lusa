@@ -296,10 +296,11 @@ function Lexer.lex(source)
         end
     end
 
-    local function emit(kind, value, line, column, start_pos, finish_pos)
+    local function emit(kind, value, line, column, start_pos, finish_pos, int_text)
         tokens[#tokens + 1] = {
             kind = kind,
             value = value,
+            int = int_text,
             line = line,
             column = column,
             start = start_pos,
@@ -542,7 +543,8 @@ function Lexer.lex(source)
             while is_hex_digit(peek(0)) do
                 advance()
             end
-            emit("number", slice(start_pos, self.pos - 1), line, column, start_pos, self.pos - 1)
+            local raw = slice(start_pos, self.pos - 1)
+            emit("number", raw, line, column, start_pos, self.pos - 1, raw)
             return
         end
 
@@ -550,8 +552,10 @@ function Lexer.lex(source)
             advance()
         end
 
+        local is_float = false
         if peek(0) == "." then
             if is_digit(peek(1)) then
+                is_float = true
                 advance()
                 while is_digit(peek(0)) do
                     advance()
@@ -583,6 +587,7 @@ function Lexer.lex(source)
             end
 
             if is_digit(peek(digit_offset)) then
+                is_float = true
                 advance() -- e/E
                 if has_sign then
                     advance()
@@ -593,7 +598,12 @@ function Lexer.lex(source)
             end
         end
 
-        emit("number", slice(start_pos, self.pos - 1), line, column, start_pos, self.pos - 1)
+        local text = slice(start_pos, self.pos - 1)
+        local int_text = nil
+        if is_float == false then
+            int_text = text
+        end
+        emit("number", text, line, column, start_pos, self.pos - 1, int_text)
     end
 
     local function scan_string(quote)

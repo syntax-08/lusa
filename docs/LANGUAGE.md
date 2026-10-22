@@ -56,9 +56,9 @@ local grid: [[i32]] = {{1, 2}, {3, 4}}
 ```
 
 An `undefined global` reads `nil` (Lua-forgiving). Moved slots follow the
-rule in section 5. Type annotations are enforced by `lusalang build` and
-`lusalang check --typed`; the dynamic interpreter and `--vm` remain
-untyped/Lua-compatible.
+rule in section 5. Type annotations are accepted by the interpreter and the
+bytecode VM too, but ignored at runtime; `lusalang build` and
+`lusalang check --typed` enforce them statically before emitting C11.
 
 ---
 
@@ -342,9 +342,12 @@ end
 | untyped integer literal | inferred as `i32` |
 | untyped decimal literal | inferred as `f32` |
 
-Lusa numbers are currently stored as `f64`, so `i128` constants are exact up
-to 2^53. Wider constants need runtime arithmetic (or a future integer-literal
-lexer); this does not limit the generated C `__int128` type itself.
+Pure integer literals keep their original decimal or hexadecimal spelling in
+the token/AST stream. The C11 backend passes that text to
+`lusa_i128_parse("...")`, so constants above 2^53 retain all bits up to
+`__int128`. The dynamic interpreter/VM still expose numbers as `f64` for
+Lua-compatible arithmetic; use `build`/`run --native` when exact 128-bit
+literals matter.
 
 The checker runs before emission. Incompatible assignments, returns, calls,
 conditions and table elements stop compilation with Cargo-style diagnostics:
@@ -381,9 +384,20 @@ uint32_t read = (*(volatile uint32_t *)(uintptr_t)(v));
 
 `unsafe_ptr_cast(address) -> i128` (a `uintptr_t` in C),
 `unsafe_read_mem(address) -> u32`, and `unsafe_write_mem(address, value)` are
-rejected outside an `unsafe` block with `E0316`. Use these only with addresses
-that are valid on the target board/process; the C backend intentionally does
-not add bounds checks or a memory sandbox.
+rejected outside an `unsafe` block with `E0316` in the C backend. Use these
+only with addresses that are valid on the target board/process; the native
+backend intentionally does not add bounds checks or a memory sandbox.
+
+The interpreter and `--vm` give the same source a **safe simulation**: the
+intrinsics read/write a process-local `HashMap<address, u32>` and never
+dereference real memory. This lets developers test register logic before
+compiling:
+
+```sh
+lusalang run hardware_test.lusa
+lusalang run hardware_test.lusa --vm
+lusalang build hardware_test.lusa   # real volatile access
+```
 
 ### 9.3 Heap ABI and RAII
 

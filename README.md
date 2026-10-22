@@ -4,7 +4,9 @@
 `std`, zero dependencies), with an optional twist of **Rust-style ownership**
 — value moves, borrows and clones with **cargo-style diagnostics**. Module 8.5
 adds a typed C11 backend (`u32`/`i32`/`i128`/`f32`), RAII drops, host-toolchain
-native builds, and `unsafe` volatile access for hardware registers.
+native builds, and `unsafe` volatile access for hardware registers. Module 9
+brings the same typed/`unsafe` surface to the interpreter and bytecode VM
+(with safe simulated memory), plus exact `i128` integer literals.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -134,6 +136,7 @@ parser.lusa               # self-hosted recursive-descent parser (typed subset)
 compiler.lusa             # self-hosted bytecode compiler
 compiler_bootstrap.lusa   # Module 8.5 optimizer + checker + C11 emitter
 docs/SELF_HOSTING.md      # self-hosted front-end and C11 backend reference
+docs/RELEASE_NOTES.md     # release-notes structure enforced by CI
 ```
 
 Pipeline:
@@ -244,6 +247,12 @@ Untyped integer literals infer `i32`; untyped decimal literals infer `f32`.
 The checker runs before emission and aborts with Cargo-style diagnostics such as
 `error[E0308]: mismatched types ... --> lusa:1:16`.
 
+Pure integer tokens keep their exact spelling. A literal such as
+`123456789012345678901234567890` is emitted as
+`lusa_i128_parse("123456789012345678901234567890")`, preserving all 128 bits
+instead of passing through `f64`. GCC/Clang provide full `__int128`; MSVC's
+fallback is 64-bit.
+
 ### Heap and RAII
 
 `Compiler.memory_layout()` is the ABI source of truth:
@@ -268,9 +277,11 @@ unsafe do
 end
 ```
 
-This lowers to `*(volatile uint32_t *)(uintptr_t)address = value`. The raw
-intrinsics are rejected outside an `unsafe` block (`E0316`). The caller is
-responsible for valid addresses; the backend deliberately does no memory
+This lowers to `*(volatile uint32_t *)(uintptr_t)address = value` in native
+builds. The raw intrinsics are rejected outside an `unsafe` block (`E0316`) by
+the C backend. The interpreter and `--vm` instead use a safe simulated-memory
+map, so the same script can be tested without touching hardware. Native
+execution requires valid addresses; the backend deliberately does no memory
 sandboxing or bounds checks.
 
 ### Host compiler discovery
@@ -282,8 +293,8 @@ found, the interpreter and bytecode VM still work; only `build`/`run --native`
 require a C toolchain.
 
 Runnable examples: `examples/typed_native.lusa` (build/run) and
-`examples/unsafe_hardware.lusa` (compile-only; replace the illustrative MMIO
-address before running).
+`examples/unsafe_hardware.lusa` (simulated memory in `run`/`--vm`; replace the
+illustrative MMIO address before native execution).
 
 `tests/c_backend.rs` covers typed mapping, functions/tables, moves/clone/drops,
 Cargo-style diagnostics, unsafe volatile emission, and a native build/run test

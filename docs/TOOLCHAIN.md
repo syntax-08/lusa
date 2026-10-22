@@ -203,8 +203,14 @@ The intermediate C file contains:
 - `LusaString`/`LusaTable` structs with a 32-byte `LusaObj` header;
 - `malloc`/`calloc`/`realloc`/`free` allocation and deep RAII drops;
 - `uint32_t`, `int32_t`, `lusa_i128`, and `float` numeric mappings;
+- exact integer literals lowered through `lusa_i128_parse("...")` so digits
+  above 2^53 are not rounded by f64;
 - `unsafe do ... end` lowered to `*(volatile uint32_t *)(uintptr_t)address`
   reads/writes for registers and memory-mapped hardware.
+
+The interpreter and `--vm` now accept the same typed and `unsafe` source.
+They ignore annotations at runtime and simulate raw memory with an isolated
+address map, so hardware test logic can be exercised before a native build.
 
 Compiler discovery order is `--cc`, `LUSA_CC`, `CC`, `PATH`
 (`cc`/`gcc`/`clang`/`tcc`/`cl`), then Visual Studio via `vswhere.exe`. GCC,
@@ -217,6 +223,14 @@ toolchain.
 The old PE32+/ELF64 image emitter and its `emit_binary` API were removed. See
 [`SELF_HOSTING.md`](SELF_HOSTING.md) for the compiler architecture and
 [`LANGUAGE.md`](LANGUAGE.md) section 9 for the typed/unsafe language surface.
+
+### Release notes
+
+From v0.5.0 onward, `.github/workflows/release.yml` publishes a curated body
+from `.github/release-notes/<tag>.md` instead of an auto-generated commit list.
+The publish job validates the presence of **Introdução de Impacto**,
+**Mapeamento de Features**, and **Como Usar** before creating the release.
+See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the policy and template.
 
 ---
 

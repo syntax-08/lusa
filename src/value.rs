@@ -327,6 +327,22 @@ impl Value {
     }
 }
 
+/// Converts an exact integer token (`123...` or `0x...`) to the dynamic
+/// runtime's f64 representation.  The C11 backend uses the original string
+/// instead, preserving all 128 bits.
+pub fn int_literal_to_f64(text: &str) -> f64 {
+    if let Some(hex) = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+    {
+        u128::from_str_radix(hex, 16)
+            .map(|v| v as f64)
+            .unwrap_or(f64::INFINITY)
+    } else {
+        text.parse::<f64>().unwrap_or(f64::INFINITY)
+    }
+}
+
 /// Formats a number the Lua way: integral values without decimals.
 pub fn format_number(n: f64) -> String {
     if n.is_nan() {

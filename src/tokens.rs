@@ -14,7 +14,11 @@ pub enum StrSeg {
 pub enum TokenKind {
     // literals
     Name(String),
+    /// Floating-point literal (or a numeric token that must be treated as f64).
     Num(f64),
+    /// Exact pure-integer literal.  The digits are kept verbatim so the C11
+    /// backend can emit an exact `i128` instead of round-tripping through f64.
+    Int(String),
     Str(Vec<StrSeg>),
     Nil,
     True,
@@ -33,6 +37,7 @@ pub enum TokenKind {
     While,
     Repeat,
     Until,
+    Unsafe,
     Return,
     Break,
     And,
@@ -82,6 +87,7 @@ impl Token {
         match &self.kind {
             TokenKind::Name(n) => format!("name `{}`", n),
             TokenKind::Num(n) => format!("number `{}`", crate::value::format_number(*n)),
+            TokenKind::Int(s) => format!("integer `{s}`"),
             TokenKind::Str(_) => "string literal".into(),
             TokenKind::Nil => "nil".into(),
             TokenKind::True => "true".into(),
@@ -99,6 +105,7 @@ impl Token {
             TokenKind::While => "`while`".into(),
             TokenKind::Repeat => "`repeat`".into(),
             TokenKind::Until => "`until`".into(),
+            TokenKind::Unsafe => "`unsafe`".into(),
             TokenKind::Return => "`return`".into(),
             TokenKind::Break => "`break`".into(),
             TokenKind::And => "`and`".into(),

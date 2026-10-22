@@ -32,7 +32,8 @@
 --
 --   Nil      { tag = "Nil" }
 --   Bool     { tag = "Bool", value = true | false }
---   Number   { tag = "Number", value = number, float = bool }
+--   Number   { tag = "Number", value = number, int = exact-text|nil,
+--              float = bool }
 --   String   { tag = "String", value = decoded text, raw = source text,
 --              interpolated = bool }
 --   Name     { tag = "Name", name = string }
@@ -840,6 +841,7 @@ parse_primary = function()
     local column = peek_column()
 
     if kind == "number" then
+        local int_text = tokens[pos].int
         advance()
         local is_float = false
         if string.find(value, ".", 1, true) ~= nil then
@@ -854,6 +856,7 @@ parse_primary = function()
         return {
             tag = "Number",
             value = parse_number(value, line, column),
+            int = int_text,
             float = is_float,
             line = line,
             column = column

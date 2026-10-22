@@ -678,6 +678,7 @@ fn scalar_of(e: &Expr) -> Value {
         ExprKind::True => Value::Bool(true),
         ExprKind::False => Value::Bool(false),
         ExprKind::Num(n) => Value::Number(*n),
+        ExprKind::Int(text) => Value::Number(crate::value::int_literal_to_f64(text)),
         _ => unreachable!("scalar_of on non-literal"),
     }
 }
@@ -689,7 +690,7 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
     // which is exactly the node that sets the line on entry.
     c.set_line(e.span);
     match &e.kind {
-        ExprKind::Nil | ExprKind::True | ExprKind::False | ExprKind::Num(_) => {
+        ExprKind::Nil | ExprKind::True | ExprKind::False | ExprKind::Num(_) | ExprKind::Int(_) => {
             let k = c.konst(&ConstKey::of(&scalar_of(e)));
             c.em(Instr::LoadConst(k));
         }

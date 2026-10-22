@@ -423,6 +423,9 @@ fn compile_c_file(
                     // and LIB.  Run the matching vcvars script first.
                     let bat = workdir.join("lusa-msvc.bat");
                     let mut text = String::from("@echo off\r\n");
+                    // The batch file is UTF-8; switch cmd's code page so
+                    // non-ASCII project paths reach cl.exe/link.exe intact.
+                    text.push_str("chcp 65001 >nul\r\n");
                     text.push_str(&format!("call \"{}\"", script.display()));
                     if script
                         .file_name()

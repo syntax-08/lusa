@@ -64,6 +64,38 @@ fn b_print(i: &mut Interp, args: Vec<Value>, _span: Span) -> LResult<Vec<Value>>
     Ok(Vec::new())
 }
 
+// ===== safe unsafe-block simulation =====
+
+fn mem_addr(args: &[Value], span: Span) -> LResult<u64> {
+    let n = need_num(get(args, 0, "address", span)?, "address", span)?;
+    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
+        return Err(LusaError::new(
+            E_NUM,
+            Some(span),
+            "unsafe memory address must be a non-negative integer",
+        ));
+    }
+    Ok(n as u64)
+}
+
+fn b_unsafe_ptr_cast(_i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    let addr = mem_addr(&args, span)?;
+    one(Value::Number(addr as f64))
+}
+
+fn b_unsafe_write_mem(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    let addr = mem_addr(&args, span)?;
+    let value = need_num(get(&args, 1, "value", span)?, "value", span)? as u32;
+    i.unsafe_mem.insert(addr, value);
+    Ok(Vec::new())
+}
+
+fn b_unsafe_read_mem(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    let addr = mem_addr(&args, span)?;
+    let value = i.unsafe_mem.get(&addr).copied().unwrap_or(0);
+    one(Value::Number(value as f64))
+}
+
 /// `io_read_file(path)`: reads a UTF-8 text file and returns its contents.
 ///
 /// This is the native I/O primitive used by the self-hosted compiler pipeline.
@@ -474,6 +506,9 @@ pub fn all() -> Vec<(&'static str, BF)> {
         ("pcall", Box::new(b_pcall)),
         ("pairs", Box::new(b_pairs)),
         ("ipairs", Box::new(b_ipairs)),
+        ("unsafe_ptr_cast", Box::new(b_unsafe_ptr_cast)),
+        ("unsafe_write_mem", Box::new(b_unsafe_write_mem)),
+        ("unsafe_read_mem", Box::new(b_unsafe_read_mem)),
         ("io_read_file", Box::new(b_io_read_file)),
         ("io_write_binary", Box::new(b_io_write_binary)),
         ("io_read_binary", Box::new(b_io_read_binary)),

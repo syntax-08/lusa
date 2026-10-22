@@ -25,6 +25,7 @@ const KEYWORDS: &[(&str, TokenKind)] = &[
     ("while", TokenKind::While),
     ("repeat", TokenKind::Repeat),
     ("until", TokenKind::Until),
+    ("unsafe", TokenKind::Unsafe),
     ("return", TokenKind::Return),
     ("break", TokenKind::Break),
     ("and", TokenKind::And),
@@ -41,6 +42,8 @@ struct Lexer {
     chars: Vec<char>,
     pos: usize,
     last_num: Option<f64>,
+    /// Exact digits when the last scanned number was a pure integer.
+    last_int: Option<String>,
 }
 
 pub fn is_name_start(c: char) -> bool {
@@ -60,6 +63,7 @@ impl Lexer {
             chars,
             pos: 0,
             last_num: None,
+            last_int: None,
         }
     }
 
@@ -73,6 +77,14 @@ impl Lexer {
         let c = self.peek();
         self.pos += 1;
         c
+    }
+
+    fn take_number(&mut self) -> TokenKind {
+        if let Some(text) = self.last_int.take() {
+            TokenKind::Int(text)
+        } else {
+            TokenKind::Num(self.last_num.take().unwrap_or(0.0))
+        }
     }
 
     fn run(mut self) -> LResult<Vec<Token>> {
@@ -96,7 +108,7 @@ impl Lexer {
                 });
             } else if c.is_ascii_digit() {
                 self.scan_number()?;
-                let kind = TokenKind::Num(self.last_num.take().unwrap());
+                let kind = self.take_number();
                 out.push(Token {
                     kind,
                     span: Span::new(start, self.pos),
@@ -253,8 +265,10 @@ impl Lexer {
     }
 
     fn scan_number(&mut self) -> LResult<()> {
+        self.last_num = None;
+        self.last_int = None;
         let start = self.pos;
-        let mut text = String::new();
+
         if self.peek() == '0' && (self.peek2() == 'x' || self.peek2() == 'X') {
             self.pos += 2;
             let dstart = self.pos;
@@ -262,18 +276,27 @@ impl Lexer {
                 self.pos += 1;
             }
             if dstart == self.pos {
-                return Err(self.err_at(Span::new(start, self.pos), "invalid hex literal (expected digits after `0x`)"));
+                return Err(self.err_at(
+                    Span::new(start, self.pos),
+                    "invalid hex literal (expected digits after `0x`)",
+                ));
             }
-            let digits: String = self.chars[dstart..self.pos].iter().collect();
-            let v = u64::from_str_radix(&digits, 16)
-                .map_err(|_| self.err_at(Span::new(start, self.pos), "invalid hex literal"))?;
-            self.last_num = Some(v as f64);
+            // Keep the raw spelling: converting through u64/f64 would lose
+            // precision for 128-bit constants.  The C backend parses this
+            // exact text into lusa_i128.
+            let raw: String = self.chars[start..self.pos].iter().collect();
+            self.last_int = Some(raw);
             return Ok(());
         }
+
+        let mut text = String::new();
+        let mut is_float = false;
         while self.peek().is_ascii_digit() {
             text.push(self.bump());
         }
-        if self.peek() == '.' && self.chars.get(self.pos + 1).map_or(false, |c| c.is_ascii_digit()) {
+        if self.peek() == '.' && self.chars.get(self.pos + 1).is_some_and(|c| c.is_ascii_digit())
+        {
+            is_float = true;
             text.push(self.bump());
             while self.peek().is_ascii_digit() {
                 text.push(self.bump());
@@ -289,6 +312,7 @@ impl Lexer {
             self.pos = save;
             has_digits
         } {
+            is_float = true;
             text.push(self.bump()); // e/E
             if self.peek() == '+' || self.peek() == '-' {
                 text.push(self.bump());
@@ -297,10 +321,15 @@ impl Lexer {
                 text.push(self.bump());
             }
         }
-        let v: f64 = text
-            .parse()
-            .map_err(|_| self.err_at(Span::new(start, self.pos), "invalid number literal"))?;
-        self.last_num = Some(v);
+
+        if is_float {
+            let v: f64 = text
+                .parse()
+                .map_err(|_| self.err_at(Span::new(start, self.pos), "invalid number literal"))?;
+            self.last_num = Some(v);
+        } else {
+            self.last_int = Some(text);
+        }
         Ok(())
     }
 
@@ -419,7 +448,7 @@ impl Lexer {
                 });
             } else if c.is_ascii_digit() {
                 self.scan_number()?;
-                let kind = TokenKind::Num(self.last_num.take().unwrap());
+                let kind = self.take_number();
                 toks.push(Token {
                     kind,
                     span: Span::new(tstart, self.pos),

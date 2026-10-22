@@ -1,6 +1,7 @@
 //! The interpreter: frames, statement execution, calls, loops, and the
 //! runtime ownership/borrow engine.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -28,6 +29,9 @@ pub struct Interp {
     pub depth: usize,
     /// bytecode VM state (`--vm` runs compile + execute here)
     pub vm: crate::vm::Vm,
+    /// Safe simulation of `unsafe_write_mem`/`unsafe_read_mem`.  Addresses are
+    /// process-local keys; the dynamic engines never dereference real memory.
+    pub unsafe_mem: HashMap<u64, u32>,
 }
 
 pub struct Frame {
@@ -66,6 +70,7 @@ impl Interp {
             out: Vec::new(),
             depth: 0,
             vm: crate::vm::Vm::new(),
+            unsafe_mem: HashMap::new(),
         }
     }
 

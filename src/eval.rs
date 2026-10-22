@@ -116,6 +116,7 @@ pub fn eval_expr(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr
         ExprKind::True => Ok(Value::Bool(true)),
         ExprKind::False => Ok(Value::Bool(false)),
         ExprKind::Num(n) => Ok(Value::Number(*n)),
+        ExprKind::Int(text) => Ok(Value::Number(crate::value::int_literal_to_f64(text))),
         ExprKind::Str(segs) => {
             if segs.len() == 1 {
                 if let StrAstSeg::Lit(s) = &segs[0] {
