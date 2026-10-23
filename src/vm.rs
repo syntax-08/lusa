@@ -25,6 +25,8 @@ pub struct Vm {
     pub frames: Vec<VmFrame>,
     pub stack: Vec<Value>,
     pub segs: Vec<Seg>,
+    /// values handed out by the last `coroutine.yield`
+    pub yielded: Vec<Value>,
     /// number of values left by the last expansion (call / `...`)
     pub last_ret: usize,
     /// `LUSA_TRACE_VM` is read once per VM, never per instruction
@@ -168,6 +170,7 @@ impl Vm {
             // never reallocates. Individual frames reserve a small window too.
             stack: Vec::with_capacity(1024),
             segs: Vec::with_capacity(16),
+            yielded: Vec::new(),
             last_ret: 1,
             trace: std::env::var_os("LUSA_TRACE_VM").is_some(),
             slot_vec_pool: Vec::new(),
@@ -180,6 +183,9 @@ enum StepOutcome {
     Continue,
     /// Return values are left on the value stack; the count says how many.
     Returned(usize),
+    /// A `coroutine.yield` suspended the VM. `one` says the yield expression
+    /// expects a single resume value; the yielded values live in `Vm::yielded`.
+    Yielded(usize, bool),
 }
 
 // ===== driving =====
@@ -427,6 +433,13 @@ fn run_till_return(interp: &mut Interp, base: usize) -> LResult<usize> {
         }
         match step(interp)? {
             StepOutcome::Continue => {}
+            StepOutcome::Yielded(_, _) => {
+                return Err(LusaError::new(
+                    E_RUNTIME,
+                    Some(span0()),
+                    "attempt to yield from outside a coroutine",
+                ));
+            }
             StepOutcome::Returned(n) => {
                 let truncate = interp
                     .vm
@@ -450,17 +463,125 @@ fn run_till_return(interp: &mut Interp, base: usize) -> LResult<usize> {
     }
 }
 
+/// Suspends the current VM at a `coroutine.yield` site. The yielded values are
+/// moved into `Vm::yielded`; the coroutine driver consumes them after the VM
+/// state has been swapped back out.
+fn yield_values(
+    interp: &mut Interp,
+    nargs: usize,
+    n_takes: usize,
+    one: bool,
+) -> LResult<StepOutcome> {
+    if n_takes != 0 {
+        finalize_args(interp, false, n_takes)?;
+    }
+    let len = interp.vm.stack.len();
+    let start = len.saturating_sub(nargs);
+    let values: Vec<Value> = interp.vm.stack.drain(start..).collect();
+    interp.vm.yielded = values;
+    interp.vm.last_ret = 1;
+    Ok(StepOutcome::Yielded(interp.vm.yielded.len(), one))
+}
+
+/// What a coroutine VM did in one `drive_coroutine` slice.
+pub enum CoroDrive {
+    /// suspended at a yield; `usize` = yielded value count, `bool` = the
+    /// resume result is truncated to one value
+    Yielded(usize, bool),
+    /// the coroutine's outermost frame returned; `usize` = result count
+    Returned(usize),
+}
+
+/// Starts a new coroutine frame in the currently installed VM.
+pub fn coroutine_begin(
+    interp: &mut Interp,
+    compiled: Rc<Compiled>,
+    upvals: Rc<[Rc<RefCell<SlotV>>]>,
+    args: Vec<Value>,
+    span: Span,
+) -> LResult<()> {
+    push_frame(interp, &compiled, upvals, args, span)
+}
+
+/// Runs the installed coroutine VM until it yields or its outermost frame
+/// returns. Frames are not unwound on error here; `coroutine_reset` does that.
+pub fn drive_coroutine(interp: &mut Interp) -> LResult<CoroDrive> {
+    loop {
+        match step(interp)? {
+            StepOutcome::Continue => {}
+            StepOutcome::Yielded(n, one) => return Ok(CoroDrive::Yielded(n, one)),
+            StepOutcome::Returned(n) => {
+                let truncate = interp
+                    .vm
+                    .frames
+                    .last()
+                    .map(|f| f.truncate_return)
+                    .unwrap_or(false);
+                pop_frame_recycling(interp);
+                if truncate {
+                    truncate_results_to_one(interp, n);
+                } else {
+                    interp.vm.last_ret = n;
+                }
+                if interp.vm.frames.is_empty() {
+                    return Ok(CoroDrive::Returned(interp.vm.last_ret));
+                }
+            }
+        }
+    }
+}
+
+/// Supplies resume arguments as the result of the suspended yield.
+pub fn coroutine_supply(interp: &mut Interp, mut args: Vec<Value>, one: bool) {
+    if one {
+        let value = if args.is_empty() {
+            Value::Nil
+        } else {
+            args.swap_remove(0)
+        };
+        interp.vm.stack.push(value);
+        interp.vm.last_ret = 1;
+    } else {
+        let n = args.len();
+        interp.vm.stack.append(&mut args);
+        interp.vm.last_ret = n;
+    }
+}
+
+/// Takes the yielded values out of the installed coroutine VM.
+pub fn coroutine_take_yielded(interp: &mut Interp) -> Vec<Value> {
+    std::mem::take(&mut interp.vm.yielded)
+}
+
+/// Takes the top `n` result values out of the installed coroutine VM.
+pub fn coroutine_take_results(interp: &mut Interp, n: usize) -> Vec<Value> {
+    let take = n.min(interp.vm.stack.len());
+    interp.vm.stack.split_off(interp.vm.stack.len() - take)
+}
+
+/// Drops every value and frame in the installed coroutine VM. Runs after a
+/// coroutine error or `coroutine.close`.
+pub fn coroutine_reset(interp: &mut Interp) {
+    while !interp.vm.frames.is_empty() {
+        pop_frame_recycling(interp);
+    }
+    interp.vm.stack.clear();
+    interp.vm.segs.clear();
+    interp.vm.yielded.clear();
+    interp.vm.last_ret = 1;
+}
+
 /// Runs a compiled main program chunk to completion.
 pub fn run_main(interp: &mut Interp, compiled: Rc<Compiled>) -> LResult<Value> {
     interp.vm.frames.clear();
     interp.vm.stack.clear();
     interp.vm.segs.clear();
+    interp.vm.yielded.clear();
     interp.vm.last_ret = 1;
     let args: Vec<Value> = Vec::new();
     invoke(interp, &compiled, Rc::from([]), args, span0())?;
     Ok(Value::Nil)
 }
-
 /// Prints the compiled bytecode when `LUSA_DEBUG_VM=1` (debug aid).
 pub fn debug_dump(compiled: &Compiled) {
     if std::env::var("LUSA_DEBUG_VM").is_err() {
@@ -1002,6 +1123,20 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
         Instr::CallExpOne(base, nt) => {
             call_plain(interp, *base as usize, true, *nt as usize, true, span0())?
         }
+        Instr::Yield(base, nt) => {
+            yield_values(interp, *base as usize, *nt as usize, false)?
+        }
+        Instr::YieldExp(base, nt) => {
+            let n = *base as usize + interp.vm.last_ret;
+            yield_values(interp, n, *nt as usize, false)?
+        }
+        Instr::YieldOne(base, nt) => {
+            yield_values(interp, *base as usize, *nt as usize, true)?
+        }
+        Instr::YieldExpOne(base, nt) => {
+            let n = *base as usize + interp.vm.last_ret;
+            yield_values(interp, n, *nt as usize, true)?
+        }
         Instr::MethodCall(k, base, nt) => {
             call_method(interp, *k, *base as usize, false, *nt as usize, false, span0())?
         }
@@ -1306,6 +1441,37 @@ fn classify(v: &Value) -> Callee {
     }
 }
 
+/// Compiles an interpreter function for execution inside a coroutine. The
+/// snapshot makes captured locals readable; direct `coroutine.yield` sites in
+/// the compiled body become suspension points.
+fn compile_lusa_runtime(
+    interp: &mut Interp,
+    func: &Value,
+) -> Option<crate::compiler::RuntimeFunction> {
+    let Value::Func(f) = func.base_value() else {
+        return None;
+    };
+    let crate::value::FuncBody::Lusa(lit) = &f.body else {
+        return None;
+    };
+    let structs: std::collections::HashMap<String, Vec<(String, String)>> = interp
+        .struct_defs
+        .iter()
+        .map(|(name, def)| (name.clone(), def.fields.clone()))
+        .collect();
+    let seed = interp.coroutine_captures.last().cloned();
+    let runtime =
+        crate::compiler::compile_runtime_function(lit, &f.env, &structs, seed.as_ref()).ok()?;
+    if let Some(map) = interp.coroutine_captures.last_mut() {
+        for (index, scope, name) in &runtime.captures {
+            if let Some(cell) = runtime.upvals.get(*index) {
+                map.insert(name.to_string(), (scope.clone(), cell.clone()));
+            }
+        }
+    }
+    Some(runtime)
+}
+
 /// Plain call. Arguments stay on the shared stack until the frame is built;
 /// VM→VM calls never allocate a `Vec<Value>` for them.
 fn call_plain(
@@ -1348,6 +1514,31 @@ fn call_plain(
                     .last_mut()
                     .expect("callee frame")
                     .truncate_return = true;
+            }
+            Ok(StepOutcome::Continue)
+        }
+        Callee::Lusa if !interp.active_coroutines.is_empty() => {
+            let func = interp.vm.stack.get(func_pos).cloned().unwrap_or(Value::Nil);
+            let start = (func_pos + 1).min(interp.vm.stack.len());
+            let args: Vec<Value> = interp.vm.stack.drain(start..).collect();
+            interp.vm.stack.truncate(func_pos.min(interp.vm.stack.len()));
+            interp.vm.last_ret = 1;
+            if let Some(runtime) = compile_lusa_runtime(interp, &func) {
+                push_frame(interp, &runtime.compiled, runtime.upvals, args, span)?;
+                if want_one {
+                    interp
+                        .vm
+                        .frames
+                        .last_mut()
+                        .expect("callee frame")
+                        .truncate_return = true;
+                }
+                return Ok(StepOutcome::Continue);
+            }
+            invoke_non_vm(interp, func, args, span)?;
+            if want_one {
+                let n = interp.vm.last_ret;
+                truncate_results_to_one(interp, n);
             }
             Ok(StepOutcome::Continue)
         }
@@ -1410,6 +1601,29 @@ fn call_method(
                     .last_mut()
                     .expect("callee frame")
                     .truncate_return = true;
+            }
+            Ok(StepOutcome::Continue)
+        }
+        Callee::Lusa if !interp.active_coroutines.is_empty() => {
+            let start = obj_pos.min(interp.vm.stack.len());
+            let args: Vec<Value> = interp.vm.stack.drain(start..).collect();
+            interp.vm.last_ret = 1;
+            if let Some(runtime) = compile_lusa_runtime(interp, &f) {
+                push_frame(interp, &runtime.compiled, runtime.upvals, args, span)?;
+                if want_one {
+                    interp
+                        .vm
+                        .frames
+                        .last_mut()
+                        .expect("callee frame")
+                        .truncate_return = true;
+                }
+                return Ok(StepOutcome::Continue);
+            }
+            invoke_non_vm(interp, f, args, span)?;
+            if want_one {
+                let n = interp.vm.last_ret;
+                truncate_results_to_one(interp, n);
             }
             Ok(StepOutcome::Continue)
         }
@@ -1666,6 +1880,7 @@ fn same_heap(a: &Value, b: &Value) -> bool {
         (Value::Table(x), Value::Table(y)) => Rc::ptr_eq(x, y),
         (Value::Func(x), Value::Func(y)) => Rc::ptr_eq(x, y),
         (Value::Iter(x), Value::Iter(y)) => Rc::ptr_eq(x, y),
+        (Value::Coroutine(x), Value::Coroutine(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -1690,7 +1905,7 @@ fn arg_push_local(
         cell.read_clone()
             .ok_or_else(|| moved_out_err(&src.to_string(), frame_span(frame)))?
     };
-    let rec = if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_)) {
+    let rec = if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_) | Value::Coroutine(_)) {
         UndoRec::Local {
             slot,
             vid: v.vid(),
@@ -1718,7 +1933,7 @@ fn arg_push_slot(
         SlotV::Set(v) => v.clone(),
         SlotV::Moved(_) => return Err(moved_out_err(&src.to_string(), current_span(interp))),
     };
-    let rec = if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_)) {
+    let rec = if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_) | Value::Coroutine(_)) {
         UndoRec::Slot {
             handle: handle.clone(),
             vid: v.vid(),
@@ -1737,7 +1952,7 @@ fn arg_push_slot(
 /// Same as `arg_push_slot` but for a global (restore goes by name).
 fn arg_push_glob(interp: &mut Interp, name: &str, dest: &str) -> LResult<()> {
     let v = read_global_deferred_span(interp, name)?;
-    let rec = if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_)) {
+    let rec = if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_) | Value::Coroutine(_)) {
         UndoRec::Glob {
             name: name.to_string(),
             vid: v.vid(),
@@ -1768,7 +1983,7 @@ fn arg_push_entry(
         None => None,
     };
     let rec = match &v {
-        Some(vv) if matches!(vv, Value::Table(_) | Value::Func(_) | Value::Iter(_)) => {
+        Some(vv) if matches!(vv, Value::Table(_) | Value::Func(_) | Value::Iter(_) | Value::Coroutine(_)) => {
             UndoRec::Field {
                 table: t.clone(),
                 key: key.clone(),
@@ -2075,6 +2290,7 @@ fn values_eq(l: &Value, r: &Value) -> bool {
         (Value::Table(a), Value::Table(b)) => Rc::ptr_eq(a, b),
         (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(a, b),
         (Value::Iter(a), Value::Iter(b)) => Rc::ptr_eq(a, b),
+        (Value::Coroutine(a), Value::Coroutine(b)) => Rc::ptr_eq(a, b),
         _ => false,
     }
 }

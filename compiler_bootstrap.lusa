@@ -519,6 +519,9 @@ local function canonical_type(name, line, column)
     if name == "auto" then
         return "auto"
     end
+    if name == "coroutine" then
+        return name
+    end
     if TYPE_NAMES[name] == true then
         return name
     end
@@ -558,6 +561,7 @@ end
 
 local function is_heap_type(type_name)
     return type_name == "string" or type_name == "table"
+        or type_name == "coroutine"
         or table_element(type_name) ~= nil
 end
 
@@ -785,8 +789,140 @@ local function check_condition(expr, context)
     return checked, found
 end
 
+local function check_coroutine_arg(expr, expected, context)
+    local checked, actual = check_expr(expr)
+    if not assignable(expected, actual, clone checked) then
+        check_mismatch(checked.line, checked.column, context, expected, actual)
+    end
+    return coerce_literal(checked, expected)
+end
+
+local function check_coroutine_handle(expr, context)
+    local checked, actual = check_expr(expr)
+    if actual ~= "coroutine" then
+        check_mismatch(checked.line, checked.column, context,
+            "coroutine", actual)
+    end
+    if checked.tag ~= "Name" then
+        type_fail("E0319", checked.line, checked.column,
+            "native coroutine handles must be named locals")
+    end
+    return checked
+end
+
+local function check_coroutine_call(expr, method)
+    local args = expr.args or {}
+    if method == "create" then
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`coroutine.create` takes one named function, found "
+                .. tostring(#args))
+        end
+        local target = args[1]
+        if target.tag ~= "Name" then
+            type_fail("E0312", target.line, target.column,
+                "native `coroutine.create` requires a direct named function")
+        end
+        local signature = borrow check_functions[target.name]
+        if signature == nil then
+            type_fail("E0310", target.line, target.column,
+                "cannot find function `" .. target.name .. "` in this scope")
+        end
+        if signature.receiver ~= nil then
+            type_fail("E0319", target.line, target.column,
+                "native coroutines cannot use method receivers")
+        end
+        if #signature.params ~= 0 then
+            type_fail("E0319", target.line, target.column,
+                "native coroutine entry functions must take no parameters")
+        end
+        if signature.ret ~= "i32" then
+            type_fail("E0319", target.line, target.column,
+                "native coroutine entry functions must return `i32`")
+        end
+        expr.builtin = "coroutine_create"
+        expr.fn_name = target.name
+        expr.ctype = "coroutine"
+        expr.elem_type = "i32"
+        expr.own = true
+        expr.args = {}
+        return expr, "coroutine"
+    end
+
+    if method == "yield" then
+        if check_current_function == nil then
+            type_fail("E0319", expr.line, expr.column,
+                "`coroutine.yield` can only appear inside a function")
+        end
+        if #args > 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`coroutine.yield` takes at most one `i32` value")
+        end
+        if #args == 1 then
+            expr.args = { check_coroutine_arg(args[1], "i32",
+                "`coroutine.yield` value") }
+        else
+            expr.args = {}
+        end
+        expr.builtin = "coroutine_yield"
+        expr.ctype = "i32"
+        return expr, "i32"
+    end
+
+    if method == "status" then
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`coroutine.status` takes one coroutine")
+        end
+        expr.args = { check_coroutine_handle(args[1],
+            "`coroutine.status` handle") }
+        expr.builtin = "coroutine_status"
+        expr.ctype = "string"
+        expr.own = true
+        return expr, "string"
+    end
+
+    if method == "close" then
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`coroutine.close` takes one coroutine")
+        end
+        expr.args = { check_coroutine_handle(args[1],
+            "`coroutine.close` handle") }
+        expr.builtin = "coroutine_close"
+        expr.ctype = "bool"
+        return expr, "bool"
+    end
+
+    if method == "isyieldable" then
+        if #args ~= 0 then
+            type_fail("E0311", expr.line, expr.column,
+                "`coroutine.isyieldable` takes no arguments")
+        end
+        expr.builtin = "coroutine_isyieldable"
+        expr.ctype = "bool"
+        return expr, "bool"
+    end
+
+    if method == "resume" then
+        type_fail("E0317", expr.line, expr.column,
+            "native `coroutine.resume` must be used as a local initializer: "
+            .. "`local ok, value = coroutine.resume(co, arg)` or "
+            .. "`local ok, value, err = coroutine.resume(co, arg)`")
+    end
+
+    type_fail("E0319", expr.line, expr.column,
+        "unsupported native coroutine operation `" .. tostring(method) .. "`")
+end
+
 local function check_call(expr)
     local callee = borrow expr.callee
+    if callee.tag == "Field" then
+        local receiver = borrow callee.table
+        if receiver.tag == "Name" and receiver.name == "coroutine" then
+            return check_coroutine_call(expr, callee.field_name)
+        end
+    end
     if callee.tag ~= "Name" then
         type_fail("E0312", expr.line, expr.column,
             "only direct calls to named functions are supported by the C backend")
@@ -898,6 +1034,52 @@ local function check_call(expr)
         return expr, "i128"
     end
 
+    if name == "error" then
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`error` takes one string argument, found "
+                .. tostring(#args))
+        end
+        local checked_message, message_type = check_expr(args[1])
+        if message_type ~= "string" then
+            check_mismatch(checked_message.line, checked_message.column,
+                "`error` message", "string", message_type)
+        end
+        expr.args = { checked_message }
+        expr.builtin = "error"
+        expr.ctype = "void"
+        return expr, "void"
+    end
+
+    if name == "assert" then
+        if #args < 1 or #args > 2 then
+            type_fail("E0311", expr.line, expr.column,
+                "`assert` takes one condition and an optional message, found "
+                .. tostring(#args))
+        end
+        local checked_condition, condition_type = check_expr(args[1])
+        if condition_type ~= "bool" then
+            check_mismatch(checked_condition.line, checked_condition.column,
+                "`assert` condition", "bool", condition_type)
+        end
+        local checked_message = nil
+        if #args == 2 then
+            local message_type
+            checked_message, message_type = check_expr(args[2])
+            if message_type ~= "string" then
+                check_mismatch(checked_message.line, checked_message.column,
+                    "`assert` message", "string", message_type)
+            end
+        end
+        expr.args = { checked_condition }
+        if checked_message ~= nil then
+            expr.args[2] = checked_message
+        end
+        expr.builtin = "assert"
+        expr.ctype = "void"
+        return expr, "void"
+    end
+
     if name == "print" then
         while i <= #args do
             local checked_arg, arg_type = check_expr(args[i])
@@ -916,6 +1098,13 @@ local function check_call(expr)
         expr.builtin = "print"
         expr.args = args
         return expr, "void"
+    end
+
+    if name == "pcall" then
+        type_fail("E0317", expr.line, expr.column,
+            "native pcall must be used as a local initializer: "
+            .. "`local ok, err = pcall(f, ...)` or "
+            .. "`local ok, result, err = pcall(f, ...)`")
     end
 
     local signature = borrow check_functions[name]
@@ -1450,10 +1639,187 @@ check_expr = function(expr)
         "unsupported expression node `" .. tostring(tag) .. "`")
 end
 
+local function check_pcall_local(stmt, names, stmt_types, values)
+    local call = values[1]
+    local args = call.args
+    if #names ~= 2 and #names ~= 3 then
+        type_fail("E0317", call.line, call.column,
+            "native pcall must bind `local ok, err = pcall(f, ...)` or "
+            .. "`local ok, result, err = pcall(f, ...)`")
+    end
+    local arg_count = #args
+    if arg_count < 1 then
+        type_fail("E0311", call.line, call.column,
+            "`pcall` needs a function name as its first argument")
+    end
+    local target = args[1]
+    if target.tag ~= "Name" then
+        type_fail("E0312", target.line, target.column,
+            "native `pcall` requires a direct named function")
+    end
+    local fname = target.name
+    local signature = borrow check_functions[fname]
+    if signature == nil then
+        type_fail("E0310", target.line, target.column,
+            "cannot find function `" .. fname .. "` in this scope")
+    end
+    local ret = signature.ret
+    if ret == "void" and #names ~= 2 then
+        type_fail("E0317", call.line, call.column,
+            "a void function has no result; use `local ok, err = pcall("
+            .. fname .. ", ...)`")
+    end
+    if #names == 2 and ret ~= "void" then
+        -- Two names mean `ok, err`; the function result is discarded.  Use
+        -- three names when the value matters.
+    end
+    if arg_count - 1 ~= #signature.params then
+        type_fail("E0311", call.line, call.column,
+            "function `" .. fname .. "` takes " .. tostring(#signature.params)
+            .. " argument(s) but " .. tostring(arg_count - 1)
+            .. " were supplied to pcall")
+    end
+
+    local target_args = {}
+    local i = 2
+    while i <= arg_count do
+        local checked_arg, arg_type = check_expr(args[i])
+        local param = borrow signature.params[i - 1]
+        if not assignable(param.type, arg_type, clone checked_arg) then
+            check_mismatch(checked_arg.line, checked_arg.column,
+                "argument " .. tostring(i - 1) .. " of `" .. fname
+                .. "` in pcall", param.type, arg_type)
+        end
+        target_args[i - 1] = coerce_literal(checked_arg, param.type)
+        i = i + 1
+    end
+
+    call.args = target_args
+    call.ctype = ret
+    call.fn_name = fname
+    call.callee = { tag = "Name", name = fname, line = target.line,
+        column = target.column }
+    call.pcall = true
+
+    local types = { "bool" }
+    local own = { false }
+    if #names == 3 then
+        types[2] = ret
+        own[2] = is_heap_type(ret)
+        types[3] = "string"
+        own[3] = true
+    else
+        types[2] = "string"
+        own[2] = true
+    end
+
+    i = 1
+    while i <= #names do
+        if stmt_types ~= nil and stmt_types[i] ~= nil then
+            local declared = canonical_type(stmt_types[i], stmt.line, stmt.column)
+            if declared ~= "auto" and declared ~= "nil" and declared ~= types[i] then
+                check_mismatch(stmt.line, stmt.column,
+                    "local `" .. names[i] .. "`", declared, types[i])
+            end
+        end
+        i = i + 1
+    end
+
+    scope_declare(names[1], "bool", false, false)
+    if #names == 3 then
+        scope_declare(names[2], ret, is_heap_type(ret), false)
+        scope_declare(names[3], "string", true, false)
+    else
+        scope_declare(names[2], "string", true, false)
+    end
+
+    stmt.pcall = { fn = fname, ret = ret, has_result = #names == 3 }
+    stmt.own = own
+    stmt.types = types
+    stmt.values = { call }
+    stmt.names = names
+    return stmt
+end
+
+local function check_coroutine_resume_local(stmt, names, stmt_types, values)
+    local call = values[1]
+    local args = call.args
+    if #names ~= 2 and #names ~= 3 then
+        type_fail("E0317", call.line, call.column,
+            "native coroutine.resume must bind `local ok, value = "
+            .. "coroutine.resume(co, arg)` or `local ok, value, err = "
+            .. "coroutine.resume(co, arg)`")
+    end
+    if #args < 1 or #args > 2 then
+        type_fail("E0311", call.line, call.column,
+            "`coroutine.resume` takes a coroutine and an optional `i32` value")
+    end
+    local checked_co = check_coroutine_handle(args[1],
+        "`coroutine.resume` handle")
+    local entry = value_lookup(checked_co.name)
+    if entry == nil or entry.elem_type ~= "i32" then
+        type_fail("E0319", checked_co.line, checked_co.column,
+            "native coroutine entry functions must return `i32`")
+    end
+    local checked_arg = nil
+    if #args == 2 then
+        checked_arg = check_coroutine_arg(args[2], "i32",
+            "`coroutine.resume` value")
+    end
+    local result_types = { "bool", "i32" }
+    local own = { false, false }
+    if #names == 3 then
+        result_types[3] = "string"
+        own[3] = true
+    end
+    local i = 1
+    while i <= #names do
+        if stmt_types ~= nil and stmt_types[i] ~= nil then
+            local declared = canonical_type(stmt_types[i], stmt.line, stmt.column)
+            if declared ~= "auto" and declared ~= "nil"
+                and declared ~= result_types[i] then
+                check_mismatch(stmt.line, stmt.column,
+                    "local `" .. names[i] .. "`", declared, result_types[i])
+            end
+        end
+        i = i + 1
+    end
+    call.builtin = "coroutine_resume"
+    call.ctype = "coroutine_result"
+    call.args = { checked_co }
+    if checked_arg ~= nil then
+        call.args[2] = checked_arg
+    end
+    stmt.coroutine_resume = { has_error = #names == 3 }
+    i = 1
+    while i <= #names do
+        scope_declare(names[i], result_types[i], own[i], false)
+        i = i + 1
+    end
+    stmt.types = result_types
+    stmt.own = own
+    stmt.values = { call }
+    stmt.names = names
+    return stmt
+end
+
 local function check_local(stmt)
     local names = stmt.names
     local types = stmt.types
     local values = stmt.values
+    if values ~= nil and values[1] ~= nil and values[1].tag == "Call"
+        and values[1].callee ~= nil and values[1].callee.tag == "Name"
+        and values[1].callee.name == "pcall" then
+        return check_pcall_local(stmt, names, types, values)
+    end
+    if values ~= nil and values[1] ~= nil and values[1].tag == "Call"
+        and values[1].callee ~= nil and values[1].callee.tag == "Field"
+        and values[1].callee.table ~= nil
+        and values[1].callee.table.tag == "Name"
+        and values[1].callee.table.name == "coroutine"
+        and values[1].callee.field_name == "resume" then
+        return check_coroutine_resume_local(stmt, names, types, values)
+    end
     if #values > #names then
         type_fail("E0311", stmt.line, stmt.column,
             "more initializers than local names are not supported")
@@ -2160,6 +2526,7 @@ local function c_type(type_name)
     if type_name == "f32" then return "float" end
     if type_name == "bool" then return "bool" end
     if type_name == "string" then return "LusaString *" end
+    if type_name == "coroutine" then return "LusaCoro *" end
     if type_name == "nil" then return "void *" end
     if type_name == "void" then return "void" end
     if type_name == "table" or table_element(type_name) ~= nil then
@@ -2190,7 +2557,8 @@ local function default_c(type_name)
         return "0"
     end
     if type_name == "string" or type_name == "nil"
-        or type_name == "table" or table_element(type_name) ~= nil then
+        or type_name == "table" or type_name == "coroutine"
+        or table_element(type_name) ~= nil then
         return "NULL"
     end
     if type_name == "value" then
@@ -2286,6 +2654,8 @@ local function emit_drop_entry(entry)
         line("lusa_drop_string(&" .. entry.cname .. ");")
     elseif entry.type == "table" or table_element(entry.type) ~= nil then
         line("lusa_drop_table(&" .. entry.cname .. ");")
+    elseif entry.type == "coroutine" then
+        line("lusa_drop_coroutine(&" .. entry.cname .. ");")
     end
 end
 
@@ -2323,6 +2693,44 @@ local function emit_global_drops()
         emit_drop_entry(emit_global_order[i])
         i = i - 1
     end
+end
+
+-- Propagate a recorded runtime error through the normal function return path
+-- so every owned local is released exactly once.  `pcall` clears the flag
+-- before its protected call and inspects it afterwards.
+local function emit_error_check()
+    line("if (lusa_error_pending) {")
+    emit_indent = emit_indent + 1
+    emit_all_drops()
+    if emit_is_main then
+        emit_global_drops()
+        line("return lusa_error_report();")
+    elseif emit_return_type == "void" then
+        line("return;")
+    else
+        line("return " .. default_c(emit_return_type) .. ";")
+    end
+    emit_indent = emit_indent - 1
+    line("}")
+end
+
+-- When `coroutine.close` resumes a suspended fiber, the next statement
+-- boundary unwinds its ordinary stack frame.  Every generated function has
+-- the hidden `lusa_co` parameter, so helpers clean up just like the entry.
+local function emit_coro_closing_check()
+    if emit_is_main then
+        return
+    end
+    line("if (lusa_coro_closing(lusa_co)) {")
+    emit_indent = emit_indent + 1
+    emit_all_drops()
+    if emit_return_type == "void" then
+        line("return;")
+    else
+        line("return " .. default_c(emit_return_type) .. ";")
+    end
+    emit_indent = emit_indent - 1
+    line("}")
 end
 
 local function save_moved_state()
@@ -2409,6 +2817,9 @@ end
 -- ---- C runtime -----------------------------------------------------------
 
 local RUNTIME = {
+    "#if !defined(_WIN32)",
+    "#define _XOPEN_SOURCE 700",
+    "#endif",
     "#include <stdio.h>",
     "#include <stdlib.h>",
     "#include <stdint.h>",
@@ -2435,6 +2846,35 @@ local RUNTIME = {
     "#endif",
     "",
     "static void lusa_panic(const char *message);",
+    "",
+    "/* Native panic recovery uses checked propagation instead of longjmp:",
+    "   runtime helpers record the first error, generated functions return",
+    "   through their normal RAII cleanup paths, and `pcall` inspects the",
+    "   flag at its protected call site.  This keeps every drop deterministic",
+    "   on all supported C toolchains. */",
+    "static bool lusa_error_pending = false;",
+    "static char lusa_error_code[32] = {0};",
+    "static char lusa_error_message[512] = {0};",
+    "static void lusa_error_clear(void) {",
+    "    lusa_error_pending = false;",
+    "    lusa_error_code[0] = 0;",
+    "    lusa_error_message[0] = 0;",
+    "}",
+    "static void lusa_throw(const char *code, const char *message) {",
+    "    if (lusa_error_pending) return;",
+    "    lusa_error_pending = true;",
+    '    snprintf(lusa_error_code, sizeof(lusa_error_code), "%s",',
+    '        code == NULL ? "E9999" : code);',
+    '    snprintf(lusa_error_message, sizeof(lusa_error_message), "%s",',
+    '        message == NULL ? "" : message);',
+    "}",
+    "static int lusa_error_report(void) {",
+    "    fflush(stdout);",
+    '    fprintf(stderr, "lusa runtime: %s: %s", lusa_error_code,',
+    "        lusa_error_message);",
+    "    fputc(10, stderr);",
+    "    return 1;",
+    "}",
     "",
     "/* Tracked buffers behind `unsafe_alloc`; released before the program",
     "   exits so tests and drivers can use them freely. */",
@@ -2539,11 +2979,15 @@ local RUNTIME = {
     "}",
     "",
     "static void lusa_panic(const char *message) {",
-    "    fflush(stdout);",
-    '    fputs("lusa runtime: ", stderr);',
-    "    fputs(message, stderr);",
-    "    putchar(10);",
-    "    exit(1);",
+    '    lusa_throw("E9999", message);',
+    "}",
+    "",
+    "static LusaString *lusa_string_new(const char *bytes, uint64_t length);",
+    "static LusaString *lusa_error_string(void) {",
+    "    char buffer[600];",
+    '    snprintf(buffer, sizeof(buffer), "%s: %s", lusa_error_code,',
+    "        lusa_error_message);",
+    "    return lusa_string_new(buffer, (uint64_t)strlen(buffer));",
     "}",
     "",
     "static void lusa_drop_string(LusaString **value);",
@@ -2553,13 +2997,17 @@ local RUNTIME = {
     "",
     "static LusaString *lusa_string_new(const char *bytes, uint64_t length) {",
     "    LusaString *value = (LusaString *)calloc(1, sizeof(LusaString));",
-    '    if (value == NULL) lusa_panic("out of memory");',
+    '    if (value == NULL) { lusa_panic("out of memory"); return NULL; }',
     "    value->obj.type = LUSA_OBJ_STRING;",
     "    value->obj.length = length;",
     "    value->obj.flags = LUSA_OWNED;",
     "    value->obj.size = (uint64_t)sizeof(LusaString) + length + 1u;",
     "    value->data = (char *)malloc((size_t)length + 1u);",
-    '    if (value->data == NULL) lusa_panic("out of memory");',
+    "    if (value->data == NULL) {",
+    "        free(value);",
+    '        lusa_panic("out of memory");',
+    "        return NULL;",
+    "    }",
     "    if (length != 0u) memcpy(value->data, bytes, (size_t)length);",
     "    value->data[length] = 0;",
     "    return value;",
@@ -2576,9 +3024,10 @@ local RUNTIME = {
     "    uint64_t length = left_length + right_length;",
     '    LusaString *out = lusa_string_new("", 0u);',
     "    char *grown;",
+    "    if (out == NULL) return NULL;",
     "    if (length == 0u) return out;",
     "    grown = (char *)realloc(out->data, (size_t)length + 1u);",
-    '    if (grown == NULL) lusa_panic("out of memory");',
+    '    if (grown == NULL) { lusa_panic("out of memory"); return out; }',
     "    out->data = grown;",
     "    if (left_length != 0u) memcpy(out->data, left->data, (size_t)left_length);",
     "    if (right_length != 0u) memcpy(out->data + left_length, right->data, (size_t)right_length);",
@@ -2853,34 +3302,66 @@ local RUNTIME = {
     "}",
     "",
     "static uint64_t lusa_index(uint64_t length, int64_t index) {",
-    '    if (index < 1 || (uint64_t)index > length) lusa_panic("table index out of bounds");',
+    "    if (index < 1 || (uint64_t)index > length) {",
+    '        lusa_throw("E2006", "table index out of bounds");',
+    "        return 0u;",
+    "    }",
     "    return (uint64_t)index - 1u;",
     "}",
     "",
     "static int32_t lusa_table_get_i32_at(LusaTable *table, int64_t index) {",
-    "    return (int32_t)(uint32_t)table->items[lusa_index(table->obj.length, index)];",
+    "    uint64_t position;",
+    "    if (table == NULL) return 0;",
+    "    position = lusa_index(table->obj.length, index);",
+    "    if (lusa_error_pending) return 0;",
+    "    return (int32_t)(uint32_t)table->items[position];",
     "}",
     "static uint32_t lusa_table_get_u32_at(LusaTable *table, int64_t index) {",
-    "    return (uint32_t)table->items[lusa_index(table->obj.length, index)];",
+    "    uint64_t position;",
+    "    if (table == NULL) return 0u;",
+    "    position = lusa_index(table->obj.length, index);",
+    "    if (lusa_error_pending) return 0u;",
+    "    return (uint32_t)table->items[position];",
     "}",
     "static bool lusa_table_get_bool_at(LusaTable *table, int64_t index) {",
-    "    return table->items[lusa_index(table->obj.length, index)] != 0u;",
+    "    uint64_t position;",
+    "    if (table == NULL) return false;",
+    "    position = lusa_index(table->obj.length, index);",
+    "    if (lusa_error_pending) return false;",
+    "    return table->items[position] != 0u;",
     "}",
     "static LusaString *lusa_table_get_string_at(LusaTable *table, int64_t index) {",
-    "    return (LusaString *)(uintptr_t)table->items[lusa_index(table->obj.length, index)];",
+    "    uint64_t position;",
+    "    if (table == NULL) return NULL;",
+    "    position = lusa_index(table->obj.length, index);",
+    "    if (lusa_error_pending) return NULL;",
+    "    return (LusaString *)(uintptr_t)table->items[position];",
     "}",
     "static LusaTable *lusa_table_get_table_at(LusaTable *table, int64_t index) {",
-    "    return (LusaTable *)(uintptr_t)table->items[lusa_index(table->obj.length, index)];",
+    "    uint64_t position;",
+    "    if (table == NULL) return NULL;",
+    "    position = lusa_index(table->obj.length, index);",
+    "    if (lusa_error_pending) return NULL;",
+    "    return (LusaTable *)(uintptr_t)table->items[position];",
     "}",
     "static float lusa_table_get_f32_at(LusaTable *table, int64_t index) {",
-    "    uint32_t bits = (uint32_t)table->items[lusa_index(table->obj.length, index)];",
+    "    uint64_t position;",
+    "    uint32_t bits;",
     "    float value = 0.0f;",
+    "    if (table == NULL) return 0.0f;",
+    "    position = lusa_index(table->obj.length, index);",
+    "    if (lusa_error_pending) return 0.0f;",
+    "    bits = (uint32_t)table->items[position];",
     "    memcpy(&value, &bits, sizeof(value));",
     "    return value;",
     "}",
     "static LusaValue lusa_table_get_value_at(LusaTable *table, int64_t index) {",
     "    LusaValue out = { table == NULL ? LUSA_ELEM_UNKNOWN : table->elem_kind, 0u };",
-    "    if (table != NULL) out.payload = table->items[lusa_index(table->obj.length, index)];",
+    "    uint64_t position;",
+    "    if (table == NULL) return out;",
+    "    position = lusa_index(table->obj.length, index);",
+    "    if (lusa_error_pending) return out;",
+    "    out.payload = table->items[position];",
     "    return out;",
     "}",
     "static void lusa_table_set_f32(LusaTable *table, uint64_t position, float value) {",
@@ -2944,37 +3425,51 @@ local RUNTIME = {
     "#endif",
     "}",
     "",
-    'static void lusa_require_nonzero_i32(int32_t value) { if (value == 0) lusa_panic("division by zero"); }',
-    'static void lusa_require_nonzero_u32(uint32_t value) { if (value == 0u) lusa_panic("division by zero"); }',
-    'static void lusa_require_nonzero_i128(lusa_i128 value) { if (value == 0) lusa_panic("division by zero"); }',
+    'static void lusa_require_nonzero_i32(int32_t value) { if (value == 0) lusa_throw("E2001", "division by zero"); }',
+    'static void lusa_require_nonzero_u32(uint32_t value) { if (value == 0u) lusa_throw("E2001", "division by zero"); }',
+    'static void lusa_require_nonzero_i128(lusa_i128 value) { if (value == 0) lusa_throw("E2001", "division by zero"); }',
+    "static int32_t lusa_div_i32(int32_t a, int32_t b) {",
+    '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
+    "    return a / b;",
+    "}",
+    "static uint32_t lusa_div_u32(uint32_t a, uint32_t b) {",
+    '    if (b == 0u) { lusa_throw("E2001", "division by zero"); return 0u; }',
+    "    return a / b;",
+    "}",
+    "static lusa_i128 lusa_div_i128(lusa_i128 a, lusa_i128 b) {",
+    '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
+    "    return a / b;",
+    "}",
     "static int32_t lusa_floor_div_i32(int32_t a, int32_t b) {",
     "    int32_t q;",
     "    int32_t r;",
-    "    lusa_require_nonzero_i32(b);",
+    '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
     "    q = a / b; r = a % b;",
     "    if (r != 0 && ((r < 0) != (b < 0))) q -= 1;",
     "    return q;",
     "}",
     "static int32_t lusa_mod_i32(int32_t a, int32_t b) {",
+    '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
     "    return a - lusa_floor_div_i32(a, b) * b;",
     "}",
     "static uint32_t lusa_floor_div_u32(uint32_t a, uint32_t b) {",
-    "    lusa_require_nonzero_u32(b);",
+    '    if (b == 0u) { lusa_throw("E2001", "division by zero"); return 0u; }',
     "    return a / b;",
     "}",
     "static uint32_t lusa_mod_u32(uint32_t a, uint32_t b) {",
-    "    lusa_require_nonzero_u32(b);",
+    '    if (b == 0u) { lusa_throw("E2001", "division by zero"); return 0u; }',
     "    return a % b;",
     "}",
     "static lusa_i128 lusa_floor_div_i128(lusa_i128 a, lusa_i128 b) {",
     "    lusa_i128 q;",
     "    lusa_i128 r;",
-    "    lusa_require_nonzero_i128(b);",
+    '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
     "    q = a / b; r = a % b;",
     "    if (r != 0 && ((r < 0) != (b < 0))) q -= 1;",
     "    return q;",
     "}",
     "static lusa_i128 lusa_mod_i128(lusa_i128 a, lusa_i128 b) {",
+    '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
     "    return a - lusa_floor_div_i128(a, b) * b;",
     "}",
     "static int32_t lusa_pow_i32(int32_t base, int32_t exponent) {",
@@ -2999,6 +3494,243 @@ local RUNTIME = {
     "}",
     "static float lusa_pow_f32(float base, float exponent) {",
     "    return (float)pow((double)base, (double)exponent);",
+    "}",
+    ""
+}
+
+-- ---- coroutine runtime ---------------------------------------------------
+
+-- Native coroutines use platform-supported stacks: Windows fibers and
+-- POSIX ucontext.  The generated functions receive a hidden `LusaCoro *`
+-- parameter, so a yield can unwind through ordinary helper calls while the
+-- normal drop paths keep every owned local deterministic.
+local COROUTINE_RUNTIME = {
+    "#if defined(_WIN32)",
+    "#include <windows.h>",
+    "#else",
+    "#include <ucontext.h>",
+    "#endif",
+    "",
+    "typedef struct LusaCoro LusaCoro;",
+    "typedef int32_t (*LusaCoroStep)(LusaCoro *);",
+    "",
+    "struct LusaCoro {",
+    "    int state; /* 0 suspended, 1 running, 2 normal, 3 dead */",
+    "    bool started;",
+    "    bool closing;",
+    "    int32_t arg;",
+    "    int32_t value;",
+    "    LusaCoroStep step;",
+    "    LusaCoro *parent;",
+    "#if defined(_WIN32)",
+    "    void *fiber;",
+    "    void *caller;",
+    "#else",
+    "    ucontext_t context;",
+    "    ucontext_t caller;",
+    "    char *stack;",
+    "#endif",
+    "};",
+    "",
+    "typedef struct LusaCoroResult {",
+    "    bool ok;",
+    "    int32_t value;",
+    "    LusaString *error;",
+    "} LusaCoroResult;",
+    "",
+    "static LusaCoro *lusa_current_coro = NULL;",
+    "",
+    "static LusaString *lusa_coro_error(const char *message) {",
+    "    return lusa_string_new(message, (uint64_t)strlen(message));",
+    "}",
+    "",
+    "static uint64_t lusa_alloc_mark(void) {",
+    "    return lusa_alloc_count;",
+    "}",
+    "",
+    "static void lusa_release_allocs_since(uint64_t mark) {",
+    "    while (lusa_alloc_count > mark) {",
+    "        lusa_alloc_count = lusa_alloc_count - 1u;",
+    "        free(lusa_alloc_list[lusa_alloc_count]);",
+    "    }",
+    "}",
+    "",
+    "#if defined(_WIN32)",
+    "static VOID CALLBACK lusa_coro_fiber_main(void *raw) {",
+    "    LusaCoro *co = (LusaCoro *)raw;",
+    "    co->value = co->step(co);",
+    "    co->state = 3;",
+    "    SwitchToFiber(co->caller);",
+    "}",
+    "#else",
+    "static void lusa_coro_context_main(void) {",
+    "    LusaCoro *co = lusa_current_coro;",
+    "    co->value = co->step(co);",
+    "    co->state = 3;",
+    "}",
+    "#endif",
+    "",
+    "static LusaCoro *lusa_coro_new(LusaCoroStep step) {",
+    "    LusaCoro *co = (LusaCoro *)calloc(1, sizeof(LusaCoro));",
+    '    if (co == NULL) { lusa_panic("out of memory"); return NULL; }',
+    "    co->state = 0;",
+    "    co->step = step;",
+    "#if defined(_WIN32)",
+    "    if (!IsThreadAFiber()) {",
+    '        if (ConvertThreadToFiber(NULL) == NULL) { free(co); lusa_panic("cannot convert thread to a fiber"); return NULL; }',
+    "    }",
+    "    co->fiber = CreateFiber((SIZE_T)(256u * 1024u),",
+    "        lusa_coro_fiber_main, co);",
+    '    if (co->fiber == NULL) { free(co); lusa_panic("cannot create coroutine stack"); return NULL; }',
+    "#else",
+    "    co->stack = (char *)malloc(256u * 1024u);",
+    '    if (co->stack == NULL) { free(co); lusa_panic("cannot create coroutine stack"); return NULL; }',
+    "    if (getcontext(&co->context) != 0) {",
+    '        free(co->stack); free(co); lusa_panic("cannot initialize coroutine context"); return NULL;',
+    "    }",
+    "    co->context.uc_stack.ss_sp = co->stack;",
+    "    co->context.uc_stack.ss_size = 256u * 1024u;",
+    "    co->context.uc_link = &co->caller;",
+    "    makecontext(&co->context, lusa_coro_context_main, 0);",
+    "#endif",
+    "    return co;",
+    "}",
+    "",
+    "static void lusa_coro_free_platform(LusaCoro *co) {",
+    "#if defined(_WIN32)",
+    "    if (co->fiber != NULL) {",
+    "        DeleteFiber(co->fiber);",
+    "        co->fiber = NULL;",
+    "    }",
+    "#else",
+    "    if (co->stack != NULL) {",
+    "        free(co->stack);",
+    "        co->stack = NULL;",
+    "    }",
+    "#endif",
+    "}",
+    "",
+    "static LusaCoroResult lusa_coro_resume(LusaCoro *co, int32_t arg) {",
+    "    LusaCoroResult result;",
+    "    LusaCoro *parent;",
+    "    result.ok = false;",
+    "    result.value = 0;",
+    "    result.error = NULL;",
+    "    if (co == NULL) {",
+    '        result.error = lusa_coro_error("E9999: cannot resume a nil coroutine");',
+    "        return result;",
+    "    }",
+    "    if (co->state == 1 || co->state == 2) {",
+    '        result.error = lusa_coro_error("E9999: cannot resume a running coroutine");',
+    "        return result;",
+    "    }",
+    "    if (co->state == 3) {",
+    '        result.error = lusa_coro_error("E9999: cannot resume a dead coroutine");',
+    "        return result;",
+    "    }",
+    "    parent = lusa_current_coro;",
+    "    if (parent != NULL && parent->state == 1) parent->state = 2;",
+    "    co->parent = parent;",
+    "    co->arg = arg;",
+    "    co->closing = false;",
+    "    co->state = 1;",
+    "    co->started = true;",
+    "    lusa_current_coro = co;",
+    "#if defined(_WIN32)",
+    "    co->caller = GetCurrentFiber();",
+    "    SwitchToFiber(co->fiber);",
+    "#else",
+    "    swapcontext(&co->caller, &co->context);",
+    "#endif",
+    "    lusa_current_coro = parent;",
+    "    if (parent != NULL && parent->state == 2) parent->state = 1;",
+    "    if (lusa_error_pending) {",
+    "        result.ok = false;",
+    "        result.value = 0;",
+    "        result.error = lusa_error_string();",
+    "        lusa_error_clear();",
+    "    } else {",
+    "        result.ok = true;",
+    "        result.value = co->value;",
+    "        result.error = NULL;",
+    "    }",
+    "    if (co->state == 3) {",
+    "        lusa_coro_free_platform(co);",
+    "    }",
+    "    return result;",
+    "}",
+    "",
+    "static int32_t lusa_coro_yield(LusaCoro *co, int32_t value) {",
+    "    if (co == NULL) {",
+    '        lusa_throw("E9999", "yield outside a coroutine");',
+    "        return 0;",
+    "    }",
+    "    co->value = value;",
+    "    co->state = 0;",
+    "    lusa_current_coro = co->parent;",
+    "#if defined(_WIN32)",
+    "    SwitchToFiber(co->caller);",
+    "#else",
+    "    swapcontext(&co->context, &co->caller);",
+    "#endif",
+    "    lusa_current_coro = co;",
+    "    co->state = 1;",
+    "    return co->arg;",
+    "}",
+    "",
+    "static bool lusa_coro_closing(LusaCoro *co) {",
+    "    return co != NULL && co->closing;",
+    "}",
+    "",
+    "static bool lusa_coro_close(LusaCoro *co) {",
+    "    LusaCoro *parent;",
+    "    if (co == NULL) return true;",
+    "    if (co->state == 1 || co->state == 2) return false;",
+    "    if (co->state == 0 && co->started) {",
+    "        parent = lusa_current_coro;",
+    "        if (parent != NULL && parent->state == 1) parent->state = 2;",
+    "        co->parent = parent;",
+    "        co->closing = true;",
+    "        co->arg = 0;",
+    "        co->state = 1;",
+    "        lusa_current_coro = co;",
+    "#if defined(_WIN32)",
+    "        co->caller = GetCurrentFiber();",
+    "        SwitchToFiber(co->fiber);",
+    "#else",
+    "        swapcontext(&co->caller, &co->context);",
+    "#endif",
+    "        lusa_current_coro = parent;",
+    "        if (parent != NULL && parent->state == 2) parent->state = 1;",
+    "        co->closing = false;",
+    "    }",
+    "    co->state = 3;",
+    "    lusa_coro_free_platform(co);",
+    "    return true;",
+    "}",
+    "",
+    "static LusaString *lusa_coro_status(LusaCoro *co) {",
+    '    const char *text = "dead";',
+    "    uint64_t length;",
+    "    if (co != NULL) {",
+    '        if (co->state == 0) text = "suspended";',
+    '        else if (co->state == 1) text = "running";',
+    '        else if (co->state == 2) text = "normal";',
+    "    }",
+    "    length = (uint64_t)strlen(text);",
+    "    return lusa_string_new(text, length);",
+    "}",
+    "",
+    "static bool lusa_coro_isyieldable(void) {",
+    "    return lusa_current_coro != NULL && lusa_current_coro->state == 1;",
+    "}",
+    "",
+    "static void lusa_drop_coroutine(LusaCoro **value) {",
+    "    if (value == NULL || *value == NULL) return;",
+    "    if (lusa_coro_close(*value)) {",
+    "        free(*value);",
+    "        *value = NULL;",
+    "    }",
     "}",
     ""
 }
@@ -3322,6 +4054,18 @@ local function emit_arithmetic(expr, lhs, rhs)
         end
         return "lusa_pow_i32(" .. lhs .. ", " .. rhs .. ")"
     end
+    if op == "/" then
+        if type_name == "u32" then
+            return "lusa_div_u32(" .. lhs .. ", " .. rhs .. ")"
+        end
+        if type_name == "i128" then
+            return "lusa_div_i128(" .. lhs .. ", " .. rhs .. ")"
+        end
+        if type_name == "f32" then
+            return "((" .. lhs .. ") / (" .. rhs .. "))"
+        end
+        return "lusa_div_i32(" .. lhs .. ", " .. rhs .. ")"
+    end
     if op == "//" then
         if type_name == "u32" then
             return "lusa_floor_div_u32(" .. lhs .. ", " .. rhs .. ")"
@@ -3440,15 +4184,55 @@ emit_expr = function(expr)
         if expr.builtin == "unsafe_asm" then
             return 'LUSA_ASM("' .. expr.asm_text .. '")'
         end
+        if expr.builtin == "coroutine_create" then
+            local cname = emit_function_cnames[expr.fn_name]
+            if cname == nil then
+                fail(expr.line, expr.column,
+                    "internal: coroutine entry has no C function")
+            end
+            return "lusa_coro_new((LusaCoroStep)" .. cname .. ")"
+        end
+        if expr.builtin == "coroutine_yield" then
+            local value = "0"
+            if #expr.args >= 1 and expr.args[1] ~= nil then
+                value = emit_expr(expr.args[1])
+            end
+            return "lusa_coro_yield(lusa_co, " .. value .. ")"
+        end
+        if expr.builtin == "coroutine_status" then
+            return "lusa_coro_status(" .. emit_expr(expr.args[1]) .. ")"
+        end
+        if expr.builtin == "coroutine_close" then
+            return "lusa_coro_close(" .. emit_expr(expr.args[1]) .. ")"
+        end
+        if expr.builtin == "coroutine_isyieldable" then
+            return "lusa_coro_isyieldable()"
+        end
         if expr.builtin == "print" then
             fail(expr.line, expr.column,
                 "internal: `print` must be used as a statement")
+        end
+        if expr.builtin == "error" then
+            local message = emit_expr(expr.args[1])
+            return '(lusa_throw("E9000", (' .. message
+                .. ') == NULL ? "" : (' .. message .. ')->data), (void)0)'
+        end
+        if expr.builtin == "assert" then
+            local condition = emit_expr(expr.args[1])
+            local message = '"assertion failed"'
+            if expr.args[2] ~= nil then
+                local rendered = emit_expr(expr.args[2])
+                message = '((' .. rendered .. ') == NULL ? "" : ('
+                    .. rendered .. ')->data)'
+            end
+            return '(( ' .. condition .. ') ? (void)0 : (lusa_throw('
+                .. '"E9100", ' .. message .. '), (void)0))'
         end
         local cname = emit_function_cnames[expr.fn_name]
         if cname == nil then
             fail(expr.line, expr.column, "internal: call has no function name")
         end
-        local args = {}
+        local args = { "lusa_current_coro" }
         local i = 1
         while i <= #expr.args do
             args[#args + 1] = emit_expr(expr.args[i])
@@ -3564,7 +4348,7 @@ emit_expr = function(expr)
         if cname == nil then
             fail(expr.line, expr.column, "internal: method has no function name")
         end
-        local args = { emit_expr(expr.obj) }
+        local args = { "lusa_current_coro", emit_expr(expr.obj) }
         local i = 1
         while i <= #expr.args do
             args[#args + 1] = emit_expr(expr.args[i])
@@ -3677,7 +4461,89 @@ local function emit_print_call(call)
     line("putchar(10);")
 end
 
+local function emit_pcall_local(stmt)
+    local call = stmt.values[1]
+    local ret = stmt.pcall.ret
+    local has_result = stmt.pcall.has_result
+    local alloc_mark = fresh("pcall_mark")
+    line("uint64_t " .. alloc_mark .. " = lusa_alloc_mark();")
+    line("lusa_error_clear();")
+    local result_temp = nil
+    if ret == "void" then
+        line("(void)(" .. emit_expr(clone call) .. ");")
+    else
+        result_temp = fresh("pcall_value")
+        line(c_type(ret) .. " " .. result_temp .. " = "
+            .. emit_expr(clone call) .. ";")
+    end
+    local ok_temp = fresh("pcall_ok")
+    line("bool " .. ok_temp .. " = !lusa_error_pending;")
+    line("if (!" .. ok_temp .. ") lusa_release_allocs_since(" .. alloc_mark .. ");")
+    local err_temp = fresh("pcall_err")
+    line("LusaString *" .. err_temp .. " = " .. ok_temp
+        .. ' ? lusa_string_new("", 0u) : lusa_error_string();')
+    line("lusa_error_clear();")
+
+    local ok_entry = emit_scope_declare(stmt.names[1], "bool", false, false)
+    line("bool " .. ok_entry.cname .. " = " .. ok_temp .. ";")
+    if has_result then
+        local result_entry = emit_scope_declare(stmt.names[2], ret,
+            is_heap_type(ret), false)
+        line(c_type(ret) .. " " .. result_entry.cname .. " = "
+            .. result_temp .. ";")
+        local err_entry = emit_scope_declare(stmt.names[3], "string", true, false)
+        line("LusaString *" .. err_entry.cname .. " = " .. err_temp .. ";")
+        return
+    end
+
+    -- Two names mean `ok, err`; release an owned result that is discarded.
+    if result_temp ~= nil and is_heap_type(ret) then
+        if ret == "string" then
+            line("lusa_drop_string(&" .. result_temp .. ");")
+        elseif ret == "coroutine" then
+            line("lusa_drop_coroutine(&" .. result_temp .. ");")
+        else
+            line("lusa_drop_table(&" .. result_temp .. ");")
+        end
+    end
+    local err_entry = emit_scope_declare(stmt.names[2], "string", true, false)
+    line("LusaString *" .. err_entry.cname .. " = " .. err_temp .. ";")
+end
+
+local function emit_coroutine_resume_local(stmt)
+    local call = stmt.values[1]
+    local has_error = stmt.coroutine_resume.has_error
+    local co = emit_expr(call.args[1])
+    local arg = "0"
+    if #call.args >= 2 and call.args[2] ~= nil then
+        arg = emit_expr(call.args[2])
+    end
+    local result_temp = fresh("coro_result")
+    line("LusaCoroResult " .. result_temp .. " = lusa_coro_resume("
+        .. co .. ", " .. arg .. ");")
+    local ok_entry = emit_scope_declare(stmt.names[1], "bool", false, false)
+    line("bool " .. ok_entry.cname .. " = " .. result_temp .. ".ok;")
+    local value_entry = emit_scope_declare(stmt.names[2], "i32", false, false)
+    line("int32_t " .. value_entry.cname .. " = " .. result_temp .. ".value;")
+    if has_error then
+        local err_entry = emit_scope_declare(stmt.names[3], "string", true, false)
+        line("LusaString *" .. err_entry.cname .. " = " .. result_temp
+            .. '.error != NULL ? ' .. result_temp
+            .. '.error : lusa_string_new("", 0u);')
+    else
+        line("lusa_drop_string(&" .. result_temp .. ".error);")
+    end
+end
+
 local function emit_local(stmt)
+    if stmt.pcall ~= nil then
+        emit_pcall_local(stmt)
+        return
+    end
+    if stmt.coroutine_resume ~= nil then
+        emit_coroutine_resume_local(stmt)
+        return
+    end
     local names = stmt.names
     local types = stmt.types
     local values = stmt.values
@@ -4017,6 +4883,19 @@ local function emit_return(stmt)
     rendered = emit_cast_to(return_type, rendered)
     local temp_name = fresh("ret")
     line(c_type(return_type) .. " " .. temp_name .. " = " .. rendered .. ";")
+    line("if (lusa_error_pending) {")
+    emit_indent = emit_indent + 1
+    emit_all_drops()
+    if emit_is_main then
+        emit_global_drops()
+        line("return lusa_error_report();")
+    elseif return_type == "void" then
+        line("return;")
+    else
+        line("return " .. default_c(return_type) .. ";")
+    end
+    emit_indent = emit_indent - 1
+    line("}")
     if value.own ~= false then
         null_moved_source(value, nil)
     end
@@ -4033,6 +4912,7 @@ local function emit_break(stmt)
     if #emit_loop_stack == 0 then
         fail(stmt.line, stmt.column, "internal: break outside a loop")
     end
+    emit_coro_closing_check()
     local loop_scope = emit_loop_stack[#emit_loop_stack]
     local i = emit_scope_count
     while i > loop_scope do
@@ -4117,7 +4997,14 @@ emit_block_statements = function(body)
     local count = #body
     local i = 1
     while i <= count do
-        emit_stmt(body[i])
+        local stmt = body[i]
+        local tag = stmt.tag
+        emit_stmt(stmt)
+        if tag ~= "Return" and tag ~= "Break"
+            and tag ~= "Function" and tag ~= "Struct" then
+            emit_error_check()
+            emit_coro_closing_check()
+        end
         i = i + 1
     end
 end
@@ -4197,7 +5084,7 @@ local function emit_function_prototypes()
     local i = 1
     while i <= #emit_functions do
         local signature = clone emit_functions[i]
-        local params = {}
+        local params = { "LusaCoro *lusa_co" }
         local j = 1
         while j <= #signature.params do
             params[#params + 1] = c_type(signature.params[j].type) .. " "
@@ -4205,9 +5092,6 @@ local function emit_function_prototypes()
             j = j + 1
         end
         local param_text = table.concat(params, ", ")
-        if param_text == "" then
-            param_text = "void"
-        end
         line("static " .. c_type(signature.ret) .. " " .. signature.cname
             .. "(" .. param_text .. ");")
         i = i + 1
@@ -4218,7 +5102,7 @@ local function emit_function_prototypes()
 end
 
 local function emit_function_definition(signature)
-    local params = {}
+    local params = { "LusaCoro *lusa_co" }
     local j = 1
     while j <= #signature.params do
         params[#params + 1] = c_type(signature.params[j].type) .. " "
@@ -4226,9 +5110,6 @@ local function emit_function_definition(signature)
         j = j + 1
     end
     local param_text = table.concat(params, ", ")
-    if param_text == "" then
-        param_text = "void"
-    end
 
     line("static " .. c_type(signature.ret) .. " " .. signature.cname
         .. "(" .. param_text .. ") {")
@@ -4307,6 +5188,11 @@ local function emit_c_impl(ast)
     local i = 1
     while i <= #RUNTIME do
         put(RUNTIME[i])
+        i = i + 1
+    end
+    i = 1
+    while i <= #COROUTINE_RUNTIME do
+        put(COROUTINE_RUNTIME[i])
         i = i + 1
     end
     put("")

@@ -214,6 +214,38 @@ way function calls do; to protect-call the same function twice, pass
 local ok = pcall(function() return risky(a, b) end)
 ```
 
+### Coroutines - `create`, `resume`, `yield`, `status`, `close`, `isyieldable`
+
+Coroutines are cooperative, isolated call stacks. `coroutine.create(f)` stores
+a function without running it. `coroutine.resume(co, ...)` starts or continues
+the coroutine and returns `true` plus the values passed to `yield`; when the
+body finishes it returns `true` plus the function's return values. A failure
+returns `false` plus an `"E-code: message"` string. `coroutine.yield(...)`
+suspends the current coroutine and later returns the values supplied to the
+next `resume`:
+
+```lusa
+function worker()
+    local incoming = coroutine.yield("ready")
+    return incoming + 1
+end
+
+local co = coroutine.create(worker)
+print(coroutine.status(co))       -- suspended
+print(coroutine.resume(co))       -- true	ready
+print(coroutine.status(co))       -- suspended
+print(coroutine.resume(co, 41))   -- true	42
+print(coroutine.status(co))       -- dead
+```
+
+`coroutine.status(co)` reports `suspended`, `running`, `normal`, or `dead`.
+`normal` means the coroutine is waiting for another coroutine it resumed.
+`coroutine.close(co)` closes a suspended coroutine and releases captured
+state; closing an unstarted coroutine is allowed, and closing a running one
+fails. `coroutine.isyieldable()` is `true` while executing inside a coroutine.
+Captured upvalues are shared with their closures; each coroutine has its own
+operand stack and local variables.
+
 `string`: `len upper lower sub rep reverse char byte find gsub format`.
 `find` and `gsub` are literal-only today (no Lua patterns) and `gsub`
 returns `(new text, count)`.
@@ -275,9 +307,11 @@ Codes `E{category}{n}`, like rustc:
 | E0301  | static   | C11 backend: missing/invalid function parameter or return type |
 | E0308  | static   | C11 backend: mismatched types (assignment, return, call, condition) |
 | E0311  | static   | C11 backend: wrong argument/initializer count |
+| E0313  | static   | C11 backend: zero or one return value only; void/value return mismatch |
 | E0316  | unsafe   | C11 backend: raw pointer intrinsic used outside `unsafe` |
+| E0317  | static   | C11 backend: `pcall` or `coroutine.resume` used outside its required local-initializer form |
 | E0318  | static   | C11 backend: missing method or invalid method receiver |
-| E0319  | static   | C11 backend: unsupported generic `for` iterator |
+| E0319  | static   | C11 backend: unsupported generic `for` iterator; invalid native coroutine entry function, handle, or operation |
 | E0320  | unsafe   | raw pointer arithmetic outside an `unsafe` block |
 | E0321  | unsafe   | raw pointer dereference outside an `unsafe` block |
 | E0322  | unsafe   | write through a `*const` pointer |
@@ -520,7 +554,100 @@ and `unsafe_alloc` hands out virtual regions. `unsafe_nop`/`unsafe_asm` are
 sandboxed no-ops, and dereferencing outside `unsafe` still reports `E0321`,
 so bare-metal logic can be debugged before native compilation.
 
-### 9.6 Native subset limits
+### 9.6 Native error recovery and coroutines (Module 12)
+
+Native protected calls use **checked error propagation**, not `setjmp`/
+`longjmp`. Runtime helpers record the first error in a runtime flag;
+generated functions return normally through their RAII drop paths; `pcall`
+inspects and clears the flag. A failed native `pcall` therefore keeps the
+process alive, releases every local declared above the failure point, and
+frees `unsafe_alloc` buffers created after the protected call began:
+
+```lusa
+function fail_after_alloc(): i32
+    unsafe do
+        local buffer: *mut u32 = unsafe_alloc(64)
+        error("failure after allocation")
+    end
+    return 0
+end
+
+local ok, err = pcall(fail_after_alloc)
+print(ok, err)                 -- false	E9000: failure after allocation
+print("still running")
+```
+
+Native `pcall` is compiler-lowered and has stricter syntax than the dynamic
+form:
+
+- It must be a local initializer. Use
+  `local ok, err = pcall(f, ...)` when the result is not needed, or
+  `local ok, result, err = pcall(f, ...)` to bind one return value. A void
+  callee requires the two-name form; a value-returning callee can use either.
+  On success the two-name error is the empty string. Using `pcall` as an
+  expression, in a return, or with one name reports `E0317`.
+- `f` must be a direct named user function, not a method, anonymous function,
+  or builtin such as `assert`. Wrap builtins in a named function. The target
+  function's parameter count and types are checked at compile time.
+- The native backend supports zero or one return value per function (`E0313`);
+  the `pcall` protocol itself adds the status and error slots.
+- An uncaught native runtime error prints `lusa runtime: <E-code>: <message>`
+  to stderr and exits with status `1`. Allocation failure and exhaustion of
+  the host stack or fiber stack remain process-level failures.
+
+Native coroutines use platform-supported stacks: Windows fibers
+(`CreateFiber`/`SwitchToFiber`) and POSIX `ucontext`. Every generated function
+receives a hidden `LusaCoro *lusa_co` parameter, so an ordinary helper can
+yield without special annotations; the normal drop checks unwind the helper
+chain when a coroutine is closed:
+
+```lusa
+function worker(): i32
+    local incoming: i32 = coroutine.yield(10)
+    return incoming + 1
+end
+
+local co = coroutine.create(worker)
+local ok1, value1 = coroutine.resume(co, 0)
+print(ok1, value1)             -- true	10
+local ok2, value2 = coroutine.resume(co, 41)
+print(ok2, value2)             -- true	42
+```
+
+The native coroutine subset is intentionally small:
+
+- `coroutine.create(f)` accepts only a named function with no parameters that
+  returns `i32`. Methods, parameters, anonymous functions, and other return
+  types report `E0319`. The result is a `coroutine` value that must remain in a
+  named local while it is resumed, inspected, or closed.
+- `coroutine.resume(co, value)` must also be a local initializer with two or
+  three names. The payload is one `i32`; varargs and multiple yield/resume
+  values are not part of the native subset. The two-name form binds
+  `ok, value` and discards the error. The three-name form binds
+  `ok, value, err`, with `err` an empty string on success and an
+  `"E-code: message"` string on failure.
+- `coroutine.yield(value)` returns the `i32` supplied to the next resume (or
+  `0` during close). It reports `E9999` if called from the program's main
+  flow, which is not a coroutine. A dedicated coroutine entry function may be
+  called directly, but then any yield is reported as an error.
+- `coroutine.status(co)`, `coroutine.close(co)`, and
+  `coroutine.isyieldable()` mirror the dynamic names. `close` returns a
+  `bool`; closing an unstarted or suspended coroutine succeeds, while closing
+  the currently running coroutine returns `false`. Closing resumes a suspended
+  fiber only to run its drop paths, then frees its stack.
+- An error inside a coroutine unwinds its locals, marks it `dead`, and is
+  returned by `resume` as `false` plus the error string. A later resume of a
+  dead coroutine reports `E9999`; the native message wording is
+  `cannot resume a dead coroutine`.
+
+The native 2-name `resume` result and 3-name error slot are deliberately
+different from the dynamic engines, where a failed 2-name `resume` binds the
+error string in the second slot and a failed 3-name `resume` puts the error in
+the second slot with `nil` third. Portable examples should print the status
+boolean and inspect the error only through the form appropriate to the chosen
+engine.
+
+### 9.7 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 array/keyed table literals, nested keyed tables, field reads/writes, colon
@@ -528,17 +655,18 @@ methods, `pairs`/`ipairs` generic `for`, one-based array indexing, `#`, `if`,
 `while`, `repeat`, `do`, `return`, `break`, assignments, globals, `print`,
 `clone`, `borrow`, `unsafe` blocks, static `struct` declarations, raw pointer
 types (`*mut u32`, `*const u32`, `*mut i32`, `*const i32`), pointer arithmetic
-and volatile dereferences inside `unsafe`, and the raw intrinsics above
+and volatile dereferences inside `unsafe`, the raw intrinsics above
 (`unsafe_ptr_cast`, `unsafe_read_mem`, `unsafe_write_mem`, `unsafe_alloc`,
-`unsafe_nop`, `unsafe_asm`).
+`unsafe_nop`, `unsafe_asm`), native `pcall`, and the restricted
+`coroutine.create/resume/yield/status/close/isyieldable` surface described in
+section 9.6.
 
 Not supported by the C emitter: numeric `for`, arbitrary dynamic key
 construction in table literals, assignment through a dynamic index, varargs,
-interpolated strings, closures/nested functions, the string library, `pcall`,
-and coroutines. Native colon methods are
-static functions and are not stored as table fields, so `pairs(user)` does not
-enumerate method names; keep enumerable data in a separate table when parity
-with the dynamic engines matters. The normal `lusalang run` interpreter and
-`--vm` engine continue to implement the full dynamic language in the preceding
-sections. Native `pcall` and coroutines are the first milestone in
-[docs/ROADMAP.md](ROADMAP.md).
+interpolated strings, closures/nested functions, the string library, multiple
+function return values (`E0313`), dynamic `pcall` expressions, and general
+first-class coroutine operations. Native colon methods are static functions
+and are not stored as table fields, so `pairs(user)` does not enumerate method
+names; keep enumerable data in a separate table when parity with the dynamic
+engines matters. The normal `lusalang run` interpreter and `--vm` engine
+continue to implement the full dynamic language in the preceding sections.

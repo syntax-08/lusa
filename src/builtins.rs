@@ -570,6 +570,7 @@ pub fn modules() -> Vec<(&'static str, Vec<(String, BF)>)> {
         ("string", map(string_mod())),
         ("table", map(table_mod())),
         ("json", map(json_mod())),
+        ("coroutine", crate::coroutine::module()),
     ]
 }
 
@@ -1303,7 +1304,7 @@ fn json_encode_value(
             }
             seen.pop();
         }
-        Value::Func(_) | Value::Iter(_) | Value::Alias(_) => {
+        Value::Func(_) | Value::Iter(_) | Value::Coroutine(_) | Value::Alias(_) => {
             return Err(LusaError::new(
                 E_ERROR,
                 Some(span),

@@ -5,6 +5,7 @@ pub mod ast;
 pub mod builtins;
 pub mod cbackend;
 pub mod compiler;
+pub mod coroutine;
 pub mod error;
 pub mod eval;
 pub mod interp;

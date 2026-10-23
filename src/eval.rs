@@ -41,6 +41,7 @@ pub fn key_hash_loose(v: &Value) -> Option<u64> {
         Value::Table(t) => Some(t.vid.wrapping_mul(0x9E3779B97F4A7C15) | 1),
         Value::Func(f) => Some(f.vid.wrapping_mul(0x9E3779B97F4A7C15) | 2),
         Value::Iter(i) => Some((Rc::as_ptr(i) as *const () as u64).wrapping_mul(0x9E3779B97F4A7C15) | 3),
+        Value::Coroutine(c) => Some((Rc::as_ptr(c) as *const () as u64).wrapping_mul(0x9E3779B97F4A7C15) | 4),
         Value::Alias(a) => key_hash_loose(&a.base),
     }
 }
@@ -54,6 +55,7 @@ pub fn key_eq_loose(a: &Value, b: &Value) -> bool {
         (Value::Table(x), Value::Table(y)) => Rc::ptr_eq(x, y),
         (Value::Func(x), Value::Func(y)) => Rc::ptr_eq(x, y),
         (Value::Iter(x), Value::Iter(y)) => Rc::ptr_eq(x, y),
+        (Value::Coroutine(x), Value::Coroutine(y)) => Rc::ptr_eq(x, y),
         (Value::Alias(x), _) => key_eq_loose(&x.base, b),
         (_, Value::Alias(y)) => key_eq_loose(a, &y.base),
         _ => false,

@@ -8,7 +8,9 @@ native builds, and `unsafe` volatile access for hardware registers. Module 9
 brings the same typed/`unsafe` surface to the interpreter and bytecode VM
 (with safe simulated memory), plus exact `i128` integer literals. Module 10
 adds native keyed tables, colon methods, and `pairs`/`ipairs` lowering to the
-C11 backend.
+C11 backend. Module 11 adds static structs, raw pointers, and kernel
+intrinsics. Module 12 adds cooperative coroutines and protects native runtime
+failures with checked `pcall` recovery and RAII cleanup.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -88,6 +90,11 @@ See [`examples/`](examples/):
 | `stdlib.lusa`             | `string`, `table`, `math`, iterators                  |
 | `ownership.lusa`          | `clone` / `borrow` / move in action                   |
 | `ownership-error.lusa`    | E1001/E1002/E1004 error codes, commented              |
+| `typed_native.lusa`       | typed C11 build with RAII and native output           |
+| `unsafe_hardware.lusa`    | simulated MMIO registers and volatile intrinsics      |
+| `structs_pointers.lusa`   | static structs and raw pointer access                 |
+| `error_recovery.lusa`     | `pcall`, error strings, and native cleanup            |
+| `coroutines.lusa`         | create/resume/yield/status/close lifecycle            |
 | `photocraft.lusa`         | mini photo-lab: 2D image in tables → filters → ASCII-art |
 
 Also in the root: `bench.lusa` — reference workload for measuring speed
@@ -113,8 +120,9 @@ cargo run -- examples/basics.lusa
     **E1002**; writing through the immutable alias → **E1004**.
 - **Methods**: `o:m()` passes the receiver as a *mutable borrow* —
   `function o:m() self.x = ... end` works naturally (mutating `self`).
-- **stdlib**: `print type tostring tonumber error assert pairs ipairs io_read_file`
-  `io_write_binary` `io_read_binary` + `string` `table` `math` `json` modules.
+- **stdlib**: `print type tostring tonumber error assert pcall pairs ipairs`
+  `io_read_file` `io_write_binary` `io_read_binary` + `string` `table` `math`
+  `json` modules, and `coroutine.create/resume/yield/status/close/isyieldable`.
 - **Errors** in cargo style (`error[E1001]: ...`, `note:` and `help:`),
   E-codes: lexer (E0001), parser (E0101), ownership (E1001–E1005),
   runtime types and I/O (E2001–E2009), `error`/`assert` (E9000/E9100).
@@ -126,7 +134,8 @@ cargo run -- examples/basics.lusa
 src/
   tokens.rs  lexer.rs     # tokens and lexing (strings with recursive interpolation)
   ast.rs     parser.rs    # AST — Lua-like syntax tree
-  value.rs                # values, tables, ownership/borrow registry
+  value.rs                # values, tables, coroutines, ownership registry
+  coroutine.rs            # isolated stacks and cooperative resume/yield
   scope.rs   interp.rs    # scopes, frames, execution, move rules
   eval.rs     builtins.rs # expression evaluation; stdlib
   compiler.rs vm.rs       # AST → bytecode compiler; register-based VM
@@ -322,6 +331,64 @@ end
 RAII scopes are entered per iteration, so temporary strings/tables allocated in
 the loop body are dropped before the next iteration.
 
+### Error recovery and coroutines (Module 12)
+
+Dynamic `pcall` keeps its Lua-style result list: `true, ...` on success or
+`false, "E-code: message"` on failure. Native `pcall` is a compiler-lowered,
+local-initializer form with the same error string and deterministic cleanup:
+
+```lusa
+function fail_after_alloc(): i32
+    unsafe do
+        local buffer: *mut u32 = unsafe_alloc(64)
+        error("failure after allocation")
+    end
+    return 0
+end
+
+local ok, err = pcall(fail_after_alloc)
+print(ok, err)                 -- false	E9000: failure after allocation
+print("still running")
+```
+
+Native `pcall` accepts `local ok, err = pcall(f, ...)` (result discarded) or
+`local ok, result, err = pcall(f, ...)`, where `f` is a direct named function.
+It records an allocation mark, fails without terminating the process, and
+releases `unsafe_alloc` buffers created after the call began. Ordinary locals
+are released by the same RAII drops used on a normal return. Uncaught errors
+print `lusa runtime: <E-code>: <message>` and exit with status `1`.
+
+Coroutines use isolated stacks in every engine. The dynamic engines support
+general functions and multiple values; the native backend uses Windows fibers
+or POSIX `ucontext` and supports a named zero-parameter `i32` entry function
+with one `i32` payload per resume/yield:
+
+```lusa
+function worker(): i32
+    local incoming: i32 = coroutine.yield(10)
+    return incoming + 1
+end
+
+local co = coroutine.create(worker)
+local ok1, value1 = coroutine.resume(co, 0)
+print(ok1, value1)             -- true	10
+local ok2, value2 = coroutine.resume(co, 41)
+print(ok2, value2)             -- true	42
+```
+
+`coroutine.status`, `coroutine.isyieldable`, and `coroutine.close` complete the
+lifecycle. Closing a suspended native coroutine resumes it through its normal
+drop paths before freeing the stack. See
+[`docs/LANGUAGE.md`](docs/LANGUAGE.md) section 9.6 for the exact native
+subset and the deliberate differences between the native and dynamic
+resume/error slots.
+
+```sh
+lusalang run examples/error_recovery.lusa
+lusalang run examples/error_recovery.lusa --native
+lusalang run examples/coroutines.lusa --vm
+```
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -336,7 +403,9 @@ illustrative MMIO address before native execution).
 
 `tests/c_backend.rs` covers typed mapping, functions/tables, moves/clone/drops,
 Cargo-style diagnostics, unsafe volatile emission, and a native build/run test
-that skips when no compiler is installed. See
+that skips when no compiler is installed. `tests/module12.rs` adds native
+`pcall` recovery, allocation marks, uncaught-error exits, coroutine lifecycle,
+nested yields, and dynamic parity. See
 [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
 [`docs/LANGUAGE.md`](docs/LANGUAGE.md) section 9 for details.
 
@@ -381,8 +450,9 @@ Near-term milestones:
   arithmetic and volatile dereferences inside `unsafe`, kernel intrinsics
   (`unsafe_nop`, `unsafe_asm`, `unsafe_alloc`), and safe sandbox emulation in
   the interpreter and bytecode VM.
-- **v0.8.0:** native `pcall` and coroutines, with the same error contract as
-  the interpreter and bytecode VM.
+- **v0.8.0 (shipped):** native `pcall` with checked error propagation and RAII
+  cleanup, plus cooperative coroutines in the interpreter, VM, and native
+  backend.
 - **v0.9.0:** Lua-style string patterns (`find`, `match`, `gmatch`, `gsub`)
   backed by one matcher shared across engines.
 - **v1.0.0:** a compile-time borrow checker plus explicit `move`/`copy`

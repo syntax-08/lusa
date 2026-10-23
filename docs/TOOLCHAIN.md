@@ -382,7 +382,7 @@ lusalang run main.lusa --vm   # compile + run on the bytecode VM
 
 Both speak the same language, including the ownership model (`move` via plain
 assignment, `clone`, `borrow` — note: `borrow` is interpreter-only for now),
-pcall error handling and E-codes.
+`pcall` error handling and E-codes, and cooperative coroutines.
 
 ### VM hot-path notes
 

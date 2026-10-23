@@ -1,0 +1,34 @@
+-- Module 12: protected calls keep failures local.
+-- Run with the interpreter, the VM, or the native backend.
+
+function fail_after_alloc(): i32
+    unsafe do
+        local buffer: *mut u32 = unsafe_alloc(64)
+        error("failure after allocation")
+        print(buffer)
+    end
+    return 0
+end
+
+function require_positive(n: i32): i32
+    assert(n > 0, "positive value required")
+    return n
+end
+
+-- Two names bind `ok, err`; the callee result is not needed here.
+local ok, err = pcall(fail_after_alloc)
+print("user error caught:", ok, err)
+
+-- Three names bind `ok, result, err`.
+local ok2, value, err2 = pcall(require_positive, 5)
+print("success:", ok2, value)
+if not ok2 then
+    print("unexpected failure:", err2)
+end
+
+local ok3, err3 = pcall(require_positive, 0)
+print("assert caught:", ok3, err3)
+
+-- A caught failure does not stop the surrounding program.
+print("program continues")
+return 0

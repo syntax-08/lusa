@@ -10,13 +10,14 @@
 //! is expressed with parent *indexes* (no recursive borrows), with Lua-style
 //! upvalue-chain synthesis when a nested function reads outer locals.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::ast::*;
 use crate::error::{LResult, LusaError, SourceMap, Span};
-use crate::value::Value;
+use crate::value::{SlotV, Value};
 
 // ===== compiled units =====
 
@@ -147,6 +148,12 @@ pub enum Instr {
     // caller executing a separate `TruncateToOne`
     CallOne(u16, u16),
     CallExpOne(u16, u16),
+    /// direct `coroutine.yield(...)` suspension point. The VM leaves the
+    /// instruction and resumes after it when the coroutine is resumed.
+    Yield(u16, u16),
+    YieldExp(u16, u16),
+    YieldOne(u16, u16),
+    YieldExpOne(u16, u16),
     MethodCall(u16, u16, u16),
     MethodCallExp(u16, u16, u16),
     MethodCallOne(u16, u16, u16),
@@ -827,6 +834,8 @@ fn emit_truncate_one(c: &mut Compiler) {
         let fused = match *last {
             Instr::Call(a, b) => Some(Instr::CallOne(a, b)),
             Instr::CallExp(a, b) => Some(Instr::CallExpOne(a, b)),
+            Instr::Yield(a, b) => Some(Instr::YieldOne(a, b)),
+            Instr::YieldExp(a, b) => Some(Instr::YieldExpOne(a, b)),
             Instr::MethodCall(a, b, d) => Some(Instr::MethodCallOne(a, b, d)),
             Instr::MethodCallExp(a, b, d) => Some(Instr::MethodCallExpOne(a, b, d)),
             _ => None,
@@ -886,6 +895,26 @@ fn compile_call(
     span: Span,
     _end: Span,
 ) -> LResult<()> {
+    if is_direct_coroutine_yield(c, callee) {
+        let n = args.len();
+        let mut nt = 0usize;
+        for (i, arg) in args.iter().enumerate() {
+            let dest = format!("(yield argument {})", i + 1);
+            if compile_take_value(c, arg, &dest, true)? {
+                nt += 1;
+            }
+            if i + 1 < n {
+                truncate_if_expansion(c, arg);
+            }
+        }
+        c.set_line(span);
+        if n > 0 && is_expansion(&args[n - 1]) {
+            c.em(Instr::YieldExp((n - 1) as u16, nt as u16));
+        } else {
+            c.em(Instr::Yield(n as u16, nt as u16));
+        }
+        return Ok(());
+    }
     compile_expr(c, callee)?;
     truncate_if_expansion(c, callee);
     let n = args.len();
@@ -906,6 +935,98 @@ fn compile_call(
         c.em(Instr::Call(n as u16, nt as u16));
     }
     Ok(())
+}
+
+/// `true` for a direct `coroutine.yield(...)` call whose `coroutine` name
+/// resolves to the standard-library global. A user local named `coroutine`
+/// keeps normal call semantics.
+fn is_direct_coroutine_yield(c: &mut Compiler, callee: &Expr) -> bool {
+    let ExprKind::Field { obj, name } = &callee.kind else {
+        return false;
+    };
+    if name.as_str() != "yield" {
+        return false;
+    }
+    let ExprKind::Var(root) = &obj.kind else {
+        return false;
+    };
+    root.as_str() == "coroutine" && matches!(resolve(c, "coroutine"), Resolved::Global)
+}
+
+/// Compiles a function literal that must be callable without a surrounding
+/// bytecode frame (a coroutine entry or a function called from one). Visible
+/// interpreter locals are exposed as synthetic upvalues so captured reads
+/// keep working; the returned `captures` list lets the coroutine library
+/// synchronize those cells with their originating scopes.
+pub struct RuntimeFunction {
+    pub compiled: Rc<Compiled>,
+    pub upvals: Rc<[Rc<RefCell<SlotV>>]>,
+    pub captures: Vec<(usize, crate::scope::ScopeRef, Arc<str>)>,
+}
+
+pub fn compile_runtime_function(
+    lit: &FuncLit,
+    env: &[crate::scope::ScopeRef],
+    structs: &HashMap<String, Vec<(String, String)>>,
+    seed: Option<&crate::value::CaptureMap>,
+) -> LResult<RuntimeFunction> {
+    let source = Arc::new(SourceMap::new(""));
+    let mut c = Compiler {
+        frames: vec![Frame::new("runtime", None)],
+        source,
+        struct_defs: structs.clone(),
+    };
+
+    // Expose every name visible through the closure environment. The compiler
+    // only creates upvalues for the names the body actually reads or writes.
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    for sc in env {
+        for name in sc.borrow().vars.keys() {
+            if seen.insert(name.clone(), ()).is_none() {
+                c.declare(name);
+            }
+        }
+    }
+
+    compile_nested_fn(&mut c, lit, "coroutine")?;
+    let parent = c.frames.pop().expect("runtime parent frame");
+    let compiled = parent
+        .protos
+        .into_iter()
+        .next()
+        .expect("coroutine prototype");
+
+    let mut upvals: Vec<Rc<RefCell<SlotV>>> =
+        Vec::with_capacity(compiled.proto.upval_labels.len());
+    let mut captures: Vec<(usize, crate::scope::ScopeRef, Arc<str>)> = Vec::new();
+    for (i, label) in compiled.proto.upval_labels.iter().enumerate() {
+        // A helper called from a running coroutine must share the coroutine's
+        // existing cells, not take a fresh snapshot of the outer scopes.
+        if let Some(existing) = seed.and_then(|map| map.get(&**label)) {
+            upvals.push(existing.1.clone());
+            captures.push((i, existing.0.clone(), label.clone()));
+            continue;
+        }
+        if let Some(sc) = crate::scope::find_in(env, &**label) {
+            let value = {
+                let b = sc.borrow();
+                match b.vars.get(&**label) {
+                    Some(SlotV::Set(v)) => v.clone(),
+                    _ => Value::Nil,
+                }
+            };
+            upvals.push(Rc::new(RefCell::new(SlotV::Set(value))));
+            captures.push((i, sc, label.clone()));
+        } else {
+            upvals.push(Rc::new(RefCell::new(SlotV::Set(Value::Nil))));
+        }
+    }
+
+    Ok(RuntimeFunction {
+        compiled,
+        upvals: Rc::from(upvals),
+        captures,
+    })
 }
 
 /// Compiles `obj:name(args...)`.

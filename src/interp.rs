@@ -46,6 +46,11 @@ pub struct Interp {
     pub struct_defs: HashMap<String, StructDef>,
     /// next simulated base address handed out by `unsafe_alloc`
     pub unsafe_alloc_next: u64,
+    /// ids of coroutines currently executing (innermost last)
+    pub active_coroutines: Vec<u64>,
+    /// upvalue cells of the running coroutine, used when helper functions are
+    /// compiled on demand so they share captures instead of taking snapshots
+    pub coroutine_captures: Vec<value::CaptureMap>,
 }
 
 pub struct Frame {
@@ -88,6 +93,8 @@ impl Interp {
             unsafe_depth: 0,
             struct_defs: HashMap::new(),
             unsafe_alloc_next: 0x1000,
+            active_coroutines: Vec::new(),
+            coroutine_captures: Vec::new(),
         }
     }
 

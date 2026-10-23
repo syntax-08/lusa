@@ -1,0 +1,57 @@
+-- Module 12: cooperative coroutines with isolated stacks.
+-- Run with the interpreter, the VM, or the native backend.
+
+function helper(): i32
+    local incoming: i32 = coroutine.yield(10)
+    return incoming + 1
+end
+
+function worker(): i32
+    local label: string = "worker" .. "-local"
+    print("worker start:", label)
+    local value: i32 = helper()
+    print("worker resumed:", value)
+    local again: i32 = coroutine.yield(value + 1)
+    return again * 2
+end
+
+local co = coroutine.create(worker)
+print("yieldable outside:", coroutine.isyieldable())
+
+local status1: string = coroutine.status(co)
+print("status:", status1)
+
+local ok1, value1 = coroutine.resume(co, 0)
+print("first resume:", ok1, value1)
+
+local ok2, value2 = coroutine.resume(co, 5)
+print("second resume:", ok2, value2)
+
+local ok3, value3 = coroutine.resume(co, 8)
+print("third resume:", ok3, value3)
+
+local status2: string = coroutine.status(co)
+print("status:", status2)
+
+function cancellable(): i32
+    local payload: string = "temporary" .. "-state"
+    print("cancellable start:", payload)
+    coroutine.yield(99)
+    print("this line is skipped after close")
+    return 0
+end
+
+local pending = coroutine.create(cancellable)
+local ok4, value4 = coroutine.resume(pending, 0)
+print("pending resume:", ok4, value4)
+
+local status3: string = coroutine.status(pending)
+print("status:", status3)
+print("close:", coroutine.close(pending))
+
+local status4: string = coroutine.status(pending)
+print("status:", status4)
+
+local ok5, value5 = coroutine.resume(pending, 0)
+print("dead resume:", ok5)
+return 0

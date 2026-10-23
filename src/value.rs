@@ -126,8 +126,76 @@ pub enum Value {
     Table(Rc<TableObj>),
     Func(Rc<FuncObj>),
     Iter(Rc<RefCell<IterState>>),
+    /// cooperative coroutine: a suspended bytecode VM plus its entry data
+    Coroutine(Rc<RefCell<CoroutineObj>>),
     /// result of `borrow x` — an alias to a heap value
     Alias(Box<AliasBox>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoroState {
+    Suspended,
+    Running,
+    Dead,
+}
+
+/// Captured coroutine locals keyed by name. Every entry keeps the cell shared
+/// by the coroutine's compiled frames and the interpreter scope it came from.
+pub type CaptureMap = std::collections::HashMap<
+    String,
+    (crate::scope::ScopeRef, Rc<RefCell<SlotV>>),
+>;
+
+/// A coroutine owns a private bytecode VM. The VM is swapped into
+/// `Interp::vm` only while the coroutine is running, so suspended stacks
+/// (registers, upvalues, and pending expression values) stay alive between
+/// resumes.
+pub struct CoroutineObj {
+    pub id: u64,
+    pub state: CoroState,
+    pub vm: crate::vm::Vm,
+    /// compiled entry function, consumed on the first resume
+    pub entry: Option<(
+        Rc<crate::compiler::Compiled>,
+        Rc<[Rc<RefCell<SlotV>>]>,
+    )>,
+    /// entry upvalues stay reachable after `entry` is consumed so their
+    /// captured values can be synchronized with interpreter scopes.
+    pub upvals: Option<Rc<[Rc<RefCell<SlotV>>]>>,
+    /// cells shared by entry and helper functions compiled on demand
+    pub capture_env: CaptureMap,
+    /// the pending yield expression truncates its resume result to one value
+    pub yield_one: bool,
+}
+
+impl CoroutineObj {
+    pub fn new(
+        id: u64,
+        entry: Option<(
+            Rc<crate::compiler::Compiled>,
+            Rc<[Rc<RefCell<SlotV>>]>,
+        )>,
+        upvals: Option<Rc<[Rc<RefCell<SlotV>>]>>,
+        captures: Vec<(usize, crate::scope::ScopeRef, Arc<str>)>,
+    ) -> CoroutineObj {
+        let mut capture_env = CaptureMap::new();
+        if let Some(cells) = &upvals {
+            for (index, scope, name) in captures {
+                if let Some(cell) = cells.get(index) {
+                    capture_env.insert(name.to_string(), (scope, cell.clone()));
+                }
+            }
+        }
+        CoroutineObj {
+            id,
+            state: CoroState::Suspended,
+            vm: crate::vm::Vm::new(),
+            entry,
+            upvals,
+            capture_env,
+            yield_one: false,
+        }
+    }
 }
 
 pub struct AliasBox {
@@ -183,6 +251,7 @@ impl Clone for Value {
             Value::Table(t) => Value::Table(Rc::clone(t)),
             Value::Func(f) => Value::Func(Rc::clone(f)),
             Value::Iter(i) => Value::Iter(Rc::clone(i)),
+            Value::Coroutine(c) => Value::Coroutine(Rc::clone(c)),
         }
     }
 }
@@ -216,6 +285,7 @@ impl Value {
             Value::Table(_) => "table",
             Value::Func(_) => "function",
             Value::Iter(_) => "iterator",
+            Value::Coroutine(_) => "coroutine",
             Value::Alias(a) => a.base.type_name(),
         }
     }
@@ -270,6 +340,7 @@ impl Value {
             Value::Table(t) => format!("table: 0x{:x}", t.vid),
             Value::Func(f) => format!("function: 0x{:x}", f.vid),
             Value::Iter(_) => "iterator".into(),
+            Value::Coroutine(c) => format!("coroutine: 0x{:x}", c.borrow().id),
             Value::Alias(_) => self.type_name().into(),
         }
     }

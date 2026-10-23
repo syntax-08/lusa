@@ -21,7 +21,22 @@ and, where supported, the C11 backend.
 - **Safety diagnostics:** `E0320` (pointer arithmetic), `E0321` (dereference),
   and `E0322` (write through `*const`) with Cargo-style spans.
 
-## Baseline after v0.7.0
+## Shipped in v0.8.0 - error recovery and coroutines
+
+- **Native `pcall`:** checked error propagation replaces the fatal
+  `lusa_panic` path for catchable runtime errors. Generated functions return
+  through their normal RAII drops, and the protected boundary releases
+  `unsafe_alloc` buffers created after the call began.
+- **Coroutines:** `create`, `resume`, `yield`, `status`, `close`, and
+  `isyieldable` run in the interpreter and VM with isolated stacks and shared
+  captured state. The native backend uses Windows fibers and POSIX `ucontext`,
+  with a hidden `LusaCoro *` parameter on every generated function.
+- **Diagnostics and limits:** native `pcall` and `resume` require local
+  initializer forms (`E0317`); native coroutine entries are named,
+  zero-parameter `i32` functions (`E0319`); the native backend supports zero or
+  one return value (`E0313`).
+
+## Baseline after v0.8.0
 
 | Area | Interpreter | Bytecode VM | C11 backend |
 | --- | --- | --- | --- |
@@ -30,99 +45,92 @@ and, where supported, the C11 backend.
 | `pairs` / `ipairs` | yes | yes | yes (native loops) |
 | Static structs | simulated buffers | simulated buffers | C typedef + member access |
 | Raw pointers | simulated addresses | simulated addresses | volatile C pointers |
-| `pcall` | yes (`src/builtins.rs`) | yes | no |
-| Coroutines | no | no | no |
+| `pcall` | yes (`src/builtins.rs`) | yes | yes (named-function subset) |
+| Coroutines | yes | yes | yes (fibers/`ucontext`, restricted subset) |
 | String patterns | literal `find`/`gsub` only | literal only | no string library |
 | Ownership checks | runtime registry (`src/value.rs`) | runtime registry | static subset (`compiler_bootstrap.lusa`) |
 | Explicit `move` / `copy` | no | no | no |
 
-The C backend currently reports fatal runtime conditions through
-`lusa_panic`, which flushes output and calls `exit(1)`. That is the main
-blocker for native protected calls. The dynamic engines already model the
-ownership rules at runtime, but the compiler does not yet prove them ahead of
-time.
-
-## Module 12 - Error Recovery and Coroutines (target v0.8.0)
+## Module 12 - Error Recovery and Coroutines (shipped in v0.8.0)
 
 ### 12.1 Native protected calls (`pcall`)
 
-The dynamic `pcall(f, ...)` contract is already stable: success returns `true`
+The dynamic `pcall(f, ...)` contract stays unchanged: success returns `true`
 followed by the callee's results; any error returns `false` and an
-`"E-code: message"` string. Module 11 must make the same contract available to
-native builds without leaking heap values or skipping RAII drops.
+`"E-code: message"` string. Native builds now expose a statically checked,
+local-initializer variant with the same error string shape and no skipped RAII
+drops.
 
 **Runtime design**
 
-1. Replace the process-exiting `lusa_panic` path with a `LusaErrorFrame`
-   stack. `lusa_throw(code, message)` records the error, unwinds registered
-   drop frames down to the nearest `pcall` frame, and transfers control with
-   C11 `setjmp`/`longjmp`.
-2. Add a scope journal to the generated code. Each lexical scope pushes the
-   addresses of its owned slots; a normal exit runs the same drops in reverse
-   order, and an error unwind runs exactly the scopes above the protected
-   frame. This preserves the v0.6.1 guarantee that every owned value is
-   released once.
-3. Keep OOM, bounds, division-by-zero, and table-index failures on the same
-   error path; no runtime failure may bypass cleanup.
-4. Convert the error value to an owned `LusaString` only at the `pcall`
-   boundary, so intermediate frames do not allocate while unwinding.
+1. Catchable runtime errors use **checked error propagation**. Helpers record
+   the first error in a flag; generated functions test the flag after each
+   statement, run their normal drops, and return a default value. No
+   `setjmp`/`longjmp` frame stack is used.
+2. The protected boundary clears the flag before the call, records an
+   `unsafe_alloc` mark, and inspects the flag afterwards. A failed call frees
+   buffers allocated after the mark and converts the recorded error into an
+   owned `LusaString`.
+3. OOM, bounds, division-by-zero, and table-index failures all use the same
+   checked path. Ordinary string/table locals are released by generated RAII
+   drops as the callee returns.
+4. Uncaught errors still print `lusa runtime: <E-code>: <message>` to stderr
+   and exit with status `1`; no error bypasses cleanup.
 
 **Code generation and type checking**
 
-- Recognize `pcall` in `check_call` as a builtin with the signature
-  `pcall(f: function, ...) -> (bool, T...)`. The first version can require a
-  direct named function (the native subset has no first-class closures) and
-  one result value; the dynamic engines keep the full Lua-style result list.
-- Emit a protected region around the direct call, store the success flag and
-  result/error in temporaries, and continue in the surrounding scope.
-- Reject `pcall` with unsupported argument or result shapes using a normal
-  `E03xx` diagnostic rather than an internal emitter error.
-- Add `pcall` to `Compiler.memory_layout()` and the native compatibility
-  table in `docs/LANGUAGE.md`.
+- Native `pcall` requires a direct named function and a local initializer:
+  `local ok, err = pcall(f, ...)` or
+  `local ok, result, err = pcall(f, ...)`. Wrong shapes report `E0317`;
+  arguments are checked against the target signature.
+- The emitter wraps the direct call, stores the success flag and
+  result/error in temporaries, releases post-mark allocations on failure, and
+  continues in the surrounding scope.
+- The native backend keeps the zero-or-one return rule (`E0313`); the dynamic
+  engines keep the full Lua-style result list.
 
 **Coroutines**
 
-- Introduce `coroutine.create`, `resume`, `yield`, `status`, and `close`.
-- Interpreter and VM: represent a coroutine as a value owning a suspended
-  frame, its registers, and its heap roots. Resume transfers arguments into
-  the frame; yield transfers values out and leaves owned locals alive in the
-  coroutine.
-- Native: prefer stackless lowering to an explicit state machine over
-  platform fibers. A coroutine function becomes a generated `switch` over
-  suspension points, with locals promoted into a heap-allocated frame.
-  `yield` returns `LUSA_CORO_YIELD`; `resume` re-enters at the saved state.
-  This keeps the backend portable C11 and avoids `ucontext`/Windows-fiber
-  dependencies.
-- Closing or cancelling a coroutine runs the frame's drop journal, including
-  values created after the last resume.
-- Errors inside a coroutine propagate through `resume` and are catchable with
-  `pcall`.
+- `coroutine.create`, `resume`, `yield`, `status`, `close`, and
+  `isyieldable` are implemented in the interpreter and the VM. A coroutine
+  owns an isolated stack and shares captured cells with its closure.
+- Native coroutines use Windows fibers and POSIX `ucontext`. Every generated
+  function carries a hidden `LusaCoro *` parameter, so helper calls can yield
+  through ordinary frames without converting the program into a state machine.
+- Closing a suspended coroutine resumes it with a closing flag; each statement
+  boundary unwinds the frame through the normal drops. Closing an unstarted
+  coroutine is allowed.
+- Errors inside a coroutine mark it dead, drop its locals, and are returned
+  through `resume` as `false` plus the error string.
 
 **Acceptance criteria**
 
-- Native and dynamic `pcall` agree on success/failure values and E-codes.
-- A native program that throws after allocating strings, tables, and nested
-  tables is leak-free under the project's allocation counter/ASan job.
-- `break`, `return`, and error unwinds drop loop-body locals exactly once.
+- Native and dynamic `pcall` agree on success/failure booleans and E-codes for
+  shared error cases.
+- A native program that throws after allocating strings, tables, and
+  `unsafe_alloc` buffers cleans up without terminating the process.
+- `break`, `return`, close, and error paths drop loop-body and coroutine locals
+  exactly once.
 - Coroutine tests cover yield/resume values, close/drop, nested coroutines,
   errors, and VM/interpreter parity.
-- Release gate: full three-OS CI plus a native error-unwind stress test.
+- Release gate: full three-OS CI plus native error-unwind and coroutine tests.
 
-**Risks**
+**Risks and limits**
 
-- `setjmp`/`longjmp` interacts badly with C++ destructors, but generated code
-  is C11 and uses explicit journals, so the risk is contained.
-- Stackless coroutine lowering increases emitter complexity; keep the first
-  release to named coroutine functions with explicit `yield` sites.
-- Multiple native return values may require a small result struct; do not
-  silently truncate.
+- Native coroutine stacks are platform resources (fibers/`ucontext`); keep the
+  first release to named zero-parameter `i32` entry functions and one `i32`
+  payload per resume/yield.
+- POSIX `ucontext` is deprecated on some platforms but remains available on
+  the supported Linux/macOS targets; CI covers both architectures.
+- Multiple native return values still require a result struct and remain out
+  of scope (`E0313`).
 
 ## Module 13 - String Utilities and Pattern Matching (target v0.9.0)
 
 ### 13.1 Pattern engine
 
 `string.find` and `string.gsub` currently compare literal character slices in
-`src/builtins.rs`. Module 12 adds a real pattern layer shared by all engines.
+`src/builtins.rs`. Module 13 adds a real pattern layer shared by all engines.
 
 **Surface API**
 
@@ -255,7 +263,7 @@ compile-time analysis and makes explicit transfer syntax part of the language.
 | Version | Theme | Required before tagging |
 | --- | --- | --- |
 | v0.7.0 | Static structs, raw pointers, kernel intrinsics (shipped) | three-OS CI, sandbox parity, native volatile access |
-| v0.8.0 | Native `pcall`, coroutines | three-OS CI, native unwind/leak suite, parity tests |
+| v0.8.0 | Native `pcall`, coroutines (shipped) | three-OS CI, native unwind/leak suite, parity tests |
 | v0.9.0 | Pattern matching and string utilities | shared matcher, fuzz corpus, native/VM/interpreter parity |
 | v1.0.0 | Static borrow checker, explicit `move`/`copy`, stabilization | golden diagnostics, migration report, frozen semantics |
 
