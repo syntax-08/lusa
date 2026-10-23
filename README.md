@@ -373,16 +373,22 @@ lusalang run main.lusa --vm
 
 ## Roadmap
 
-- Expand bytecode VM coverage (`borrow` is interpreter-only today) and make it
-  the default engine
-- pcall / coroutines
-- string patterns (gmatch/find with patterns, today literal-only)
-- explicit `move`/`copy` labels and a complete borrow checker
-- full native self-hosting: keyed/heterogeneous tables, field/index
-  assignment, heap `clone`, closures/functions, and numeric/generic `for`
-  parser coverage, then self-compilation of the bootstrap module (the native
-  heap runtime and RAII drops are already in place)
-- linter-style analysis-time errors (rustc-friendly)
+The detailed engineering plan lives in [docs/ROADMAP.md](docs/ROADMAP.md).
+
+Near-term milestones:
+
+- **v0.7.0:** native `pcall` and coroutines, with the same error contract as
+  the interpreter and bytecode VM.
+- **v0.8.0:** Lua-style string patterns (`find`, `match`, `gmatch`, `gsub`)
+  backed by one matcher shared across engines.
+- **v0.9.0:** a compile-time borrow checker plus explicit `move`/`copy`
+  labels and golden diagnostics.
+- **v1.0.0:** language stabilization.
+
+Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
+today), make the VM the default engine, and complete native self-hosting of
+the bootstrap compiler (keyed tables, nested fields, heap `clone`, and generic
+`for` are already native).
 
 ## License
 

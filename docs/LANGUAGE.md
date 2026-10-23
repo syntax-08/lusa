@@ -473,9 +473,11 @@ methods, `pairs`/`ipairs` generic `for`, one-based array indexing, `#`, `if`,
 
 Not supported by the C emitter: numeric `for`, arbitrary dynamic key
 construction in table literals, assignment through a dynamic index, varargs,
-interpolated strings, and closures/nested functions. Native colon methods are
+interpolated strings, closures/nested functions, the string library, `pcall`,
+and coroutines. Native colon methods are
 static functions and are not stored as table fields, so `pairs(user)` does not
 enumerate method names; keep enumerable data in a separate table when parity
 with the dynamic engines matters. The normal `lusalang run` interpreter and
 `--vm` engine continue to implement the full dynamic language in the preceding
-sections.
+sections. Native `pcall` and coroutines are the first milestone in
+[docs/ROADMAP.md](ROADMAP.md).
