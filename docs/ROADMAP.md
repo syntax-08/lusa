@@ -36,7 +36,23 @@ and, where supported, the C11 backend.
   zero-parameter `i32` functions (`E0319`); the native backend supports zero or
   one return value (`E0313`).
 
-## Baseline after v0.8.0
+## Shipped in v0.9.0 - string patterns and native text processing
+
+- **One bounded matcher:** `find`, `match`, `gmatch`, and `gsub` share the
+  semantics of `src/pattern.rs`; native builds append the C11 implementation
+  from `src/pattern_runtime.c`.
+- **Lua syntax:** classes, sets, anchors, captures, position captures,
+  backreferences, `%b`, `%f`, and `*`/`+`/`-`/`?`.
+- **Static diagnostics:** literal malformed patterns and replacements report
+  `E0323`; out-of-range replacement or `gmatch` captures report `E0324`.
+- **Runtime safety:** dynamic failures raise `E2010`, budget exhaustion raises
+  `E2011`, and both are catchable with `pcall`.
+- **RAII text transforms:** native `gmatch` state, loop captures, and printed
+  `match`/`gsub` temporaries are released by lexical scope drops.
+- **UTF-8 native literals:** string literals are emitted as UTF-8 bytes so
+  multibyte captures round-trip correctly.
+
+## Baseline after v0.9.0
 
 | Area | Interpreter | Bytecode VM | C11 backend |
 | --- | --- | --- | --- |
@@ -47,7 +63,7 @@ and, where supported, the C11 backend.
 | Raw pointers | simulated addresses | simulated addresses | volatile C pointers |
 | `pcall` | yes (`src/builtins.rs`) | yes | yes (named-function subset) |
 | Coroutines | yes | yes | yes (fibers/`ucontext`, restricted subset) |
-| String patterns | literal `find`/`gsub` only | literal only | no string library |
+| String patterns | full `find`/`match`/`gmatch`/`gsub` | full | direct C runtime calls (restricted surface) |
 | Ownership checks | runtime registry (`src/value.rs`) | runtime registry | static subset (`compiler_bootstrap.lusa`) |
 | Explicit `move` / `copy` | no | no | no |
 
@@ -125,60 +141,66 @@ drops.
 - Multiple native return values still require a result struct and remain out
   of scope (`E0313`).
 
-## Module 13 - String Utilities and Pattern Matching (target v0.9.0)
+## Module 13 - String Utilities and Pattern Matching (shipped in v0.9.0)
 
-### 13.1 Pattern engine
+### 13.1 One bounded pattern engine
 
-`string.find` and `string.gsub` currently compare literal character slices in
-`src/builtins.rs`. Module 13 adds a real pattern layer shared by all engines.
+`string.find`, `string.match`, `string.gmatch`, and `string.gsub` now share one
+matcher instead of literal-only comparisons. The interpreter and VM call
+`src/pattern.rs`; native builds append the dependency-free C11 implementation
+from `src/pattern_runtime.c` to every generated translation unit.
 
 **Surface API**
 
 - `string.find(s, pattern [, init [, plain]])` -> start, end, captures
-- `string.match(s, pattern [, init])` -> captures
-- `string.gmatch(s, pattern)` -> iterator
+- `string.match(s, pattern [, init])` -> captures (or the whole match)
+- `string.gmatch(s, pattern)` -> stateful iterator
 - `string.gsub(s, pattern, replacement [, limit])` -> result, count
 - Lua-compatible classes and quantifiers: `%a %c %d %g %l %p %s %u %w %x`,
   `%bxy`, `%f[set]`, captures `()`, backreferences `%1`, `.`, `*`, `+`, `-`,
   `?`, anchors `^`/`$`, and escaped literals.
 
-**Architecture**
+**Semantics**
 
-1. Add `src/patterns.rs` with a compiled pattern representation (instruction
-   list or small AST). Both the interpreter and VM call this module; no
-   duplicated matching logic.
-2. Define UTF-8 behavior explicitly. Lua patterns are byte-oriented; Lusa
-   strings are UTF-8. The recommended contract is code-point matching for
-   classes and `.`, with byte offsets still reported for compatibility. Add
-   tests for multibyte input and document the choice.
-3. Native runtime: add `lusa_pattern_*` functions to the generated C runtime.
-   Constant patterns collected at compile time can be validated early; dynamic
-   patterns use the same runtime matcher. Keep the matcher iterative with an
-   explicit backtracking stack to avoid C stack overflow.
-4. Enforce a pattern-length limit and a backtracking budget; report `E2008`
-   instead of hanging on pathological patterns.
-5. Replacement strings support `%0`..`%9`; dynamic engines may additionally
-   accept a replacement function, while the native subset initially accepts
-   string/number replacements only.
-6. Captures produce owned strings; `gmatch` state owns the source string and
-   matcher state and releases both when the iterator is dropped.
-7. Add `string.split`, `string.trim`, and `string.starts_with`/`ends_with`
-   helpers on top of the same scanner if they can share the ownership rules.
+1. Matching operates on Unicode scalar values. Pattern indices and `find`
+   results count characters, not UTF-8 bytes; `plain = true` preserves the
+   literal-search escape hatch.
+2. Both implementations enforce the same depth (200) and step (1,000,000)
+   budgets. A failed branch restores its capture state, so backtracking cannot
+   leak captures into a sibling branch.
+3. Malformed patterns and replacements raise `E2010`; budget exhaustion raises
+   `E2011`. Dynamic failures are catchable with `pcall`.
+4. Captures produce owned strings. `gmatch` state owns the source and compiled
+   pattern; native loop captures and iterators are released through RAII on
+   `break`, `return`, scope exit, and `pcall` unwinding.
+5. Native constant patterns are validated before C emission (`E0323`), and
+   statically visible replacement or `gmatch` capture overflows report
+   `E0324`. Dynamic patterns use the same runtime matcher as the dynamic
+   engines.
+
+The native surface is intentionally smaller than the dynamic one: `find`
+returns `0` on failure, `match` returns the first capture, `gsub` accepts string
+replacements only, and `gmatch` is restricted to direct generic-`for`
+iterators. These differences are documented in
+[`LANGUAGE.md`](LANGUAGE.md#97-native-string-patterns-module-13).
 
 **Acceptance criteria**
 
-- One shared conformance corpus runs on interpreter, VM, and native builds.
+- One conformance corpus runs on the interpreter, VM, and native builds.
 - `find`/`gsub` remain backward compatible when `plain = true`.
-- Fuzz tests compare the native and Rust matchers on random ASCII/UTF-8 input.
-- No pattern can overflow the native stack; the budget test is deterministic.
-- `gmatch` iterators are leak-free across `break`, `return`, and `pcall`.
+- Native and dynamic engines agree on captures, anchors, backreferences,
+  balanced/frontier matches, and backtracking results.
+- No pattern can overflow the native stack; budget tests are deterministic.
+- `gmatch` iterators and `gsub` temporaries are leak-free across `break`,
+  `return`, and `pcall`.
 
 **Risks**
 
-- Byte-versus-code-point semantics can break scripts that rely on Lua byte
-  offsets; ship the rule in the release notes and provide `plain` as an
-  escape hatch.
-- Backtracking performance needs a budget from day one.
+- Byte-versus-code-point semantics differ from stock Lua; the rule is published
+  in the release notes and `plain` remains available for literal byte-oriented
+  workflows.
+- Backtracking performance depends on the budget; nested quantifiers should be
+  simplified when `E2011` appears.
 
 ## Module 14 - Advanced Lifetimes (target v1.0.0)
 
@@ -264,7 +286,7 @@ compile-time analysis and makes explicit transfer syntax part of the language.
 | --- | --- | --- |
 | v0.7.0 | Static structs, raw pointers, kernel intrinsics (shipped) | three-OS CI, sandbox parity, native volatile access |
 | v0.8.0 | Native `pcall`, coroutines (shipped) | three-OS CI, native unwind/leak suite, parity tests |
-| v0.9.0 | Pattern matching and string utilities | shared matcher, fuzz corpus, native/VM/interpreter parity |
+| v0.9.0 | Pattern matching and string utilities (shipped) | shared matcher, native/VM/interpreter parity, RAII lifetime tests |
 | v1.0.0 | Static borrow checker, explicit `move`/`copy`, stabilization | golden diagnostics, migration report, frozen semantics |
 
 Each release uses the curated English template with `## Impact Introduction`,

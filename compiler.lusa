@@ -32,8 +32,11 @@
 --
 -- Supported nodes: Local, Assign (name targets), CallStmt, If, While, Repeat,
 -- Do, Return, Break; Nil, Bool, Number, String (without interpolation), Name,
--- Paren, Unary, Binary, Logical, Call, Clone, Borrow.  Calls are single-value
--- `CallOne` expressions; multi-return expansion and varargs are out of scope.
+-- Paren, Unary, Binary, Logical, Call, MethodCall, Clone, Borrow.  Calls and
+-- method calls are single-value expressions (`CallOne` / `MethodCallOne`).
+-- `s:find(pat)` and the other string pseudo-methods therefore compile through
+-- the same dispatch path as the native VM; multi-return expansion and varargs
+-- are out of scope.
 -- Unsupported constructs produce a `compiler:line:column:` error instead of
 -- silently miscompiling.
 
@@ -72,6 +75,7 @@ local OPCODES = {
     CLONE = 38,
     BORROW_ERR = 39,
     CALL_ONE = 42,
+    METHOD_CALL_ONE = 50,
     JUMP = 53,
     JUMP_IF_FALSE = 54,
     JUMP_IF_TRUE_KEEP = 55,
@@ -179,6 +183,27 @@ local function emit_u16_u16(opcode, first, second)
     push_byte(first % 256)
     push_byte(math.floor(second / 256))
     push_byte(second % 256)
+end
+
+local function emit_u16_u16_u16(opcode, first, second, third)
+    local values = { first, second, third }
+    local i = 1
+    while i <= 3 do
+        local value = values[i]
+        if value < 0 or value > 65535 or value ~= math.floor(value) then
+            fail(current_line, current_column,
+                "operand out of range: " .. tostring(value))
+        end
+        i = i + 1
+    end
+    push_byte(opcode)
+    i = 1
+    while i <= 3 do
+        local value = values[i]
+        push_byte(math.floor(value / 256))
+        push_byte(value % 256)
+        i = i + 1
+    end
 end
 
 local function emit_jump(opcode)
@@ -554,6 +579,18 @@ compile_expr = function(expr)
         end
         set_location(expr.line, expr.column)
         emit_u16_u16(OPCODES.CALL_ONE, count, 0)
+
+    elseif tag == "MethodCall" then
+        compile_expr(expr.obj)
+        local count = #expr.args
+        local i = 1
+        while i <= count do
+            compile_expr(expr.args[i])
+            i = i + 1
+        end
+        local key = add_const("string", expr.name)
+        set_location(expr.line, expr.column)
+        emit_u16_u16_u16(OPCODES.METHOD_CALL_ONE, key, count, 0)
 
     elseif tag == "Clone" then
         compile_expr(expr.value)

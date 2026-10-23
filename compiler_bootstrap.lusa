@@ -561,7 +561,7 @@ end
 
 local function is_heap_type(type_name)
     return type_name == "string" or type_name == "table"
-        or type_name == "coroutine"
+        or type_name == "coroutine" or type_name == "gmatch"
         or table_element(type_name) ~= nil
 end
 
@@ -915,12 +915,356 @@ local function check_coroutine_call(expr, method)
         "unsupported native coroutine operation `" .. tostring(method) .. "`")
 end
 
+-- ---- Module 13 string patterns -------------------------------------------
+
+local function string_unwrap(expr)
+    local current = expr
+    while current ~= nil and current.tag == "Paren" do
+        current = current.value
+    end
+    return current
+end
+
+local function string_literal(expr)
+    local value = string_unwrap(expr)
+    if value ~= nil and value.tag == "String"
+        and value.interpolated ~= true then
+        return value.value
+    end
+    return nil
+end
+
+local function pattern_fail(message, line, column)
+    type_fail("E0323", line, column, "malformed string pattern: " .. message)
+end
+
+local function scan_pattern_set(pat, start, line, column)
+    local i = start + 1
+    if string.sub(pat, i, i) == "^" then i = i + 1 end
+    if string.sub(pat, i, i) == "]" then i = i + 1 end
+    while i <= #pat do
+        local c = string.sub(pat, i, i)
+        if c == "]" then
+            return i + 1
+        elseif c == "%" then
+            if i == #pat then
+                pattern_fail("'%' at end of character set", line, column)
+            end
+            i = i + 2
+        else
+            i = i + 1
+        end
+    end
+    pattern_fail("missing ']' in character set", line, column)
+end
+
+local function analyze_pattern(pat, line, column)
+    local captures = 0
+    local open = 0
+    local i = 1
+    while i <= #pat do
+        local c = string.sub(pat, i, i)
+        if c == "%" then
+            if i == #pat then
+                pattern_fail("'%' at end of pattern", line, column)
+            end
+            local escaped = string.sub(pat, i + 1, i + 1)
+            if escaped == "b" then
+                if i + 3 > #pat then
+                    pattern_fail("'%b' needs two characters", line, column)
+                end
+                i = i + 4
+            elseif escaped == "f" then
+                if string.sub(pat, i + 2, i + 2) ~= "[" then
+                    pattern_fail("'%f' must be followed by a set", line, column)
+                end
+                i = scan_pattern_set(pat, i + 2, line, column)
+            elseif escaped >= "0" and escaped <= "9" then
+                local index = tonumber(escaped)
+                if index == 0 or index > captures then
+                    pattern_fail("back reference %" .. escaped
+                        .. " has no earlier capture", line, column)
+                end
+                i = i + 2
+            else
+                i = i + 2
+            end
+        elseif c == "[" then
+            i = scan_pattern_set(pat, i, line, column)
+        elseif c == "(" then
+            captures = captures + 1
+            if captures > 32 then
+                pattern_fail("too many captures (maximum is 32)", line, column)
+            end
+            if string.sub(pat, i + 1, i + 1) == ")" then
+                i = i + 2
+            else
+                open = open + 1
+                i = i + 1
+            end
+        elseif c == ")" then
+            if open == 0 then
+                pattern_fail("unmatched ')'", line, column)
+            end
+            open = open - 1
+            i = i + 1
+        else
+            i = i + 1
+        end
+    end
+    if open > 0 then
+        pattern_fail("unfinished capture", line, column)
+    end
+    return captures
+end
+
+local function analyze_replacement(replacement, captures, line, column)
+    local i = 1
+    while i <= #replacement do
+        if string.sub(replacement, i, i) ~= "%" then
+            i = i + 1
+        else
+            if i == #replacement then
+                type_fail("E0323", line, column,
+                    "invalid use of '%' in replacement string")
+            end
+            local escaped = string.sub(replacement, i + 1, i + 1)
+            if escaped == "%" then
+                i = i + 2
+            elseif escaped >= "0" and escaped <= "9" then
+                local index = tonumber(escaped)
+                if index > captures then
+                    type_fail("E0324", line, column,
+                        "replacement references capture %" .. escaped
+                        .. " but the pattern has " .. tostring(captures)
+                        .. " capture(s)",
+                        "capture index <= " .. tostring(captures),
+                        "%" .. escaped)
+                end
+                i = i + 2
+            else
+                type_fail("E0323", line, column,
+                    "invalid replacement escape `%" .. escaped
+                    .. "`; use `%0`..`%9` or `%%`")
+            end
+        end
+    end
+end
+
+local string_methods = {
+    find = true,
+    match = true,
+    gmatch = true,
+    gsub = true
+}
+
+local function string_api_name(expr)
+    if expr == nil then return nil end
+    if expr.tag == "Call" and expr.callee ~= nil
+        and expr.callee.tag == "Field" and expr.callee.table ~= nil
+        and expr.callee.table.tag == "Name"
+        and expr.callee.table.name == "string" then
+        return expr.callee.field_name
+    end
+    if expr.tag == "MethodCall" then
+        return expr.name
+    end
+    return nil
+end
+
+local function is_string_api(expr)
+    local name = string_api_name(expr)
+    return name ~= nil and string_methods[name] == true
+end
+
+local function check_string_operand(expr, line, column, what)
+    local checked, actual = check_expr(expr)
+    if actual ~= "string" then
+        check_mismatch(line, column, what, "string", actual)
+    end
+    return checked
+end
+
+local function check_integer_operand(expr, line, column, what)
+    local checked, actual = check_expr(expr)
+    if actual ~= "i32" and actual ~= "u32" then
+        check_mismatch(line, column, what, "i32", actual)
+    end
+    return coerce_literal(checked, "i32")
+end
+
+local function check_boolean_operand(expr, line, column, what)
+    local checked, actual = check_expr(expr)
+    if actual ~= "bool" then
+        check_mismatch(line, column, what, "bool", actual)
+    end
+    return checked
+end
+
+-- `context` is "expression", "local" or "gmatch".  Gmatch is only legal in a
+-- generic `for`, while find/gsub additionally support two-name local forms.
+local function check_string_operation(expr, checked_source, source_type,
+                                      args, name, context)
+    if source_type ~= "string" then
+        check_mismatch(expr.line, expr.column,
+            "string method receiver", "string", source_type)
+    end
+    local min_args = 1
+    local max_args = 1
+    if name == "find" then
+        min_args = 1
+        max_args = 3
+    elseif name == "match" then
+        min_args = 1
+        max_args = 2
+    elseif name == "gsub" then
+        min_args = 2
+        max_args = 3
+    elseif name == "gmatch" then
+        if context ~= "gmatch" then
+            type_fail("E0317", expr.line, expr.column,
+                "native `string.gmatch` must be used as a generic `for` iterator")
+        end
+    end
+    if #args < min_args or #args > max_args then
+        local expected = tostring(min_args)
+        if min_args ~= max_args then
+            expected = tostring(min_args) .. " to " .. tostring(max_args)
+        end
+        type_fail("E0311", expr.line, expr.column,
+            "`string." .. name .. "` expects " .. expected
+            .. " argument(s) after the subject, found " .. tostring(#args))
+    end
+
+    local pattern_expr = args[1]
+    local pattern_line = pattern_expr.line
+    local pattern_column = pattern_expr.column
+    local checked_pattern = check_string_operand(pattern_expr,
+        pattern_line, pattern_column,
+        "`string." .. name .. "` pattern")
+    local capture_count = nil
+    local literal = string_literal(clone checked_pattern)
+    if literal ~= nil then
+        capture_count = analyze_pattern(literal,
+            checked_pattern.line, checked_pattern.column)
+    end
+
+    local source_copy = clone checked_source
+    local pattern_copy = clone checked_pattern
+    expr.builtin = "string_" .. name
+    expr.string_source = checked_source
+    expr.string_pattern = checked_pattern
+    expr.string_capture_count = capture_count
+    expr.args = { source_copy, pattern_copy }
+
+    if name == "find" then
+        if #args >= 2 then
+            local init = args[2]
+            local init_line = init.line
+            local init_column = init.column
+            local checked_init = check_integer_operand(init,
+                init_line, init_column, "`string.find` init")
+            local init_copy = clone checked_init
+            expr.string_init = checked_init
+            expr.args[#expr.args + 1] = init_copy
+        end
+        if #args >= 3 then
+            local plain_arg = args[3]
+            local plain_line = plain_arg.line
+            local plain_column = plain_arg.column
+            local checked_plain = check_boolean_operand(plain_arg,
+                plain_line, plain_column, "`string.find` plain flag")
+            local plain_copy = clone checked_plain
+            expr.string_plain = checked_plain
+            expr.args[#expr.args + 1] = plain_copy
+        end
+        expr.ctype = "i32"
+        expr.own = false
+        return expr, "i32"
+    end
+
+    if name == "match" then
+        if #args >= 2 then
+            local init = args[2]
+            local init_line = init.line
+            local init_column = init.column
+            local checked_init = check_integer_operand(init,
+                init_line, init_column, "`string.match` init")
+            local init_copy = clone checked_init
+            expr.string_init = checked_init
+            expr.args[#expr.args + 1] = init_copy
+        end
+        expr.ctype = "string"
+        expr.own = true
+        return expr, "string"
+    end
+
+    if name == "gsub" then
+        local replacement_expr = args[2]
+        local replacement_line = replacement_expr.line
+        local replacement_column = replacement_expr.column
+        local checked_replacement = check_string_operand(replacement_expr,
+            replacement_line, replacement_column,
+            "`string.gsub` replacement")
+        local replacement_line_checked = checked_replacement.line
+        local replacement_column_checked = checked_replacement.column
+        local replacement_copy = clone checked_replacement
+        expr.string_replacement = checked_replacement
+        expr.args[#expr.args + 1] = replacement_copy
+        if #args >= 3 then
+            local limit = args[3]
+            local limit_line = limit.line
+            local limit_column = limit.column
+            local checked_limit = check_integer_operand(limit,
+                limit_line, limit_column, "`string.gsub` limit")
+            local limit_copy = clone checked_limit
+            expr.string_limit = checked_limit
+            expr.args[#expr.args + 1] = limit_copy
+        end
+        local replacement_literal = string_literal(clone expr.string_replacement)
+        if replacement_literal ~= nil then
+            analyze_replacement(replacement_literal,
+                capture_count == nil and 9 or capture_count,
+                replacement_line_checked, replacement_column_checked)
+        end
+        expr.ctype = "string"
+        expr.own = true
+        return expr, "string"
+    end
+
+    expr.ctype = "gmatch"
+    expr.own = true
+    return expr, "gmatch"
+end
+
 local function check_call(expr)
     local callee = borrow expr.callee
     if callee.tag == "Field" then
         local receiver = borrow callee.table
         if receiver.tag == "Name" and receiver.name == "coroutine" then
             return check_coroutine_call(expr, callee.field_name)
+        end
+        if receiver.tag == "Name" and receiver.name == "string" then
+            if string_methods[callee.field_name] ~= true then
+                type_fail("E0319", expr.line, expr.column,
+                    "unsupported native string operation `"
+                    .. tostring(callee.field_name) .. "`")
+            end
+            if #expr.args < 1 then
+                type_fail("E0311", expr.line, expr.column,
+                    "`string." .. callee.field_name
+                    .. "` requires a subject string")
+            end
+            local source_expr = clone expr.args[1]
+            local checked_source, source_type = check_expr(source_expr)
+            local rest = {}
+            local i = 2
+            while i <= #expr.args do
+                rest[#rest + 1] = clone expr.args[i]
+                i = i + 1
+            end
+            return check_string_operation(expr, checked_source, source_type,
+                rest, callee.field_name, "expression")
         end
     end
     if callee.tag ~= "Name" then
@@ -1140,7 +1484,17 @@ check_method_call = function(expr)
     local checked_obj, obj_type = check_expr(expr.obj)
     local receiver_tag = checked_obj.tag
     local receiver_name = checked_obj.name
-    expr.obj = checked_obj
+    expr.obj = clone checked_obj
+    if obj_type == "string" then
+        local method_name = expr.name
+        if string_methods[method_name] ~= true then
+            type_fail("E0319", expr.line, expr.column,
+                "unsupported native string method `" .. tostring(method_name) .. "`")
+        end
+        local method_args = clone expr.args
+        return check_string_operation(expr, checked_obj, obj_type,
+            method_args, method_name, "expression")
+    end
     if not is_table_type(obj_type) then
         check_mismatch(expr.line, expr.column, "method receiver",
             "table", obj_type)
@@ -1803,10 +2157,93 @@ local function check_coroutine_resume_local(stmt, names, stmt_types, values)
     return stmt
 end
 
+local function check_string_result_local(stmt, names, types, values)
+    local checked, actual = check_expr(values[1])
+    local builtin = checked.builtin
+    if builtin == "string_find" then
+        if #names ~= 2 then
+            type_fail("E0311", stmt.line, stmt.column,
+                "native `string.find` supports one result (`start`) or "
+                .. "`local start, finish = ...`")
+        end
+        if actual ~= "i32" then
+            type_fail("E0312", stmt.line, stmt.column,
+                "internal: string.find must produce `i32`")
+        end
+        local result_types = { "i32", "i32" }
+        local own = { false, false }
+        local i = 1
+        while i <= 2 do
+            if types ~= nil and types[i] ~= nil then
+                local declared = canonical_type(types[i], stmt.line, stmt.column)
+                if declared ~= "auto" and declared ~= "nil"
+                    and declared ~= result_types[i] then
+                    check_mismatch(stmt.line, stmt.column,
+                        "local `" .. names[i] .. "`", declared, result_types[i])
+                end
+            end
+            i = i + 1
+        end
+        stmt.string_result = "find"
+        stmt.values = { checked }
+        i = 1
+        while i <= #names do
+            scope_declare(names[i], result_types[i], own[i], false)
+            i = i + 1
+        end
+        stmt.names = names
+        stmt.types = result_types
+        stmt.own = own
+        return stmt
+    end
+    if builtin == "string_gsub" then
+        if #names ~= 2 then
+            type_fail("E0311", stmt.line, stmt.column,
+                "native `string.gsub` supports one result (the text) or "
+                .. "`local text, count = ...`")
+        end
+        local result_types = { "string", "i32" }
+        local own = { true, false }
+        local i = 1
+        while i <= 2 do
+            if types ~= nil and types[i] ~= nil then
+                local declared = canonical_type(types[i], stmt.line, stmt.column)
+                if declared ~= "auto" and declared ~= "nil"
+                    and declared ~= result_types[i] then
+                    check_mismatch(stmt.line, stmt.column,
+                        "local `" .. names[i] .. "`", declared, result_types[i])
+                end
+            end
+            i = i + 1
+        end
+        stmt.string_result = "gsub"
+        stmt.values = { checked }
+        i = 1
+        while i <= #names do
+            scope_declare(names[i], result_types[i], own[i], false)
+            i = i + 1
+        end
+        stmt.names = names
+        stmt.types = result_types
+        stmt.own = own
+        return stmt
+    end
+    if builtin == "string_match" then
+        type_fail("E0311", stmt.line, stmt.column,
+            "native `string.match` returns one capture; bind it with a single local")
+    end
+    type_fail("E0317", stmt.line, stmt.column,
+        "native `string.gmatch` must be used as a generic `for` iterator")
+end
+
 local function check_local(stmt)
     local names = stmt.names
     local types = stmt.types
     local values = stmt.values
+    if values ~= nil and values[1] ~= nil and #names > 1 and #values == 1
+        and is_string_api(clone values[1]) then
+        return check_string_result_local(stmt, names, types, values)
+    end
     if values ~= nil and values[1] ~= nil and values[1].tag == "Call"
         and values[1].callee ~= nil and values[1].callee.tag == "Name"
         and values[1].callee.name == "pcall" then
@@ -2252,6 +2689,60 @@ check_stmt = function(stmt, top_level)
 
     if tag == "ForIn" then
         local iter = stmt.iter
+        if string_api_name(clone iter) == "gmatch" then
+            local checked_source = nil
+            local source_type = nil
+            local pattern_args = {}
+            if iter.tag == "Call" then
+                if #iter.args ~= 2 then
+                    type_fail("E0311", line, column,
+                        "`string.gmatch` takes a string and a pattern")
+                end
+                checked_source, source_type = check_expr(clone iter.args[1])
+                pattern_args = { clone iter.args[2] }
+            else
+                if #iter.args ~= 1 then
+                    type_fail("E0311", line, column,
+                        "`string.gmatch` takes one pattern argument")
+                end
+                checked_source, source_type = check_expr(clone iter.obj)
+                iter.obj = clone checked_source
+                pattern_args = { clone iter.args[1] }
+            end
+            iter = check_string_operation(iter, checked_source, source_type,
+                pattern_args, "gmatch", "gmatch")
+            if #stmt.vars < 1 or #stmt.vars > 9 then
+                type_fail("E0311", line, column,
+                    "native gmatch loops support one to nine loop variables")
+            end
+            local captures = iter.string_capture_count
+            local results = captures == nil and 1
+                or (captures == 0 and 1 or captures)
+            if #stmt.vars > results then
+                if captures == nil then
+                    type_fail("E0323", line, column,
+                        "native gmatch needs a literal pattern when binding multiple values")
+                end
+                type_fail("E0324", line, column,
+                    "gmatch pattern produces " .. tostring(results)
+                    .. " value(s) but the loop binds " .. tostring(#stmt.vars))
+            end
+            stmt.iter = iter
+            stmt.iter_kind = "gmatch"
+            stmt.gmatch_count = #stmt.vars
+            stmt.gmatch_captures = captures or 0
+            scope_enter()
+            local i = 1
+            while i <= #stmt.vars do
+                scope_declare(stmt.vars[i], "string", true, false)
+                i = i + 1
+            end
+            check_loop_depth = check_loop_depth + 1
+            stmt.body = check_block(stmt.body, false)
+            check_loop_depth = check_loop_depth - 1
+            scope_leave()
+            return stmt
+        end
         if iter.tag ~= "Call" or iter.callee.tag ~= "Name" then
             type_fail("E0319", line, column,
                 "generic `for` requires a direct `pairs(table)` or `ipairs(table)` call")
@@ -2527,6 +3018,7 @@ local function c_type(type_name)
     if type_name == "bool" then return "bool" end
     if type_name == "string" then return "LusaString *" end
     if type_name == "coroutine" then return "LusaCoro *" end
+    if type_name == "gmatch" then return "LusaGmatch *" end
     if type_name == "nil" then return "void *" end
     if type_name == "void" then return "void" end
     if type_name == "table" or table_element(type_name) ~= nil then
@@ -2558,7 +3050,7 @@ local function default_c(type_name)
     end
     if type_name == "string" or type_name == "nil"
         or type_name == "table" or type_name == "coroutine"
-        or table_element(type_name) ~= nil then
+        or type_name == "gmatch" or table_element(type_name) ~= nil then
         return "NULL"
     end
     if type_name == "value" then
@@ -2656,6 +3148,8 @@ local function emit_drop_entry(entry)
         line("lusa_drop_table(&" .. entry.cname .. ");")
     elseif entry.type == "coroutine" then
         line("lusa_drop_coroutine(&" .. entry.cname .. ");")
+    elseif entry.type == "gmatch" then
+        line("lusa_drop_gmatch(&" .. entry.cname .. ");")
     end
 end
 
@@ -2994,6 +3488,17 @@ local RUNTIME = {
     "static void lusa_drop_table(LusaTable **value);",
     "static void lusa_drop_value(uint64_t kind, uint64_t *payload);",
     "static void lusa_panic(const char *message);",
+    "",
+    "/* Module 13 pattern runtime.  Definitions are appended by the",
+    "   `lusa::cbackend` facade after the generated translation unit. */",
+    "typedef struct LusaGmatch LusaGmatch;",
+    "static int32_t lusa_string_find_start(LusaString *source, LusaString *pattern, int32_t init, bool plain);",
+    "static bool lusa_string_find_values(LusaString *source, LusaString *pattern, int32_t init, bool plain, int32_t *out_start, int32_t *out_end);",
+    "static LusaString *lusa_string_match(LusaString *source, LusaString *pattern, int32_t init);",
+    "static LusaString *lusa_string_gsub(LusaString *source, LusaString *pattern, LusaString *replacement, int32_t limit, int32_t *out_count);",
+    "static LusaGmatch *lusa_string_gmatch_new(LusaString *source, LusaString *pattern);",
+    "static bool lusa_string_gmatch_next(LusaGmatch *iterator, LusaString **out, int32_t count);",
+    "static void lusa_drop_gmatch(LusaGmatch **value);",
     "",
     "static LusaString *lusa_string_new(const char *bytes, uint64_t length) {",
     "    LusaString *value = (LusaString *)calloc(1, sizeof(LusaString));",
@@ -3860,7 +4365,12 @@ collect_strings_block = function(body)
                 collect_strings_block(stmt.else_body)
             end
         elseif tag == "ForIn" then
-            collect_strings_expr(stmt.iter.args[1])
+            if stmt.iter_kind == "gmatch" then
+                collect_strings_expr(stmt.iter.string_source)
+                collect_strings_expr(stmt.iter.string_pattern)
+            else
+                collect_strings_expr(stmt.iter.args[1])
+            end
             collect_strings_block(stmt.body)
         elseif tag == "While" then
             collect_strings_expr(stmt.cond)
@@ -3890,14 +4400,36 @@ local function emit_static_strings()
         local bytes = {}
         local j = 1
         while j <= #value do
-            bytes[#bytes + 1] = tostring(string.byte(value, j))
+            local codepoint = string.byte(value, j)
+            if codepoint < 0x80 then
+                bytes[#bytes + 1] = tostring(codepoint)
+            elseif codepoint < 0x800 then
+                bytes[#bytes + 1] = tostring(0xC0
+                    + math.floor(codepoint / 0x40))
+                bytes[#bytes + 1] = tostring(0x80 + codepoint % 0x40)
+            elseif codepoint < 0x10000 then
+                bytes[#bytes + 1] = tostring(0xE0
+                    + math.floor(codepoint / 0x1000))
+                bytes[#bytes + 1] = tostring(0x80
+                    + math.floor(codepoint / 0x40) % 0x40)
+                bytes[#bytes + 1] = tostring(0x80 + codepoint % 0x40)
+            else
+                bytes[#bytes + 1] = tostring(0xF0
+                    + math.floor(codepoint / 0x40000))
+                bytes[#bytes + 1] = tostring(0x80
+                    + math.floor(codepoint / 0x1000) % 0x40)
+                bytes[#bytes + 1] = tostring(0x80
+                    + math.floor(codepoint / 0x40) % 0x40)
+                bytes[#bytes + 1] = tostring(0x80 + codepoint % 0x40)
+            end
             j = j + 1
         end
+        local byte_length = #bytes
         bytes[#bytes + 1] = "0"
         line("static unsigned char lusa_bytes_" .. tostring(i) .. "[] = {"
             .. table.concat(bytes, ", ") .. "};")
         line("static LusaString lusa_str_" .. tostring(i)
-            .. " = { {LUSA_OBJ_STRING, " .. tostring(#value)
+            .. " = { {LUSA_OBJ_STRING, " .. tostring(byte_length)
             .. "u, 0u, sizeof(LusaString)}, (char *)lusa_bytes_"
             .. tostring(i) .. " };")
         i = i + 1
@@ -4093,6 +4625,47 @@ local function emit_arithmetic(expr, lhs, rhs)
     return "((" .. lhs .. ") " .. op .. " (" .. rhs .. "))"
 end
 
+local function emit_string_builtin(expr)
+    local name = expr.builtin
+    if name ~= "string_find" and name ~= "string_match"
+        and name ~= "string_gsub" and name ~= "string_gmatch" then
+        return nil
+    end
+    if name == "string_gmatch" then
+        fail(expr.line, expr.column,
+            "internal: gmatch must be lowered through a generic for loop")
+    end
+    local source = emit_expr(expr.string_source)
+    local pattern = emit_expr(expr.string_pattern)
+    if name == "string_find" then
+        local init = "1"
+        if expr.string_init ~= nil then
+            init = emit_expr(expr.string_init)
+        end
+        local plain = "false"
+        if expr.string_plain ~= nil then
+            plain = emit_expr(expr.string_plain)
+        end
+        return "lusa_string_find_start(" .. source .. ", " .. pattern
+            .. ", " .. init .. ", " .. plain .. ")"
+    end
+    if name == "string_match" then
+        local init = "1"
+        if expr.string_init ~= nil then
+            init = emit_expr(expr.string_init)
+        end
+        return "lusa_string_match(" .. source .. ", " .. pattern
+            .. ", " .. init .. ")"
+    end
+    local replacement = emit_expr(expr.string_replacement)
+    local limit = "-1"
+    if expr.string_limit ~= nil then
+        limit = emit_expr(expr.string_limit)
+    end
+    return "lusa_string_gsub(" .. source .. ", " .. pattern .. ", "
+        .. replacement .. ", " .. limit .. ", NULL)"
+end
+
 emit_expr = function(expr)
     if expr == nil then
         fail(0, 0, "internal: nil expression reached the C emitter")
@@ -4161,6 +4734,10 @@ emit_expr = function(expr)
         return "((" .. lhs .. ") || (" .. rhs .. "))"
     end
     if tag == "Call" then
+        local string_value = emit_string_builtin(clone expr)
+        if string_value ~= nil then
+            return string_value
+        end
         if expr.builtin == "unsafe_ptr_cast" then
             return "((uintptr_t)(" .. emit_expr(expr.args[1]) .. "))"
         end
@@ -4344,6 +4921,10 @@ emit_expr = function(expr)
         return "(*(" .. emit_expr(expr.value) .. "))"
     end
     if tag == "MethodCall" then
+        local string_value = emit_string_builtin(clone expr)
+        if string_value ~= nil then
+            return string_value
+        end
         local cname = emit_function_cnames[expr.fn_key]
         if cname == nil then
             fail(expr.line, expr.column, "internal: method has no function name")
@@ -4431,9 +5012,19 @@ local function emit_print_call(call)
         local type_name = arg.ctype
         local arg_line = arg.line
         local arg_column = arg.column
+        local arg_builtin = arg.builtin
         local value = emit_expr(arg)
         if type_name == "string" then
+            local owned_temp = nil
+            if arg_builtin == "string_match" or arg_builtin == "string_gsub" then
+                owned_temp = fresh("print_text")
+                line("LusaString *" .. owned_temp .. " = " .. value .. ";")
+                value = owned_temp
+            end
             line("lusa_print_string(" .. value .. ");")
+            if owned_temp ~= nil then
+                line("lusa_drop_string(&" .. owned_temp .. ");")
+            end
         elseif type_name == "i32" then
             line("lusa_print_i32(" .. value .. ");")
         elseif type_name == "u32" then
@@ -4535,7 +5126,54 @@ local function emit_coroutine_resume_local(stmt)
     end
 end
 
+local function emit_string_result_local(stmt)
+    local call = stmt.values[1]
+    local source = emit_expr(call.string_source)
+    local pattern = emit_expr(call.string_pattern)
+    if stmt.string_result == "find" then
+        local init = "1"
+        if call.string_init ~= nil then
+            init = emit_expr(call.string_init)
+        end
+        local plain = "false"
+        if call.string_plain ~= nil then
+            plain = emit_expr(call.string_plain)
+        end
+        local start_value = fresh("find_start")
+        local end_value = fresh("find_end")
+        line("int32_t " .. start_value .. " = 0;")
+        line("int32_t " .. end_value .. " = 0;")
+        line("(void)lusa_string_find_values(" .. source .. ", " .. pattern
+            .. ", " .. init .. ", " .. plain .. ", &" .. start_value
+            .. ", &" .. end_value .. ");")
+        local first = emit_scope_declare(stmt.names[1], "i32", false, false)
+        local second = emit_scope_declare(stmt.names[2], "i32", false, false)
+        line("int32_t " .. first.cname .. " = " .. start_value .. ";")
+        line("int32_t " .. second.cname .. " = " .. end_value .. ";")
+        return
+    end
+    local replacement = emit_expr(call.string_replacement)
+    local limit = "-1"
+    if call.string_limit ~= nil then
+        limit = emit_expr(call.string_limit)
+    end
+    local text_value = fresh("gsub_text")
+    local count_value = fresh("gsub_count")
+    line("int32_t " .. count_value .. " = 0;")
+    line("LusaString *" .. text_value .. " = lusa_string_gsub("
+        .. source .. ", " .. pattern .. ", " .. replacement .. ", "
+        .. limit .. ", &" .. count_value .. ");")
+    local first = emit_scope_declare(stmt.names[1], "string", true, false)
+    local second = emit_scope_declare(stmt.names[2], "i32", false, false)
+    line("LusaString *" .. first.cname .. " = " .. text_value .. ";")
+    line("int32_t " .. second.cname .. " = " .. count_value .. ";")
+end
+
 local function emit_local(stmt)
+    if stmt.string_result ~= nil then
+        emit_string_result_local(stmt)
+        return
+    end
     if stmt.pcall ~= nil then
         emit_pcall_local(stmt)
         return
@@ -4714,6 +5352,47 @@ local function table_getter_for_type(type_name)
 end
 
 local function emit_for_in(stmt)
+    if stmt.iter_kind == "gmatch" then
+        local call = stmt.iter
+        local source = emit_expr(call.string_source)
+        local pattern = emit_expr(call.string_pattern)
+        emit_scope_enter()
+        local iter_entry = emit_scope_declare("__lusa_gmatch", "gmatch",
+            true, false)
+        line("LusaGmatch *" .. iter_entry.cname .. " = lusa_string_gmatch_new("
+            .. source .. ", " .. pattern .. ");")
+        local loop_scope = emit_scope_count
+        emit_loop_stack[#emit_loop_stack + 1] = loop_scope
+        local captures = fresh("gmatch_captures")
+        local count = stmt.gmatch_count
+        local zeros = {}
+        local i = 1
+        while i <= count do
+            zeros[i] = "NULL"
+            i = i + 1
+        end
+        line("LusaString *" .. captures .. "[" .. tostring(count) .. "] = {"
+            .. table.concat(zeros, ", ") .. "};")
+        line("while (!lusa_error_pending && lusa_string_gmatch_next("
+            .. iter_entry.cname .. ", " .. captures .. ", "
+            .. tostring(count) .. ")) {")
+        emit_indent = emit_indent + 1
+        emit_scope_enter()
+        i = 1
+        while i <= count do
+            local entry = emit_scope_declare(stmt.vars[i], "string", true, false)
+            line("LusaString *" .. entry.cname .. " = " .. captures
+                .. "[" .. tostring(i - 1) .. "];")
+            i = i + 1
+        end
+        emit_block_statements(stmt.body)
+        emit_leave_scope()
+        emit_indent = emit_indent - 1
+        line("}")
+        emit_loop_stack[#emit_loop_stack] = nil
+        emit_leave_scope()
+        return
+    end
     local iter_expr = stmt.iter.args[1]
     -- Only a freshly constructed iterator value is owned by the loop; a
     -- variable or field passed to pairs/ipairs stays owned by its scope.

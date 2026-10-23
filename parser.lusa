@@ -56,8 +56,10 @@
 -- and named function definitions with typed parameters and an optional
 -- return type.  Expressions cover literals, names, calls, parentheses,
 -- unary and binary operators, `and`/`or`, `clone` and `borrow`, plus array
--- table constructors and integer index expressions (`t[1]`).  Keyed fields,
--- methods and numeric/generic `for` remain extension points.
+-- table constructors and integer index expressions (`t[1]`).  Method calls
+-- such as `s:find(pat)` and `s:gsub(pat, replacement)` are parsed as ordinary
+-- `MethodCall` nodes; string pseudo-method lowering is a compiler concern.
+-- Keyed fields and numeric/generic `for` remain extension points.
 --
 -- Errors use E9000 with a `parser:line:column:` prefix.
 

@@ -14,6 +14,7 @@ use crate::error::LusaError;
 const LEXER: &str = include_str!("../lexer.lusa");
 const PARSER: &str = include_str!("../parser.lusa");
 const BOOTSTRAP: &str = include_str!("../compiler_bootstrap.lusa");
+const PATTERN_RUNTIME: &str = include_str!("pattern_runtime.c");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompilerKind {
@@ -138,7 +139,10 @@ pub fn emit_c(source: &str) -> Result<String, String> {
     if output.is_empty() {
         return Err("C backend produced no output".to_string());
     }
-    Ok(output.concat())
+    let mut c = output.concat();
+    c.push_str("\n\n/* ===== Module 13 string pattern runtime ===== */\n");
+    c.push_str(PATTERN_RUNTIME);
+    Ok(c)
 }
 
 /// Writes the generated C to `path`.

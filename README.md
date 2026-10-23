@@ -10,7 +10,10 @@ brings the same typed/`unsafe` surface to the interpreter and bytecode VM
 adds native keyed tables, colon methods, and `pairs`/`ipairs` lowering to the
 C11 backend. Module 11 adds static structs, raw pointers, and kernel
 intrinsics. Module 12 adds cooperative coroutines and protects native runtime
-failures with checked `pcall` recovery and RAII cleanup.
+failures with checked `pcall` recovery and RAII cleanup. Module 13 adds one
+Lua-style string pattern engine shared by the interpreter, bytecode VM, and C11
+backend: `find`, `match`, `gmatch`, and `gsub` with bounded matching, static
+pattern diagnostics, and RAII-tracked temporary strings.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -95,6 +98,7 @@ See [`examples/`](examples/):
 | `structs_pointers.lusa`   | static structs and raw pointer access                 |
 | `error_recovery.lusa`     | `pcall`, error strings, and native cleanup            |
 | `coroutines.lusa`         | create/resume/yield/status/close lifecycle            |
+| `string_patterns.lusa`    | `find`/`match`/`gmatch`/`gsub` with captures and anchors |
 | `photocraft.lusa`         | mini photo-lab: 2D image in tables → filters → ASCII-art |
 
 Also in the root: `bench.lusa` — reference workload for measuring speed
@@ -123,10 +127,14 @@ cargo run -- examples/basics.lusa
 - **stdlib**: `print type tostring tonumber error assert pcall pairs ipairs`
   `io_read_file` `io_write_binary` `io_read_binary` + `string` `table` `math`
   `json` modules, and `coroutine.create/resume/yield/status/close/isyieldable`.
+  `string` includes Lua-style `find`, `match`, `gmatch`, and `gsub` (see
+  [String patterns](#string-patterns-module-13)).
 - **Errors** in cargo style (`error[E1001]: ...`, `note:` and `help:`),
   E-codes: lexer (E0001), parser (E0101), ownership (E1001–E1005),
-  runtime types and I/O (E2001–E2009), `error`/`assert` (E9000/E9100).
-  Full table in [`docs/LANGUAGE.md`](docs/LANGUAGE.md).
+  runtime types, patterns, and I/O (E2001–E2011), `error`/`assert`
+  (E9000/E9100). Native static checks add E0323/E0324 for statically
+  evaluable patterns and replacement captures. Full table in
+  [`docs/LANGUAGE.md`](docs/LANGUAGE.md).
 
 ## Code architecture
 
@@ -139,6 +147,8 @@ src/
   scope.rs   interp.rs    # scopes, frames, execution, move rules
   eval.rs     builtins.rs # expression evaluation; stdlib
   compiler.rs vm.rs       # AST → bytecode compiler; register-based VM
+  pattern.rs              # bounded Lua-style matcher shared by interp + VM
+  pattern_runtime.c       # C11 matcher appended to every native translation unit
   error.rs    main.rs     # LusaError + cargo-style render; CLI/REPL
   cbackend.rs             # embedded self-hosted C11 backend + host compiler discovery
   lib.rs                  # public API (used by tests/integration.rs)
@@ -389,6 +399,51 @@ lusalang run examples/error_recovery.lusa --native
 lusalang run examples/coroutines.lusa --vm
 ```
 
+### String patterns (Module 13)
+
+`string.find`, `string.match`, `string.gmatch`, and `string.gsub` share one
+Lua-style pattern engine in every engine. The dynamic implementations use
+`src/pattern.rs`; the native backend appends `src/pattern_runtime.c` to the
+generated C11 translation unit. Patterns operate on Unicode scalar values, so
+indices count characters rather than UTF-8 bytes. Matching is depth- and
+step-bounded, which turns pathological backtracking into a catchable `E2011`
+error instead of a hang.
+
+```lusa
+local line = "release=7 build=42"
+local start_pos, end_pos = string.find(line, "%d+")
+print(start_pos, end_pos)                 -- 9	9
+
+local build = string.match(line, "build=(%d+)")
+print(build)                              -- 42
+
+local rewritten, count = string.gsub(line, "(%a+)=(%d+)", "%1:<%2>")
+print(rewritten, count)                   -- release:<7> build:<42>	2
+
+for word in string.gmatch(line, "%a+") do
+    print(word)                           -- release, build
+end
+```
+
+Native builds lower the builtins to direct runtime calls
+(`lusa_string_find_start`, `lusa_string_find_values`, `lusa_string_match`,
+`lusa_string_gsub`, `lusa_string_gmatch_new`, and
+`lusa_string_gmatch_next`). `gmatch` iterators and capture strings are owned by
+the enclosing loop scope and released on `break`, `return`, or scope exit.
+Native `find` also supports `local start, finish = ...`, while
+`local text, count = string.gsub(...)` binds both results.
+
+Literal patterns and replacements are validated before C emission: malformed
+patterns report `E0323`, and replacement captures that do not exist report
+`E0324`. Dynamic pattern strings are validated at runtime and raise `E2010`,
+which `pcall` can catch.
+
+```sh
+lusalang run examples/string_patterns.lusa
+lusalang run examples/string_patterns.lusa --vm
+lusalang run examples/string_patterns.lusa --native
+```
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -453,8 +508,9 @@ Near-term milestones:
 - **v0.8.0 (shipped):** native `pcall` with checked error propagation and RAII
   cleanup, plus cooperative coroutines in the interpreter, VM, and native
   backend.
-- **v0.9.0:** Lua-style string patterns (`find`, `match`, `gmatch`, `gsub`)
-  backed by one matcher shared across engines.
+- **v0.9.0 (shipped):** Lua-style string patterns (`find`, `match`, `gmatch`,
+  `gsub`) backed by one bounded matcher shared across engines, with native
+  static pattern diagnostics and RAII-tracked temporary strings.
 - **v1.0.0:** a compile-time borrow checker plus explicit `move`/`copy`
   labels, golden diagnostics, and language stabilization.
 

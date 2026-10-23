@@ -1574,9 +1574,36 @@ fn call_method(
     let sp = interp.vm.stack.len();
     let obj_pos = sp.saturating_sub(nargs + 1);
     let key = const_value(interp, key_k)?;
-    let f = match interp.vm.stack.get(obj_pos) {
-        Some(obj) => crate::eval::read_field(obj, &key, span)?,
-        None => Value::Nil,
+    let obj_value = interp
+        .vm
+        .stack
+        .get(obj_pos)
+        .cloned()
+        .unwrap_or(Value::Nil);
+    // Strings expose the `string` library as pseudo-methods, matching the
+    // tree-walking interpreter (`s:match(pat)` == `string.match(s, pat)`).
+    let f = match obj_value.base_value() {
+        Value::Str(_) => {
+            let module = read_global_deferred_span(interp, "string")?;
+            let table = match module.base_value() {
+                Value::Table(table) => table,
+                _ => {
+                    return Err(LusaError::new(
+                        E_CALL,
+                        Some(span),
+                        "`string` is not a table",
+                    ))
+                }
+            };
+            table.get(&key).ok_or_else(|| {
+                LusaError::new(
+                    E_CALL,
+                    Some(span),
+                    format!("string has no method `:{}`", key.fmt_value()),
+                )
+            })?
+        }
+        _ => crate::eval::read_field(&obj_value, &key, span)?,
     };
     let callee = classify(&f);
     if n_takes != 0 {
@@ -2642,6 +2669,9 @@ fn advance_iter(interp: &mut Interp, it: &Value, nvars: usize) -> LResult<Vec<Va
         }
         Value::Func(_) => {
             let results = interp.call_value(it, Vec::new(), span0())?;
+            if results.is_empty() {
+                return Ok(Vec::new());
+            }
             let n = nvars.max(1);
             let mut out: Vec<Value> = results.into_iter().take(n).collect();
             while out.len() < n {

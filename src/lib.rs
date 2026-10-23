@@ -12,6 +12,7 @@ pub mod interp;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
+pub mod pattern;
 pub mod scope;
 pub mod tokens;
 pub mod update;

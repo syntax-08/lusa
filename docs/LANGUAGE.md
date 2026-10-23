@@ -246,9 +246,62 @@ fails. `coroutine.isyieldable()` is `true` while executing inside a coroutine.
 Captured upvalues are shared with their closures; each coroutine has its own
 operand stack and local variables.
 
-`string`: `len upper lower sub rep reverse char byte find gsub format`.
-`find` and `gsub` are literal-only today (no Lua patterns) and `gsub`
-returns `(new text, count)`.
+`string`: `len upper lower sub rep reverse char byte find match gmatch gsub
+format`. `find`, `match`, `gmatch`, and `gsub` use the Lua-style pattern
+language described below. `gsub` returns `(new text, count)` and keeps its
+previous behavior when `plain = true`.
+
+### String patterns - `find`, `match`, `gmatch`, `gsub`
+
+Patterns are matched over Unicode scalar values. Indices count characters, not
+UTF-8 bytes, and `.` matches one scalar value. The supported syntax is:
+
+| syntax | meaning |
+|---|---|
+| `%a %c %d %g %l %p %s %u %w %x` | ASCII classes; uppercase letters negate the class |
+| `[set]`, `[^set]`, `a-z` | character sets and ranges |
+| `.` | any character |
+| `*`, `+`, `-`, `?` | greedy, one-or-more, non-greedy, optional |
+| `^`, `$` | start and end anchors |
+| `(...)`, `()` | substring capture and position capture |
+| `%1`..`%9` | back reference to an earlier capture |
+| `%bxy`, `%f[set]` | balanced match and frontier match |
+| `%%` and `%x` | escaped literal characters |
+
+```lusa
+local line = "release=7 build=42"
+print(string.find(line, "%d+"))            -- 9	9
+print(string.match(line, "build=(%d+)"))   -- 42
+print(string.gsub(line, "(%a+)=(%d+)", "%1:<%2>"))
+-- release:<7> build:<42>	2
+
+for word in string.gmatch(line, "%a+") do
+    print(word)                            -- release, build
+end
+```
+
+`string.find(s, pattern [, init [, plain]])` returns `start, end` followed by
+any captures, or `nil` when there is no match. A negative `init` counts from
+the end. `plain = true` performs a literal substring search. `string.match`
+returns the captures, or the whole match when the pattern has no captures.
+`string.gsub(s, pattern, replacement [, limit])` supports `%0` (the whole
+match), `%1`..`%9` (captures), and `%%`; `limit` caps the substitution count.
+Position captures produce 1-based decimal numbers.
+
+Matching is bounded by a nesting depth of 200 and a step budget of 1,000,000.
+A malformed pattern or replacement raises `E2010`; exhausting the budget raises
+`E2011`. Both are catchable with `pcall`, and both leave the process running.
+
+The C11 backend accepts the same surface with a few static restrictions:
+patterns and replacements must be strings, `gmatch` must appear directly in a
+generic `for`, and a loop may bind one to nine values. A literal pattern with
+no captures yields one loop value (the whole match); a literal pattern with
+captures must not bind more values than it produces. Literal malformed
+patterns report `E0323`; an out-of-range replacement capture or `gmatch`
+binding reports `E0324`. Native `string.find` returns `0` (not `nil`) when the
+search fails and supports `local start, finish = ...`; native `string.gsub`
+supports `local text, count = ...`; native `string.match` returns the first
+capture (or the whole match) as a nullable string.
 
 `table`: `insert` (positional or append), `remove`, `concat`, `sort`
 (optional comparator), `unpack`, `pack`.
@@ -304,17 +357,21 @@ Codes `E{category}{n}`, like rustc:
 | E2007  | key      | `nil`/NaN key in `t[k] = v` |
 | E2008  | value    | invalid `tonumber`/`format` |
 | E2009  | I/O      | file I/O cannot read/write (missing, unreadable, non-UTF-8, permissions) |
+| E2010  | pattern  | malformed string pattern or replacement |
+| E2011  | pattern  | pattern exceeded the bounded matching budget |
 | E0301  | static   | C11 backend: missing/invalid function parameter or return type |
 | E0308  | static   | C11 backend: mismatched types (assignment, return, call, condition) |
 | E0311  | static   | C11 backend: wrong argument/initializer count |
 | E0313  | static   | C11 backend: zero or one return value only; void/value return mismatch |
 | E0316  | unsafe   | C11 backend: raw pointer intrinsic used outside `unsafe` |
-| E0317  | static   | C11 backend: `pcall` or `coroutine.resume` used outside its required local-initializer form |
+| E0317  | static   | C11 backend: `pcall`, `coroutine.resume`, or `string.gmatch` used outside its required local/loop form |
 | E0318  | static   | C11 backend: missing method or invalid method receiver |
-| E0319  | static   | C11 backend: unsupported generic `for` iterator; invalid native coroutine entry function, handle, or operation |
+| E0319  | static   | C11 backend: unsupported generic `for` iterator; invalid native coroutine entry function, handle, operation, or string method |
 | E0320  | unsafe   | raw pointer arithmetic outside an `unsafe` block |
 | E0321  | unsafe   | raw pointer dereference outside an `unsafe` block |
 | E0322  | unsafe   | write through a `*const` pointer |
+| E0323  | static   | C11 backend: statically evaluable malformed string pattern or replacement |
+| E0324  | static   | C11 backend: replacement capture or `gmatch` binding exceeds the pattern's captures |
 | E9000  | runtime  | `error(msg)` |
 | E9100  | runtime  | `assert(false, msg)` |
 | E9999  | runtime  | internal error (umbrella; includes stack overflow for calls > 200 — catchable with `pcall`) |
@@ -647,7 +704,57 @@ the second slot with `nil` third. Portable examples should print the status
 boolean and inspect the error only through the form appropriate to the chosen
 engine.
 
-### 9.7 Native subset limits
+### 9.7 Native string patterns (Module 13)
+
+The C11 backend recognizes `string.find`, `string.match`, `string.gmatch`, and
+`string.gsub`, including colon forms such as `s:find("%d+")`. Constant patterns
+are checked during type checking; runtime calls lower directly to the
+dependency-free matcher appended from `src/pattern_runtime.c`.
+
+```lusa
+local s: string = "a=1 b=2"
+local start, finish = string.find(s, "%d+")
+print(start, finish)                         -- 3	3
+
+local text, count = string.gsub(s, "(%a+)=(%d+)", "%2:%1")
+print(text, count)                           -- 1:a 2:b	2
+
+for key, value in string.gmatch(s, "(%a+)=(%d+)") do
+    print(key, value)                        -- a 1, then b 2
+end
+```
+
+Native surface rules:
+
+- Subject, pattern, and replacement expressions must have type `string`.
+  `init` and `limit` are `i32`/`u32`; `plain` is `bool`.
+- `string.find` returns `0` when there is no match. Bind one name for the start
+  position or use `local start, finish = ...` for both positions. The native
+  backend does not expose the dynamic capture list from `find`.
+- `string.match` returns the first capture, or the whole match when there are no
+  captures, as an owned nullable string. Bind it with one local.
+- `string.gsub` supports a string replacement using `%0`..`%9` and `%%`.
+  Function replacements are dynamic-only. Bind one name for the text or
+  `local text, count = ...` for both values.
+- `string.gmatch` must be the direct iterator expression of a generic `for`.
+  The loop owns the iterator and every capture string; `break`, `return`, and
+  normal loop exit release them through RAII. Literal patterns with no captures
+  produce the whole match; literal patterns with captures produce one string per
+  capture (position captures become decimal strings). With a dynamic pattern,
+  bind only one loop variable.
+- Literal malformed patterns and invalid replacement escapes report `E0323`.
+  Replacement indices beyond a literal pattern's capture count, or too many
+  `gmatch` loop variables, report `E0324`. Dynamic failures raise `E2010`,
+  catchable through the native `pcall` subset. Budget exhaustion raises
+  `E2011`.
+
+The matcher mirrors `src/pattern.rs`: both decode UTF-8 to scalar values, enforce
+the same depth (200) and step (1,000,000) limits, and restore captures when a
+backtracking branch fails so sibling branches observe consistent state. Native
+string literals are emitted as UTF-8 bytes, so pattern results containing
+multibyte characters print and compare correctly.
+
+### 9.8 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 array/keyed table literals, nested keyed tables, field reads/writes, colon
@@ -657,15 +764,16 @@ methods, `pairs`/`ipairs` generic `for`, one-based array indexing, `#`, `if`,
 types (`*mut u32`, `*const u32`, `*mut i32`, `*const i32`), pointer arithmetic
 and volatile dereferences inside `unsafe`, the raw intrinsics above
 (`unsafe_ptr_cast`, `unsafe_read_mem`, `unsafe_write_mem`, `unsafe_alloc`,
-`unsafe_nop`, `unsafe_asm`), native `pcall`, and the restricted
+`unsafe_nop`, `unsafe_asm`), native `pcall`, the string-pattern surface in
+section 9.7, and the restricted
 `coroutine.create/resume/yield/status/close/isyieldable` surface described in
 section 9.6.
 
 Not supported by the C emitter: numeric `for`, arbitrary dynamic key
 construction in table literals, assignment through a dynamic index, varargs,
-interpolated strings, closures/nested functions, the string library, multiple
-function return values (`E0313`), dynamic `pcall` expressions, and general
-first-class coroutine operations. Native colon methods are static functions
+interpolated strings, closures/nested functions, the rest of the dynamic string
+library, multiple function return values (`E0313`), dynamic `pcall`
+expressions, and general first-class coroutine operations. Native colon methods are static functions
 and are not stored as table fields, so `pairs(user)` does not enumerate method
 names; keep enumerable data in a separate table when parity with the dynamic
 engines matters. The normal `lusalang run` interpreter and `--vm` engine

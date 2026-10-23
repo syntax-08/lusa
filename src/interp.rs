@@ -707,6 +707,9 @@ impl Interp {
             }
             Value::Func(_) => {
                 let results = self.call_value(it, Vec::new(), span)?;
+                if results.is_empty() {
+                    return Ok(Vec::new());
+                }
                 let n = vars.len().max(1);
                 let mut out = results.into_iter().take(n).collect::<Vec<_>>();
                 while out.len() < n {

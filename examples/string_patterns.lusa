@@ -1,0 +1,35 @@
+-- Module 13: one Lua-style pattern engine in the interpreter, VM, and C11 backend.
+
+local line: string = "release=7 build=42"
+
+local start_pos, end_pos = string.find(line, "%d+")
+print("number", start_pos, end_pos)          -- number	9	9
+
+local method_start, method_end = line:find("%a+")
+print("method", method_start, method_end)    -- method	1	7
+
+local build: string = string.match(line, "build=(%d+)")
+print("build", build)                        -- build	42
+
+local swapped, count = string.gsub(line, "(%a+)=(%d+)", "%2:%1")
+print("swapped", swapped, count)             -- swapped	7:release 42:build	2
+
+for word in string.gmatch(line, "%a+") do
+    print("word", word)
+end
+
+for key, value in string.gmatch(line, "(%a+)=(%d+)") do
+    print("pair", key, value)
+end
+
+local nested: string = string.match("call(a(b)c)", "%b()")
+print("balanced", nested)                    -- balanced	(a(b)c)
+
+local first_word: string = string.match("THE (quick) fox", "%f[%a]%a+")
+print("frontier", first_word)                -- frontier	THE
+
+local repeated: string = string.match("abc abc", "(%a+) %1")
+print("backref", repeated)                   -- backref	abc
+
+local plain_start, plain_end = string.find("a.b", ".", 1, true)
+print("plain", plain_start, plain_end)       -- plain	2	2

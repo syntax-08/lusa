@@ -5,8 +5,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
 
-use crate::error::{LResult, LusaError, Span, E_ASSERT, E_CMP, E_ERROR, E_INDEX, E_IO, E_NUM};
+use crate::error::{
+    LResult, LusaError, Span, E_ASSERT, E_CMP, E_ERROR, E_INDEX, E_IO, E_NUM,
+};
 use crate::interp::Interp;
+use crate::pattern::{self, CaptureKind, Gmatch};
 use crate::value::{format_number, with_reg, FuncBody, FuncObj, IterState, TableObj, Value};
 
 type BF = Box<dyn Fn(&mut Interp, Vec<Value>, Span) -> LResult<Vec<Value>>>;
@@ -54,6 +57,57 @@ pub fn need_num(v: &Value, what: &str, span: Span) -> LResult<f64> {
 
 fn to_str(v: &Value) -> String {
     v.base_value().fmt_value()
+}
+
+fn pattern_error(err: pattern::PatternError, span: Span) -> LusaError {
+    let help = if err.code == pattern::E_PATTERN_COMPLEX {
+        "simplify nested quantifiers or match a shorter subject"
+    } else {
+        "patterns use Lua syntax: `%d`, `%a`, `%w`, `[...]`, `*`, `+`, `-`, `?`, captures, and `^`/`$`"
+    };
+    LusaError::new(err.code, Some(span), err.message).help(help)
+}
+
+/// Converts a Lua-style 1-based `init` argument to a zero-based search index.
+/// Negative values count from the end of the subject; values beyond the last
+/// valid insertion point produce no match.
+fn pattern_init(value: Option<&Value>, len: usize) -> Option<usize> {
+    let number = match value {
+        Some(Value::Number(n)) if n.is_finite() => *n,
+        _ => 1.0,
+    };
+    let mut pos = number.trunc() as i64;
+    if pos < 0 {
+        pos = len as i64 + pos + 1;
+    }
+    if pos < 1 {
+        pos = 1;
+    }
+    if pos > len as i64 + 1 {
+        return None;
+    }
+    Some((pos - 1) as usize)
+}
+
+fn capture_values(m: &pattern::Match, source: &[char]) -> Vec<Value> {
+    m.captures
+        .iter()
+        .map(|cap| match cap.kind {
+            CaptureKind::Position => Value::Number((cap.start + 1) as f64),
+            CaptureKind::Substring => {
+                let text: String = source[cap.start..cap.end].iter().collect();
+                Value::Str(Arc::from(text.as_str()))
+            }
+        })
+        .collect()
+}
+
+fn match_values(m: &pattern::Match, source: &[char]) -> Vec<Value> {
+    if m.captures.is_empty() {
+        vec![Value::Str(Arc::from(m.text(source).as_str()))]
+    } else {
+        capture_values(m, source)
+    }
 }
 
 // ===== base functions =====
@@ -798,26 +852,63 @@ fn string_mod() -> Vec<(&'static str, BF)> {
             Box::new(|_: &mut Interp, a: Vec<Value>, s: Span| {
                 let src = to_str(get(&a, 0, "s", s)?);
                 let pat = to_str(get(&a, 1, "pat", s)?);
-                let init = match a.get(2) {
-                    Some(Value::Number(n)) if !n.is_nan() => (*n).max(1.0) as usize,
-                    _ => 1,
-                };
                 let hay: Vec<char> = src.chars().collect();
-                let nee: Vec<char> = pat.chars().collect();
-                if nee.is_empty() {
-                    let p = init.min(hay.len() + 1) as f64;
-                    return Ok(vec![Value::Number(p), Value::Number(p - 1.0)]);
-                }
-                let start = init.saturating_sub(1).min(hay.len());
-                for i in start..=hay.len().saturating_sub(nee.len()) {
-                    if hay[i..i + nee.len()] == nee[..] {
-                        return Ok(vec![
-                            Value::Number((i + 1) as f64),
-                            Value::Number((i + nee.len()) as f64),
-                        ]);
-                    }
-                }
-                one(Value::Nil)
+                let Some(start) = pattern_init(a.get(2), hay.len()) else {
+                    return one(Value::Nil);
+                };
+                let plain = a.get(3).map(Value::truthy).unwrap_or(false);
+                let Some(found) = pattern::find(&src, &pat, start, plain)
+                    .map_err(|err| pattern_error(err, s))?
+                else {
+                    return one(Value::Nil);
+                };
+                let mut out = vec![
+                    Value::Number((found.start + 1) as f64),
+                    Value::Number(found.end as f64),
+                ];
+                out.extend(capture_values(&found, &hay));
+                Ok(out)
+            }),
+        ),
+        (
+            "match",
+            Box::new(|_: &mut Interp, a: Vec<Value>, s: Span| {
+                let src = to_str(get(&a, 0, "s", s)?);
+                let pat = to_str(get(&a, 1, "pat", s)?);
+                let hay: Vec<char> = src.chars().collect();
+                let Some(start) = pattern_init(a.get(2), hay.len()) else {
+                    return one(Value::Nil);
+                };
+                let Some(found) = pattern::find(&src, &pat, start, false)
+                    .map_err(|err| pattern_error(err, s))?
+                else {
+                    return one(Value::Nil);
+                };
+                Ok(match_values(&found, &hay))
+            }),
+        ),
+        (
+            "gmatch",
+            Box::new(|_: &mut Interp, a: Vec<Value>, s: Span| {
+                let src = to_str(get(&a, 0, "s", s)?);
+                let pat = to_str(get(&a, 1, "pat", s)?);
+                let state = Rc::new(std::cell::RefCell::new(
+                    Gmatch::new(&src, &pat).map_err(|err| pattern_error(err, s))?,
+                ));
+                Ok(vec![make_builtin(
+                    "string.gmatch iterator",
+                    Box::new(move |_: &mut Interp, _args: Vec<Value>, call_span: Span| {
+                        let mut state = state.borrow_mut();
+                        let Some(found) = state
+                            .next_match()
+                            .map_err(|err| pattern_error(err, call_span))?
+                        else {
+                            return Ok(Vec::new());
+                        };
+                        let source = state.source_chars();
+                        Ok(match_values(&found, source))
+                    }),
+                )])
             }),
         ),
         (
@@ -840,26 +931,14 @@ fn string_mod() -> Vec<(&'static str, BF)> {
                     }
                 }
                 let rep = to_str(repl);
-                let mut out = String::new();
-                let hay: Vec<char> = src.chars().collect();
-                let nee: Vec<char> = pat.chars().collect();
-                let mut count = 0usize;
-                if !nee.is_empty() {
-                    let mut i = 0usize;
-                    while i + nee.len() <= hay.len() {
-                        if hay[i..i + nee.len()] == nee[..] {
-                            out.push_str(&rep);
-                            count += 1;
-                            i += nee.len();
-                            continue;
-                        }
-                        out.push(hay[i]);
-                        i += 1;
+                let limit = match a.get(3) {
+                    Some(Value::Number(n)) if n.is_finite() => {
+                        Some((*n).max(0.0).trunc() as usize)
                     }
-                    out.extend(hay[i..].iter());
-                } else {
-                    out = rep;
-                }
+                    _ => None,
+                };
+                let (out, count) = pattern::gsub(&src, &pat, &rep, limit)
+                    .map_err(|err| pattern_error(err, s))?;
                 Ok(vec![
                     Value::Str(Arc::from(out.as_str())),
                     Value::Number(count as f64),
