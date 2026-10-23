@@ -1,0 +1,37 @@
+-- Module 14: compile-time borrow checking and explicit ownership transfer.
+
+local account = { owner = "Ana", cents = 100 }
+
+-- Multiple immutable aliases may coexist. They end at the block exit.
+do
+    local first_view = borrow account
+    local second_view = borrow account
+    print("views", first_view.cents, second_view.cents)
+end
+
+-- clone is an independent deep copy; the owner stays available.
+local snapshot = clone account
+snapshot.cents = 250
+print("clone", account.cents, snapshot.cents)
+
+-- A colon method receives a mutable borrow of the receiver.
+function account:deposit(amount: i32): i32
+    self.cents = self.cents + amount
+    return self.cents
+end
+
+account:deposit(50)
+print("method", account.cents)
+
+-- unsafe is the explicit escape hatch: this write bypasses alias checks.
+do
+    local view = borrow account
+    unsafe do
+        account.cents = account.cents + 1
+    end
+    print("unsafe", view.cents)
+end
+
+-- move transfers ownership; `account` is moved-out after this line.
+local moved = move account
+print("moved", moved.owner, moved.cents)

@@ -34,6 +34,7 @@ const KEYWORDS: &[(&str, TokenKind)] = &[
     ("not", TokenKind::Not),
     ("borrow", TokenKind::Borrow),
     ("clone", TokenKind::Clone),
+    ("move", TokenKind::Move),
     ("nil", TokenKind::Nil),
     ("true", TokenKind::True),
     ("false", TokenKind::False),

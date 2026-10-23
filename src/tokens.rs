@@ -46,6 +46,7 @@ pub enum TokenKind {
     Not,
     Borrow,
     Clone,
+    Move,
     // operators
     Plus,
     Minus,
@@ -118,6 +119,7 @@ impl Token {
             TokenKind::Not => "`not`".into(),
             TokenKind::Borrow => "`borrow`".into(),
             TokenKind::Clone => "`clone`".into(),
+            TokenKind::Move => "`move`".into(),
             TokenKind::Plus => "`+`".into(),
             TokenKind::Minus => "`-`".into(),
             TokenKind::Star => "`*`".into(),

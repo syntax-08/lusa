@@ -1,6 +1,6 @@
 [package]
 name = "lusa"
-version = "0.9.0"
+version = "1.0.0"
 edition = "2021"
 description = "Lusa — a Lua-flavoured dynamic language written in Rust, with optional ownership (borrow/clone) and friendly Rust-style diagnostics."
 license = "MIT"

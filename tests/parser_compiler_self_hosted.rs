@@ -1,7 +1,7 @@
 //! Runs the self-hosted parser and compiler through both engines.
 //!
 //! Each module is wrapped in its own `do ... end` block so their top-level
-//! locals (including the local `move` helpers) cannot shadow one another.  The
+//! locals (including the local `transfer` helpers) cannot shadow one another.  The
 //! harness asserts AST shape, an exact byte image, traversal ownership, jump
 //! targets, and the parser/compiler error paths.
 
@@ -17,20 +17,20 @@ fn strip_module<'a>(source: &'a str, suffix: &str) -> &'a str {
 }
 
 fn program() -> String {
-    let lexer = strip_module(LEXER, "return move(Lexer)");
-    let parser = strip_module(PARSER, "return move(Parser)");
-    let compiler = strip_module(COMPILER, "return move(Compiler)");
+    let lexer = strip_module(LEXER, "return transfer(Lexer)");
+    let parser = strip_module(PARSER, "return transfer(Parser)");
+    let compiler = strip_module(COMPILER, "return transfer(Compiler)");
 
     let mut src = String::from("local M6Lexer, M6Parser, M6Compiler\n");
     src.push_str("do\n");
     src.push_str(lexer);
-    src.push_str("\nM6Lexer = move(Lexer)\nend\n");
+    src.push_str("\nM6Lexer = transfer(Lexer)\nend\n");
     src.push_str("do\n");
     src.push_str(parser);
-    src.push_str("\nM6Parser = move(Parser)\nend\n");
+    src.push_str("\nM6Parser = transfer(Parser)\nend\n");
     src.push_str("do\n");
     src.push_str(compiler);
-    src.push_str("\nM6Compiler = move(Compiler)\nend\n");
+    src.push_str("\nM6Compiler = transfer(Compiler)\nend\n");
 
     src.push_str(
         r#"
@@ -156,7 +156,7 @@ local operand_bytes = {
     [38] = 0, [39] = 0,
     [42] = 4,
     [53] = 2, [54] = 2, [55] = 2, [56] = 2,
-    [59] = 0, [61] = 2
+    [59] = 0, [61] = 2, [83] = 0
 }
 local is_jump = {
     [53] = true, [54] = true, [55] = true, [56] = true

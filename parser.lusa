@@ -50,12 +50,13 @@
 --   Table    { tag = "Table", items = { expr... }, keys = { string|nil... } }
 --   Clone    { tag = "Clone", value = expr }
 --   Borrow   { tag = "Borrow", value = expr }
+--   Move     { tag = "Move", value = expr }
 --
 -- Supported statements: local declarations (with optional `: type`),
 -- name assignments, calls, `if`, `while`, `repeat`, `do`, `return`, `break`,
 -- and named function definitions with typed parameters and an optional
 -- return type.  Expressions cover literals, names, calls, parentheses,
--- unary and binary operators, `and`/`or`, `clone` and `borrow`, plus array
+-- unary and binary operators, `and`/`or`, `clone`, `borrow`, and `move`, plus array
 -- table constructors and integer index expressions (`t[1]`).  Method calls
 -- such as `s:find(pat)` and `s:gsub(pat, replacement)` are parsed as ordinary
 -- `MethodCall` nodes; string pseudo-method lowering is a compiler concern.
@@ -63,7 +64,7 @@
 --
 -- Errors use E9000 with a `parser:line:column:` prefix.
 
-local function move(value)
+local function transfer(value)
     return value
 end
 
@@ -355,7 +356,7 @@ parse_block = function()
             end
         end
     end
-    return move(list)
+    return transfer(list)
 end
 
 -- A type name is deliberately kept as a name token here.  The backend's
@@ -798,7 +799,7 @@ parse_exprlist = function()
         advance()
         list[#list + 1] = parse_expr()
     end
-    return move(list)
+    return transfer(list)
 end
 
 subexpr = function(limit)
@@ -913,7 +914,7 @@ parse_suffixes = function(e)
             local column = e.column
             e = {
                 tag = "Field",
-                table = move(e),
+                table = transfer(e),
                 field_name = name,
                 line = line,
                 column = column
@@ -927,7 +928,7 @@ parse_suffixes = function(e)
             local column = e.column
             e = {
                 tag = "MethodCall",
-                obj = move(e),
+                obj = transfer(e),
                 name = name,
                 args = args,
                 line = line,
@@ -948,7 +949,9 @@ parse_prefix = function()
     local is_unary = false
     if kind == "operator" and (value == "-" or value == "#" or value == "*") then
         is_unary = true
-    elseif kind == "keyword" and (value == "not" or value == "borrow" or value == "clone") then
+    elseif kind == "keyword"
+        and (value == "not" or value == "borrow" or value == "clone"
+            or value == "move") then
         is_unary = true
     end
 
@@ -960,6 +963,8 @@ parse_prefix = function()
             tag = "Borrow"
         elseif value == "clone" then
             tag = "Clone"
+        elseif value == "move" then
+            tag = "Move"
         elseif value == "*" then
             tag = "Deref"
         end
@@ -1114,7 +1119,7 @@ parse_args = function()
     local args = {}
     if at_value(")") then
         advance()
-        return move(args)
+        return transfer(args)
     end
     args[#args + 1] = parse_expr()
     while at_value(",") do
@@ -1122,7 +1127,7 @@ parse_args = function()
         args[#args + 1] = parse_expr()
     end
     expect_value(")", "`)`")
-    return move(args)
+    return transfer(args)
 end
 
 parse_program = function()
@@ -1153,7 +1158,7 @@ function Parser.parse(input)
     local ast = parse_program()
     tokens = nil
     total = 0
-    return move(ast)
+    return transfer(ast)
 end
 
-return move(Parser)
+return transfer(Parser)

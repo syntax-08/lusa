@@ -180,7 +180,7 @@ impl Parser {
                 self.bump();
                 St { kind: StKind::Break, span: tk.span }
             }
-            TK::Borrow | TK::Clone | TK::LParen | TK::Num(_) | TK::Int(_) | TK::Str(_)
+            TK::Borrow | TK::Clone | TK::Move | TK::LParen | TK::Num(_) | TK::Int(_) | TK::Str(_)
             | TK::Nil | TK::True | TK::False | TK::Minus | TK::Not | TK::Len
             | TK::DotDotDot | TK::LBrace => {
                 let e = self.parse_expr()?;
@@ -564,7 +564,14 @@ impl Parser {
     fn parse_prefix(&mut self) -> LResult<Expr> {
         let tk = self.peek().clone();
         match tk.kind {
-            TK::Not | TK::Minus | TK::Len | TK::Star | TK::StarLine | TK::Borrow | TK::Clone => {
+            TK::Not
+            | TK::Minus
+            | TK::Len
+            | TK::Star
+            | TK::StarLine
+            | TK::Borrow
+            | TK::Clone
+            | TK::Move => {
                 let op = tk.kind.clone();
                 self.bump();
                 let e = self.subexpr(PREC_UNARY)?;
@@ -575,6 +582,7 @@ impl Parser {
                     TK::Len => ExprKind::Un { op: UnOp::Len, e: Box::new(e) },
                     TK::Star | TK::StarLine => ExprKind::Un { op: UnOp::Deref, e: Box::new(e) },
                     TK::Borrow => ExprKind::Borrow { e: Box::new(e), is_mut: false },
+                    TK::Move => ExprKind::Move { e: Box::new(e) },
                     _ => ExprKind::Clone { e: Box::new(e) },
                 };
                 let mut ex = Expr { kind, span };

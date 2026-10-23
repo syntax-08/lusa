@@ -32,7 +32,7 @@
 --
 -- Supported nodes: Local, Assign (name targets), CallStmt, If, While, Repeat,
 -- Do, Return, Break; Nil, Bool, Number, String (without interpolation), Name,
--- Paren, Unary, Binary, Logical, Call, MethodCall, Clone, Borrow.  Calls and
+-- Paren, Unary, Binary, Logical, Call, MethodCall, Clone, Borrow, Move.  Calls and
 -- method calls are single-value expressions (`CallOne` / `MethodCallOne`).
 -- `s:find(pat)` and the other string pseudo-methods therefore compile through
 -- the same dispatch path as the native VM; multi-return expansion and varargs
@@ -40,7 +40,7 @@
 -- Unsupported constructs produce a `compiler:line:column:` error instead of
 -- silently miscompiling.
 
-local function move(value)
+local function transfer(value)
     return value
 end
 
@@ -74,6 +74,7 @@ local OPCODES = {
     LEN = 37,
     CLONE = 38,
     BORROW_ERR = 39,
+    BORROW_IMM = 83,
     CALL_ONE = 42,
     METHOD_CALL_ONE = 50,
     JUMP = 53,
@@ -597,9 +598,14 @@ compile_expr = function(expr)
         set_location(expr.line, expr.column)
         emit0(OPCODES.CLONE)
 
+    elseif tag == "Move" then
+        -- Assignment, calls, and returns already emit moving reads in the
+        -- reference image; an explicit `move` keeps the same value shape.
+        compile_expr(expr.value)
+
     elseif tag == "Borrow" then
-        -- Matches the native compiler: bytecode mode rejects `borrow`.
-        emit0(OPCODES.BORROW_ERR)
+        compile_expr(expr.value)
+        emit0(OPCODES.BORROW_IMM)
 
     else
         fail(current_line, current_column, "unsupported expression node `" .. tostring(tag) .. "`")
@@ -649,10 +655,10 @@ function Compiler.compile(ast)
         lines = lines,
         nlocals = next_slot
     }
-    return move(image)
+    return transfer(image)
 end
 
 Compiler.Version = 1
 Compiler.Opcode = clone OPCODES
 
-return move(Compiler)
+return transfer(Compiler)

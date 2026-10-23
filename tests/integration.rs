@@ -103,13 +103,13 @@ fn closure_locals_shadow_outer_variables_with_the_same_name() {
     // including on repeated calls.
     assert_parity(
         r#"
-local function move(v) return v end
+local function transfer(v) return v end
 local function build()
     local tokens = {}
     local function add(x) tokens[#tokens + 1] = x end
     add(1)
     add(2)
-    return move(tokens)
+    return transfer(tokens)
 end
 local tokens = build()
 local second = build()

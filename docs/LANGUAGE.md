@@ -104,25 +104,37 @@ Operators (Lua precedence): `or < and < (== ~= < > <= >=) < .. (right) <
    print(t)           -- ⚠ error[E1001]: use of moved-out value `t`
    ```
    The moved slot keeps a history (`note: moved to `u` here`) for the
-   diagnostic.
-3. `clone x` — deep copy (recursive for tables), **independent**:
+   diagnostic. The C11 front end rejects the same use at compile time.
+3. `move x` — explicit ownership transfer. It is accepted in every compiler
+   stage and has the same effect as a consuming read, but makes the intent
+   visible:
+   ```lusa
+   local t = {1}
+   local u = move t   -- explicit move; t becomes moved-out
+   ```
+4. `clone x` — deep copy (recursive for tables), **independent**:
    ```lusa
    local t = {1}
    local u = clone t  -- both stay alive and separate
    ```
-4. `borrow x` — immutable alias of the value (still owned by the original):
+5. `borrow x` — immutable alias of the value (still owned by the original):
    ```lusa
    local v = borrow t
    print(v[1])        -- read ok
    -- v[1] = 9        -- ⚠ error[E1004]: write through an immutable borrow
    ```
-5. Methods — `o:m()` passes the receiver as a **mutable borrow**, for
+   Multiple immutable aliases may coexist. They end at lexical scope exit
+   (including loop-body exit and `break`).
+6. Methods — `o:m()` passes the receiver as a **mutable borrow**, for
    compatibility with Lua:
    ```lusa
    function o:inc() self.n = self.n + 1 end
    o:inc()            -- implicit mutable borrow, mutates `o.n`
    ```
-6. `and`, `or` evaluate their operands without consuming anything (plain
+   No other read, borrow, or move of `o` may appear while the method call
+   evaluates its arguments; the static checker reports `E1002`. A mutating
+   method call through a `borrow` alias is rejected with `E1004`.
+7. `and`, `or` evaluate their operands without consuming anything (plain
    reads are Copy in expression context).
 
 ### Order of checks (runtime)
@@ -140,6 +152,31 @@ do
 end
 local c = t         -- ok: the borrow already ended
 ```
+
+### Compile-time borrow checking
+
+The C11 backend performs the same ownership analysis before emitting C. The
+checker is path-conservative at variable granularity and adds no runtime
+overhead. It enforces:
+
+- a moved or `move`-d heap value cannot be read or moved again (`E1001`);
+- a value with a live alias cannot be moved or overwritten (`E1002`);
+- multiple immutable `borrow` aliases are allowed;
+- an immutable alias cannot be written through (`E1004`);
+- a method receiver is treated as a mutable borrow while its arguments are
+  checked; any simultaneous read or move of the receiver reports `E1002`.
+
+Diagnostics include the source span and, for alias conflicts, the borrow site:
+
+```text
+error[E1002]: cannot move out of `t` because it is borrowed
+  --> lusa:4:11
+   = borrowed by `view` at lusa:2:14
+```
+
+`unsafe do ... end` bypasses borrow/mutation checks for raw pointer and hardware
+access. Move tracking (`E1001`) still applies, because using a moved value would
+be undefined even in native code. `clone` always remains a safe deep copy.
 
 ---
 
@@ -344,7 +381,7 @@ Codes `E{category}{n}`, like rustc:
 | E0101  | parser   | syntax (unexpected token, missing `end`) |
 | E0102  | reserved | `break` outside a loop (reported as E0101 today) |
 | E1001  | move     | `use of moved-out value` — a moved slot was reused |
-| E1002  | borrow   | op. that needs exclusive access while a `borrow` exists |
+| E1002  | borrow   | move, read, or write needing exclusive access while a borrow or method receiver borrow is active |
 | E1003  | reserved | (future) access through a borrow whose owner was moved |
 | E1004  | borrow   | write through an immutable borrow |
 | E1005  | reserved | (future) move out through a borrow |
@@ -760,7 +797,8 @@ Supported: typed and inferred locals, named typed functions, calls, string and
 array/keyed table literals, nested keyed tables, field reads/writes, colon
 methods, `pairs`/`ipairs` generic `for`, one-based array indexing, `#`, `if`,
 `while`, `repeat`, `do`, `return`, `break`, assignments, globals, `print`,
-`clone`, `borrow`, `unsafe` blocks, static `struct` declarations, raw pointer
+`clone`, `borrow`, `move`, the compile-time borrow checker, `unsafe` blocks,
+static `struct` declarations, raw pointer
 types (`*mut u32`, `*const u32`, `*mut i32`, `*const i32`), pointer arithmetic
 and volatile dereferences inside `unsafe`, the raw intrinsics above
 (`unsafe_ptr_cast`, `unsafe_read_mem`, `unsafe_write_mem`, `unsafe_alloc`,

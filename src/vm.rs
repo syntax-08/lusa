@@ -1,4 +1,4 @@
-﻿//! Bytecode VM: executes compiled `Chunk`s with a stack machine.
+//! Bytecode VM: executes compiled `Chunk`s with a stack machine.
 //!
 //! Frames share one value stack; segments (`SegStart`/`SegEnd`) carve list
 //! regions for multi-value bookkeeping; `last_ret` carries the expansion count
@@ -17,7 +17,7 @@ use crate::compiler::{Compiled, Instr};
 use crate::error::{LResult, LusaError, Span, E_CALL, E_LEN, E_MOVED, E_RUNTIME};
 use crate::interp::{Interp, MAX_CALL_DEPTH};
 use crate::scope;
-use crate::value::{format_number, span0, SlotV, TableObj, Value};
+use crate::value::{format_number, span0, AliasKind, SlotV, TableObj, Value};
 
 // ===== state =====
 
@@ -887,6 +887,15 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             }
             StepOutcome::Continue
         }
+        Instr::ClearSlot(slot) => {
+            // Lexical scope exit: dropping the value releases borrow aliases
+            // before the register is reused by a sibling block.
+            let frame = interp.vm.frames.last_mut().expect("frame");
+            if let Some(cell) = frame.slots.get_mut(*slot as usize) {
+                cell.set(SlotV::Set(Value::Nil));
+            }
+            StepOutcome::Continue
+        }
         Instr::SetUp(idx) => {
             let v = pop1(interp);
             let frame = interp.vm.frames.last().expect("frame");
@@ -914,8 +923,13 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             let v = pop1(interp);
             let obj = pop1(interp);
             let key = const_value(interp, *k)?;
-            let t = expect_table(&obj)?;
-            let _ = t.set(key, v);
+            interp.write_table_slot(
+                obj.clone(),
+                key,
+                v,
+                "field",
+                current_span(interp),
+            )?;
             interp.vm.stack.push(obj);
             interp.vm.last_ret = 1;
             StepOutcome::Continue
@@ -925,8 +939,13 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             let v = pop1(interp);
             let key = pop1(interp);
             let obj = pop1(interp);
-            let t = expect_table(&obj)?;
-            let _ = t.set(key, v);
+            interp.write_table_slot(
+                obj.clone(),
+                key,
+                v,
+                "index",
+                current_span(interp),
+            )?;
             interp.vm.stack.push(obj);
             StepOutcome::Continue
         }
@@ -1017,6 +1036,18 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
                 E_RUNTIME,
                 "borrow is not supported in bytecode mode yet; run this program with the interpreter",
             ))
+        }
+        Instr::BorrowImm => {
+            let value = pop1(interp);
+            let alias = interp.make_alias(
+                value,
+                "<borrow>",
+                AliasKind::Imm,
+                current_span(interp),
+            )?;
+            interp.vm.stack.push(alias);
+            interp.vm.last_ret = 1;
+            StepOutcome::Continue
         }
         Instr::UnsafeEnter => {
             interp.unsafe_depth += 1;
@@ -1276,16 +1307,26 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             let obj = pop1(interp);
             let v = seg_front_or_nil(interp)?;
             let key = const_value(interp, *k)?;
-            let t = expect_table(&obj)?;
-            let _ = t.set(key, v);
+            interp.write_table_slot(
+                obj,
+                key,
+                v,
+                "field",
+                current_span(interp),
+            )?;
             StepOutcome::Continue
         }
         Instr::StoreIndexFromSeg => {
             let key = pop1(interp);
             let obj = pop1(interp);
             let v = seg_front_or_nil(interp)?;
-            let t = expect_table(&obj)?;
-            let _ = t.set(key, v);
+            interp.write_table_slot(
+                obj,
+                key,
+                v,
+                "index",
+                current_span(interp),
+            )?;
             StepOutcome::Continue
         }
         Instr::MakeClosure(k) => {
@@ -1395,7 +1436,7 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
                     err_at(
                         current_span(interp),
                         E_MOVED,
-                        "use of moved value `(iter)`",
+                        "use of moved-out value `(iter)`",
                     )
                 })?;
             let row = advance_iter(interp, &it, *nvars as usize)?;
@@ -2478,7 +2519,7 @@ fn push_local(interp: &mut Interp, slot: usize) -> LResult<()> {
             Err(err_at(
                 frame.proto.proto.span_at(pc),
                 crate::error::E_MOVED,
-                format!("use of moved value `{}`", label),
+                format!("use of moved-out value `{}`", label),
             ))
         }
     }
@@ -2529,7 +2570,7 @@ fn push_upval(interp: &mut Interp, idx: usize) -> LResult<()> {
             Err(err_at(
                 frame_span(frame),
                 crate::error::E_MOVED,
-                format!("use of moved value `{}`", label),
+                format!("use of moved-out value `{}`", label),
             ))
         }
     }
@@ -2587,7 +2628,7 @@ fn frame_num(frame: &VmFrame, slot: usize) -> LResult<f64> {
             Err(err_at(
                 frame_span(frame),
                 crate::error::E_MOVED,
-                format!("use of moved value `{}`", label),
+                format!("use of moved-out value `{}`", label),
             ))
         }
     }

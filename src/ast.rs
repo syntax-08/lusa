@@ -107,9 +107,11 @@ pub enum ExprKind {
     /// `a and b` / `a or b` (kept distinct for short-circuit eval)
     Log { op: LogOp, l: Box<Expr>, r: Box<Expr> },
     Un { op: UnOp, e: Box<Expr> },
-    /// `borrow expr` / `clone expr` / `borrow mut expr`
+    /// `borrow expr` / `clone expr` / `move expr` / `borrow mut expr`
     Borrow { e: Box<Expr>, is_mut: bool },
     Clone { e: Box<Expr> },
+    /// Explicit ownership transfer (`move expr`).
+    Move { e: Box<Expr> },
     /// `...`
     Vararg,
     /// (expr) — truncates multiple returns to one

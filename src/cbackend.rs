@@ -77,9 +77,9 @@ fn source_chunks_literal(source: &str) -> String {
 }
 
 fn backend_program(source: &str) -> Result<String, String> {
-    let lexer = strip_module(LEXER, "return move(Lexer)")?;
-    let parser = strip_module(PARSER, "return move(Parser)")?;
-    let bootstrap = strip_module(BOOTSTRAP, "return move(Compiler)")?;
+    let lexer = strip_module(LEXER, "return transfer(Lexer)")?;
+    let parser = strip_module(PARSER, "return transfer(Parser)")?;
+    let bootstrap = strip_module(BOOTSTRAP, "return transfer(Compiler)")?;
 
     let mut program = String::with_capacity(
         lexer.len() + parser.len() + bootstrap.len() + source.len() / 8 + 512,

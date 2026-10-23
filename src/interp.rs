@@ -939,7 +939,7 @@ impl Interp {
     }
 
     /// `t.k = v` / `t[k] = v` through slot semantics with borrow checks.
-    fn write_table_slot(
+    pub(crate) fn write_table_slot(
         &self,
         obj: Value,
         key: Value,
@@ -949,19 +949,21 @@ impl Interp {
     ) -> LResult<()> {
         let t: Rc<TableObj> = match obj {
             Value::Table(t) => {
-                let borrowers = self.borrowed_by(t.vid);
-                if !borrowers.is_empty() {
-                    return Err(self.conflict_conf(
-                        &format!("cannot assign to `{}` because its table is borrowed", desc),
-                        desc,
-                        &borrowers,
-                        span,
-                    ));
+                if self.unsafe_depth == 0 {
+                    let borrowers = self.borrowed_by(t.vid);
+                    if !borrowers.is_empty() {
+                        return Err(self.conflict_conf(
+                            &format!("cannot assign to `{}` because its table is borrowed", desc),
+                            desc,
+                            &borrowers,
+                            span,
+                        ));
+                    }
                 }
                 t
             }
             Value::Alias(a) => {
-                if a.kind != AliasKind::Mut {
+                if self.unsafe_depth == 0 && a.kind != AliasKind::Mut {
                     return Err(LusaError::new(
                         crate::error::E_MUT_IMMUT,
                         Some(span),

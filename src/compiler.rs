@@ -220,6 +220,8 @@ pub enum Instr {
     StoreGlobSeg(u16),  // name-const
     StoreFieldSeg(u16), // TOS = obj; name-const
     StoreIndexFromSeg,  // TOS = key, under = obj
+    BorrowImm,          // TOS = value; wraps it in an immutable alias
+    ClearSlot(u16),     // drop a lexical binding as its block exits
 }
 
 // ===== compiler state =====
@@ -278,6 +280,8 @@ struct Frame {
     decl_groups: Vec<Vec<(u16, u16)>>,
     /// pending break jumps of the innermost enclosing loops
     breaks: Vec<Vec<usize>>,
+    /// lexical scope depth at each enclosing loop entry
+    loop_depths: Vec<usize>,
     nparams: usize,
     has_vararg: bool,
 }
@@ -339,6 +343,7 @@ impl Frame {
             code: Vec::new(),
             decl_groups: Vec::new(),
             breaks: Vec::new(),
+            loop_depths: Vec::new(),
             nparams: 0,
             has_vararg: false,
         }
@@ -461,18 +466,49 @@ impl Compiler {
     /// not alias one another. Uncaptured registers need no instruction at all:
     /// the next declaration simply overwrites the direct cell.
     fn close_scope(&mut self) {
-        let captured: Vec<u16> = {
+        let (slots, captured): (Vec<u16>, Vec<u16>) = {
             let f = self.cur();
             let scope = f.scopes.last().expect("scope levels are never empty");
-            scope
-                .slots
+            let slots: Vec<u16> = scope.slots.clone();
+            let captured = slots
                 .iter()
                 .copied()
                 .filter(|&slot| f.slots[slot as usize].captured)
-                .collect()
+                .collect();
+            (slots, captured)
         };
         for slot in captured {
             self.em(Instr::ResetSlot(slot));
+        }
+        // Release aliases and other heap values at lexical scope exit.  The
+        // register may be reused immediately afterwards for a sibling block.
+        for slot in slots {
+            self.em(Instr::ClearSlot(slot));
+        }
+    }
+
+    /// Emits the cleanup instructions for scopes at `depth` and deeper without
+    /// popping them. Used by `break`, which jumps past the normal block-exit
+    /// sequence but must still release aliases and captured cells.
+    fn close_scopes_from(&mut self, depth: usize) {
+        let (slots, captured): (Vec<u16>, Vec<u16>) = {
+            let f = self.cur();
+            let mut slots = Vec::new();
+            for scope in f.scopes.iter().skip(depth) {
+                slots.extend(scope.slots.iter().copied());
+            }
+            let captured = slots
+                .iter()
+                .copied()
+                .filter(|&slot| f.slots[slot as usize].captured)
+                .collect();
+            (slots, captured)
+        };
+        for slot in captured {
+            self.em(Instr::ResetSlot(slot));
+        }
+        for slot in slots {
+            self.em(Instr::ClearSlot(slot));
         }
     }
 
@@ -657,6 +693,9 @@ fn compile_take_value(c: &mut Compiler, e: &Expr, dest: &str, arg: bool) -> LRes
             }
             return Ok(true);
         }
+        ExprKind::Move { e: inner } => {
+            return compile_take_value(c, inner, dest, arg);
+        }
         _ => {}
     }
     // expansion nodes keep their multi-value shape; the caller truncates
@@ -806,14 +845,24 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
                 UnOp::Deref => unreachable!("handled above"),
             });
         }
-        ExprKind::Borrow { .. } => {
-            c.em(Instr::BorrowErr);
+        ExprKind::Borrow { e: inner, .. } => {
+            compile_expr(c, inner)?;
+            truncate_if_expansion(c, inner);
+            c.set_line(e.span);
+            c.em(Instr::BorrowImm);
         }
         ExprKind::Clone { e: inner } => {
             compile_expr(c, inner)?;
             truncate_if_expansion(c, inner);
             c.set_line(e.span);
             c.em(Instr::CloneV);
+        }
+        ExprKind::Move { e: inner } => {
+            let dest = crate::eval::label_of(inner);
+            let took = compile_take_value(c, inner, &dest, false)?;
+            if !took {
+                truncate_if_expansion(c, inner);
+            }
         }
     }
     Ok(())
@@ -1195,6 +1244,11 @@ fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
         StKind::Return { values, span } => compile_return(c, values, *span)?,
         StKind::Break => {
             c.set_line(st.span);
+            let loop_depth = c.cur().loop_depths.last().copied();
+            if let Some(depth) = loop_depth {
+                c.close_scopes_from(depth);
+                c.set_line(st.span);
+            }
             let at = c.em(Instr::Jump(0));
             // record under the innermost loop
             if let Some(loops) = c.cur().breaks.last_mut() {
@@ -1417,7 +1471,10 @@ fn compile_while(c: &mut Compiler, cond: &Expr, body: &Block) -> LResult<()> {
     c.set_line(cond.span);
     let exit = c.em(Instr::JumpIfFalse(0));
     c.cur().breaks.push(Vec::new());
+    let loop_depth = c.cur().scopes.len();
+    c.cur().loop_depths.push(loop_depth);
     compile_block(c, body)?;
+    c.cur().loop_depths.pop();
     let breaks = c.cur().breaks.pop().expect("loop breaks pushed");
     let back = start;
     c.set_line(cond.span);
@@ -1433,6 +1490,8 @@ fn compile_while(c: &mut Compiler, cond: &Expr, body: &Block) -> LResult<()> {
 fn compile_repeat(c: &mut Compiler, body: &Block, cond: &Expr) -> LResult<()> {
     let start = c.pos();
     c.cur().breaks.push(Vec::new());
+    let loop_depth = c.cur().scopes.len();
+    c.cur().loop_depths.push(loop_depth);
     // repeat condition sees body locals
     c.push_shadow();
     for s in body {
@@ -1440,6 +1499,7 @@ fn compile_repeat(c: &mut Compiler, body: &Block, cond: &Expr) -> LResult<()> {
     }
     compile_expr(c, cond)?;
     c.pop_shadow();
+    c.cur().loop_depths.pop();
     let breaks = c.cur().breaks.pop().expect("loop breaks pushed");
     c.set_line(cond.span);
     let _ = c.em(Instr::JumpIfFalse(start as i32));
@@ -1481,9 +1541,12 @@ fn compile_for_num(
     let limit_slot = c.declare("(for limit)");
     let step_slot = c.declare("(for step)");
     c.cur().breaks.push(Vec::new());
+    let loop_depth = c.cur().scopes.len();
+    c.cur().loop_depths.push(loop_depth);
     c.set_line(span);
     let init = c.em(Instr::ForNumInit { var: var_slot, limit: limit_slot, step: step_slot, end: 0 });
     compile_block(c, body)?;
+    c.cur().loop_depths.pop();
     c.set_line(span);
     let step_at = c.em(Instr::ForNumStep { var: var_slot, limit: limit_slot, step: step_slot, top: (init + 1) as i32, end: 0 });
     let breaks = c.cur().breaks.pop().expect("loop breaks pushed");
@@ -1523,9 +1586,12 @@ fn compile_for_iter(
     }
     let nvars = vars.len() as u16;
     c.cur().breaks.push(Vec::new());
+    let loop_depth = c.cur().scopes.len();
+    c.cur().loop_depths.push(loop_depth);
     c.set_line(span);
     let setup = c.em(Instr::ForInSetup { iter: iter_slot, first, nvars, end: 0 });
     compile_block(c, body)?;
+    c.cur().loop_depths.pop();
     c.set_line(span);
     let step_at = c.em(Instr::ForInStep { iter: iter_slot, first, nvars, top: (setup + 1) as i32, end: 0 });
     let breaks = c.cur().breaks.pop().expect("loop breaks pushed");

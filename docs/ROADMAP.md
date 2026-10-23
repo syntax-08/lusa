@@ -36,6 +36,22 @@ and, where supported, the C11 backend.
   zero-parameter `i32` functions (`E0319`); the native backend supports zero or
   one return value (`E0313`).
 
+## Shipped in v1.0.0 - compile-time borrow checking and explicit move
+
+- **Static borrow checker:** `compiler_bootstrap.lusa` tracks moved variables,
+  multiple immutable aliases, mutable method receivers, and alias lifetimes
+  without emitting runtime checks.
+- **Stable diagnostics:** `E1001` use-after-move, `E1002` borrow conflicts,
+  and `E1004` writes through immutable aliases include source spans and borrow
+  notes.
+- **Explicit transfer:** `move x` is parsed, evaluated, byte-compiled, and
+  lowered by the C11 backend in all engines.
+- **VM borrow support:** the bytecode VM creates immutable aliases, enforces
+  borrow rules on field/index writes, and releases aliases at scope and loop
+  exit.
+- **Unsafe boundary:** `unsafe do ... end` bypasses borrow mutation checks for
+  raw pointer and hardware access while move tracking remains active.
+
 ## Shipped in v0.9.0 - string patterns and native text processing
 
 - **One bounded matcher:** `find`, `match`, `gmatch`, and `gsub` share the
@@ -52,7 +68,7 @@ and, where supported, the C11 backend.
 - **UTF-8 native literals:** string literals are emitted as UTF-8 bytes so
   multibyte captures round-trip correctly.
 
-## Baseline after v0.9.0
+## Baseline after v1.0.0
 
 | Area | Interpreter | Bytecode VM | C11 backend |
 | --- | --- | --- | --- |
@@ -65,7 +81,7 @@ and, where supported, the C11 backend.
 | Coroutines | yes | yes | yes (fibers/`ucontext`, restricted subset) |
 | String patterns | full `find`/`match`/`gmatch`/`gsub` | full | direct C runtime calls (restricted surface) |
 | Ownership checks | runtime registry (`src/value.rs`) | runtime registry | static subset (`compiler_bootstrap.lusa`) |
-| Explicit `move` / `copy` | no | no | no |
+| Explicit `move` / `clone` | yes | yes | yes (static move analysis) |
 
 ## Module 12 - Error Recovery and Coroutines (shipped in v0.8.0)
 
@@ -202,67 +218,61 @@ iterators. These differences are documented in
 - Backtracking performance depends on the budget; nested quantifiers should be
   simplified when `E2011` appears.
 
-## Module 14 - Advanced Lifetimes (target v1.0.0)
+## Module 14 - Advanced Lifetimes (shipped in v1.0.0)
 
 ### 14.1 Static borrow checker
 
-The C backend currently tracks `own`, `borrowed`, and `mutable` flags in
-`compiler_bootstrap.lusa`; the dynamic engines enforce rules in the runtime
-`Ownership` registry. Module 13 replaces the ad-hoc checks with a shared
-compile-time analysis and makes explicit transfer syntax part of the language.
+`compiler_bootstrap.lusa` now performs ownership analysis on every typed
+function before C emission. It tracks moved variables and live aliases while
+the dynamic engines enforce the same rules through the runtime `Ownership`
+registry.
 
 **Analysis design**
 
-1. Build a control-flow graph per function from the typed AST. Nodes are
-   statements and branch joins; edges carry move/borrow events.
-2. Track places, not just names: `x`, `x.field`, and `x[i]` are distinct move
-   paths. A move of `x` invalidates all its subpaths; a move of a subpath
-   leaves siblings valid.
-3. Compute borrow regions with a last-use/NLL-style liveness pass. A borrow
-   conflicts with a move or a mutable borrow only while it is live.
-4. Integrate the analysis into the C backend front end and expose the same
-   diagnostics to the interpreter/VM ahead of execution (warnings first).
-5. Keep `unsafe do ... end` as the explicit escape hatch; it must be visible
-   in diagnostics and documented as unchecked.
+1. Each binding receives an analysis state with `moved`, immutable-borrow
+   sites, and an optional mutable method-receiver borrow.
+2. Consuming contexts (locals, assignments, user-function/method arguments,
+   returns, table literals, and explicit `move`) mark heap values moved.
+   `clone` and `borrow` are non-consuming.
+3. Multiple immutable aliases are recorded together and released at lexical
+   scope exit. Moving or overwriting an aliased owner reports `E1002`; writing
+   through an immutable alias reports `E1004`.
+4. Method calls begin a mutable receiver borrow before checking arguments.
+   Reads, moves, and borrows of the receiver during that window report
+   `E1002`.
+5. `unsafe do ... end` bypasses borrow/mutation checks for raw pointer and
+   hardware access; move tracking still reports `E1001`.
 
-**Explicit move/copy labels**
+**Explicit move**
 
-- `move x` transfers ownership and leaves `x` unusable; the lexer already
-  reserves `move`, and the bootstrap modules use a `move(...)` helper
-  convention. Promote this to a real expression and make the implicit move
-  explicit in consuming contexts.
-- `copy x` (or the existing `clone x`) creates an independent value. Decide
-  whether `copy` is a synonym or a shallow copy; the recommendation is a
-  synonym for the current deep `clone`, with `copy` as the user-facing word.
-- Type-level labels such as `move T` and `copy T` are a later extension; do
-  not add them until the expression forms and diagnostics are stable.
+- `move x` is a real expression in `parser.lusa`, the Rust front end, the
+  reference compiler, the interpreter, the bytecode VM, and the C11 emitter.
+- Assignment and explicit `move` both transfer ownership for heap values;
+  `clone x` remains the explicit deep-copy form.
+- The lexer reserves `move`; internal self-hosted helpers were renamed to
+  `transfer` so the keyword is unambiguous.
 
 **Diagnostics**
 
-- Keep the stable codes `E1001` (use after move), `E1002` (borrow conflict),
-  `E1004` (write through immutable borrow), and `E1005` (move out of a
-  borrow), and add notes that point at the move/borrow site plus a `help`
-  line suggesting `copy` or a shorter borrow.
-- LSP quick fixes: rename the shadowed value, insert `copy`, or end the
-  borrow earlier.
-- Golden diagnostic tests for every code, including multiline spans.
+- Stable codes: `E1001` use after move, `E1002` move/read/write while
+  borrowed, and `E1004` write through an immutable alias.
+- Diagnostics include the offending source span and a note pointing at the
+  borrow site.
 
 **Acceptance criteria**
 
 - The static checker accepts the full existing test suite and examples.
-- Every runtime ownership test has a compile-time counterpart where the error
-  is statically decidable.
-- Native code generation no longer needs `own = false` escape hatches for
-  field reads; the analysis proves when a copy is required.
-- Migration report lists false positives and the planned fixes before the
-  rules become errors.
+- Interpreter, VM, and native builds agree on `move`, `clone`, borrow
+  lifetimes, catchable failures, and unsafe escape behavior.
+- Native code generation adds no runtime borrow tracking.
+- Borrows end at block/loop exit, including `break`, in the VM.
 
 **Risks**
 
-- Field-sensitive tracking can explode; start with a bounded path depth and
-  fall back to whole-object conservatism.
-- Dynamic code that mutates tables through aliases may be valid in Lua but
-  rejected by static rules; keep `unsafe` and clear migration notes.
+- The static analysis is variable-focused; nested field-path precision and
+  branch-sensitive NLL-style liveness remain future work.
+- Dynamic code that mutates tables through aliases may be rejected by static
+  rules; keep `unsafe` and clear migration notes.
 
 ## Cross-cutting work
 
@@ -287,7 +297,7 @@ compile-time analysis and makes explicit transfer syntax part of the language.
 | v0.7.0 | Static structs, raw pointers, kernel intrinsics (shipped) | three-OS CI, sandbox parity, native volatile access |
 | v0.8.0 | Native `pcall`, coroutines (shipped) | three-OS CI, native unwind/leak suite, parity tests |
 | v0.9.0 | Pattern matching and string utilities (shipped) | shared matcher, native/VM/interpreter parity, RAII lifetime tests |
-| v1.0.0 | Static borrow checker, explicit `move`/`copy`, stabilization | golden diagnostics, migration report, frozen semantics |
+| v1.0.0 | Static borrow checker, explicit `move`, stabilization (shipped) | golden diagnostics, native/VM/interpreter parity, frozen semantics |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

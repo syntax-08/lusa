@@ -38,8 +38,8 @@ local CAN_BORROW = detect_borrow()
 
 local Lexer = {}
 
--- Lusa keywords.  `move` is reserved here for the language's planned
--- explicit-move syntax; the current Rust parser still moves on assignment.
+-- Lusa keywords.  `move` is an explicit ownership-transfer expression;
+-- ordinary assignment already performs a moving read for heap values.
 local KEYWORDS = {
     ["local"] = true,
     ["function"] = true,
@@ -207,7 +207,7 @@ end
 
 -- Lusa already transfers ownership when a heap value is returned.  Keeping
 -- the transfer behind an explicit helper makes the move visible in the code.
-local function move(value)
+local function transfer(value)
     return value
 end
 
@@ -696,7 +696,7 @@ function Lexer.lex(source)
         end
     end
 
-    return move(tokens)
+    return transfer(tokens)
 end
 
-return move(Lexer)
+return transfer(Lexer)

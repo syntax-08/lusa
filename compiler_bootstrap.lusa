@@ -19,19 +19,23 @@
 -- Ownership remains static: owned heap locals receive a drop at lexical
 -- scope exit, before return/break, and before assignment overwrites a value.
 -- A move clears the source slot and cancels that source's drop.  `borrow`
--- aliases without ownership; `clone` performs a deep copy.
+-- aliases without ownership; `clone` performs a deep copy.  Before emission,
+-- the checker tracks moved bindings, immutable borrow sites, and mutable
+-- method receivers.  It rejects use-after-move (`E1001`), moves or writes
+-- while aliased (`E1002`), and writes through an immutable alias (`E1004`)
+-- without emitting any runtime borrow machinery.
 --
--- `unsafe do ... end` disables the local borrow-assignment rule and enables
--- the volatile raw-pointer intrinsics unsafe_ptr_cast, unsafe_read_mem and
--- unsafe_write_mem.  Generated C uses `*(volatile uint32_t *)(uintptr_t)a`.
+-- `unsafe do ... end` disables borrow/mutation checks and enables the volatile
+-- raw-pointer intrinsics unsafe_ptr_cast, unsafe_read_mem and unsafe_write_mem.
+-- Generated C uses `*(volatile uint32_t *)(uintptr_t)a`.
 
 local Compiler = {}
 
-local COMPILER_VERSION = 2
+local COMPILER_VERSION = 3
 Compiler.Version = COMPILER_VERSION
 Compiler.Targets = { c = "c11" }
 
-local function move(value)
+local function transfer(value)
     return value
 end
 
@@ -231,7 +235,7 @@ local function opt_expr(expr)
         }
     end
 
-    if tag == "Clone" or tag == "Borrow" then
+    if tag == "Clone" or tag == "Borrow" or tag == "Move" then
         local value = opt_expr(expr.value)
         return {
             tag = tag, value = value, line = line, column = column
@@ -678,6 +682,8 @@ end
 
 local check_scopes = {}
 local check_scope_count = 0
+local check_states = {}
+local check_next_state = 0
 local check_globals = {}
 local check_global_order = {}
 local check_functions = {}
@@ -692,10 +698,54 @@ local check_current_function = nil
 
 local function scope_enter()
     check_scope_count = check_scope_count + 1
-    check_scopes[check_scope_count] = {vars = {}, order = {}}
+    check_scopes[check_scope_count] = {vars = {}, order = {}, aliases = {}}
+end
+
+local function new_check_state()
+    check_next_state = check_next_state + 1
+    check_states[check_next_state] = {
+        moved = false,
+        borrows = {},
+        mutable_borrow = false,
+        mutable_site = nil
+    }
+    return check_next_state
+end
+
+local function state_of(entry_id)
+    if entry_id == nil then return nil end
+    local state = check_states[entry_id]
+    if state ~= nil then
+        local copy = clone state
+        check_states[entry_id] = state
+        return copy
+    end
+    return nil
 end
 
 local function scope_leave()
+    local scope = check_scopes[check_scope_count]
+    if scope ~= nil then
+        local aliases = scope.aliases or {}
+        local i = 1
+        while i <= #aliases do
+            local alias = aliases[i]
+            local state = state_of(alias.owner_id)
+            if state ~= nil then
+                local out = {}
+                local j = 1
+                while j <= #state.borrows do
+                    if state.borrows[j].alias_id ~= alias.alias_id then
+                        out[#out + 1] = state.borrows[j]
+                    end
+                    j = j + 1
+                end
+                state.borrows = out
+                check_states[alias.owner_id] = state
+            end
+            i = i + 1
+        end
+    end
     check_scopes[check_scope_count] = nil
     check_scope_count = check_scope_count - 1
 end
@@ -709,7 +759,8 @@ local function scope_declare(name, type_name, own, borrowed, schema,
         borrowed = borrowed == true,
         mutable = mutable == true,
         schema = schema,
-        elem_type = elem_type
+        elem_type = elem_type,
+        id = new_check_state()
     }
     local scope = check_scopes[check_scope_count]
     scope.vars[name] = clone entry
@@ -764,7 +815,8 @@ local function declare_global(name, type_name, line, column, schema, elem_type)
         global = true,
         schema = schema,
         elem_type = elem_type,
-        moved = false
+        moved = false,
+        id = new_check_state()
     }
     check_globals[name] = clone entry
     check_global_order[#check_global_order + 1] = clone entry
@@ -779,6 +831,177 @@ local check_method_call
 local function check_mismatch(line, column, context, expected, found)
     type_fail("E0308", line, column, "mismatched types in " .. context,
         expected, found)
+end
+
+-- ---- static ownership / borrow analysis --------------------------------
+
+local function ownership_fail(code, line, column, message, note)
+    local parts = {
+        "error[" .. code .. "]: " .. message,
+        "  --> lusa:" .. tostring(line or 0) .. ":" .. tostring(column or 0)
+    }
+    if note ~= nil then
+        parts[#parts + 1] = "   = borrowed by `" .. tostring(note.by)
+            .. "` at lusa:" .. tostring(note.line) .. ":" .. tostring(note.column)
+    end
+    error(table.concat(parts, "\n"))
+end
+
+local function is_move_type(type_name)
+    return is_heap_type(type_name) and type_name ~= "string"
+end
+
+local function note_from_state(state)
+    if state == nil then return nil end
+    if #state.borrows > 0 then
+        return state.borrows[1]
+    end
+    return state.mutable_site
+end
+
+local function check_entry_read(entry_id, name, line, column)
+    local state = state_of(entry_id)
+    if state == nil then return end
+    if state.moved then
+        ownership_fail("E1001", line, column,
+            "use of moved-out value `" .. tostring(name) .. "`")
+    end
+    if state.mutable_borrow and check_unsafe_depth == 0 then
+        ownership_fail("E1002", line, column,
+            "cannot read `" .. tostring(name)
+            .. "` while it is mutably borrowed by a method call",
+            state.mutable_site)
+    end
+end
+
+local function mark_entry_moved(entry_id, name, line, column)
+    local state = state_of(entry_id)
+    if state == nil then return end
+    if state.moved then
+        ownership_fail("E1001", line, column,
+            "use of moved-out value `" .. tostring(name) .. "`")
+    end
+    local note = note_from_state(clone state)
+    if note ~= nil and check_unsafe_depth == 0 then
+        ownership_fail("E1002", line, column,
+            "cannot move out of `" .. tostring(name)
+            .. "` because it is borrowed",
+            note)
+    end
+    state.moved = true
+    check_states[entry_id] = state
+end
+
+local function reset_entry_state(entry_id)
+    local state = state_of(entry_id)
+    if state == nil then return end
+    state.moved = false
+    check_states[entry_id] = state
+end
+
+local function root_name_of(expr)
+    local current = expr
+    while current ~= nil
+        and (current.tag == "Field" or current.tag == "Index") do
+        current = current.table
+    end
+    if current ~= nil and current.tag == "Name" then
+        return current.entry_id, current.entry_name or current.name
+    end
+    return nil, nil
+end
+
+local function add_immutable_borrow(owner_id, owner_name, alias_name,
+                                    alias_id, line, column)
+    local state = state_of(owner_id)
+    if state == nil then return end
+    if state.moved then
+        ownership_fail("E1001", line, column,
+            "cannot borrow moved-out value `" .. tostring(owner_name) .. "`")
+    end
+    if state.mutable_borrow then
+        ownership_fail("E1002", line, column,
+            "cannot borrow `" .. tostring(owner_name)
+            .. "` while it is mutably borrowed",
+            state.mutable_site)
+    end
+    state.borrows[#state.borrows + 1] = {
+        by = alias_name,
+        alias_id = alias_id,
+        line = line,
+        column = column
+    }
+    check_states[owner_id] = state
+end
+
+local function register_scope_alias(alias_name, owner_id, alias_id)
+    local scope = check_scopes[check_scope_count]
+    scope.aliases[#scope.aliases + 1] = {
+        by = alias_name,
+        owner_id = owner_id,
+        alias_id = alias_id
+    }
+    check_scopes[check_scope_count] = scope
+end
+
+local function begin_mutable_borrow(entry, line, column)
+    if entry == nil or entry.entry_id == nil then return nil end
+    local state = state_of(entry.entry_id)
+    if state == nil then return nil end
+    if state.moved then
+        ownership_fail("E1001", line, column,
+            "use of moved-out value `" .. tostring(entry.entry_name) .. "`")
+    end
+    if entry.borrowed and entry.mutable ~= true then
+        ownership_fail("E1004", line, column,
+            "cannot call a mutating method through immutable borrow `"
+            .. tostring(entry.entry_name) .. "`")
+    end
+    local note = note_from_state(clone state)
+    if note ~= nil then
+        ownership_fail("E1002", line, column,
+            "cannot mutably borrow `" .. tostring(entry.entry_name)
+            .. "` while another borrow is active",
+            note)
+    end
+    state.mutable_borrow = true
+    state.mutable_site = { by = entry.entry_name, line = line, column = column }
+    check_states[entry.entry_id] = state
+    return entry.entry_id
+end
+
+local function end_mutable_borrow(entry_id)
+    if entry_id == nil then return end
+    local state = state_of(entry_id)
+    if state == nil then return end
+    state.mutable_borrow = false
+    state.mutable_site = nil
+    check_states[entry_id] = state
+end
+
+local function consume_expr(checked, line, column)
+    if checked == nil then return end
+    if checked.tag == "Paren" then
+        consume_expr(checked.value, line, column)
+        return
+    end
+    if checked.tag ~= "Name" then return end
+    if checked.own == false or not is_move_type(checked.ctype) then return end
+    mark_entry_moved(checked.entry_id, checked.entry_name or checked.name,
+        line or checked.line, column or checked.column)
+end
+
+local function check_owner_write(checked, line, column)
+    if checked == nil or checked.tag ~= "Name" then return end
+    local state = state_of(checked.entry_id)
+    if state == nil then return end
+    local note = note_from_state(clone state)
+    if note ~= nil then
+        ownership_fail("E1002", line, column,
+            "cannot write `" .. tostring(checked.entry_name or checked.name)
+            .. "` while it is borrowed",
+            note)
+    end
 end
 
 local function check_condition(expr, context)
@@ -1471,6 +1694,10 @@ local function check_call(expr)
                 param_type, arg_type)
         end
         checked_arg = coerce_literal(checked_arg, param_type)
+        if checked_arg.tag ~= "Clone" and checked_arg.tag ~= "Borrow"
+            and checked_arg.tag ~= "Move" then
+            consume_expr(clone checked_arg, checked_arg.line, checked_arg.column)
+        end
         args[i] = checked_arg
         i = i + 1
     end
@@ -1523,6 +1750,10 @@ check_method_call = function(expr)
             .. tostring(#signature.params - 1) .. " argument(s) but "
             .. tostring(#args) .. " were supplied")
     end
+    local borrow_id = nil
+    if receiver_name ~= "self" and check_unsafe_depth == 0 then
+        borrow_id = begin_mutable_borrow(checked_obj, expr.line, expr.column)
+    end
     local i = 1
     while i <= #args do
         local checked_arg, arg_type = check_expr(args[i])
@@ -1532,9 +1763,15 @@ check_method_call = function(expr)
                 "argument " .. tostring(i) .. " of method `" .. expr.name .. "`",
                 param.type, arg_type)
         end
-        args[i] = coerce_literal(checked_arg, param.type)
+        checked_arg = coerce_literal(checked_arg, param.type)
+        if checked_arg.tag ~= "Clone" and checked_arg.tag ~= "Borrow"
+            and checked_arg.tag ~= "Move" then
+            consume_expr(clone checked_arg, checked_arg.line, checked_arg.column)
+        end
+        args[i] = checked_arg
         i = i + 1
     end
+    end_mutable_borrow(borrow_id)
     expr.ctype = signature.ret
     expr.fn_key = key
     expr.args = args
@@ -1557,6 +1794,10 @@ local function check_table(expr)
         if item_type == "i128" then
             type_fail("E0312", checked_item.line, checked_item.column,
                 "i128 table elements are not supported by the C ABI")
+        end
+        if checked_item.tag ~= "Clone" and checked_item.tag ~= "Borrow"
+            and checked_item.tag ~= "Move" then
+            consume_expr(clone checked_item, checked_item.line, checked_item.column)
         end
         local key = keys[i]
         if key ~= nil then
@@ -1657,12 +1898,15 @@ check_expr = function(expr)
             type_fail("E0309", line, column,
                 "cannot find value `" .. expr.name .. "` in this scope")
         end
+        check_entry_read(entry.id, entry.name, line, column)
         expr.ctype = entry.type
         expr.own = entry.own
         expr.borrowed = entry.borrowed
         expr.mutable = entry.mutable
         expr.schema = entry.schema
         expr.elem_type = entry.elem_type
+        expr.entry_id = entry.id
+        expr.entry_name = entry.name
         return expr, entry.type
     end
 
@@ -1673,6 +1917,8 @@ check_expr = function(expr)
         local inner_mutable = checked_inner.mutable
         local inner_schema = checked_inner.schema
         local inner_elem = checked_inner.elem_type
+        local inner_id = checked_inner.entry_id
+        local inner_name = checked_inner.entry_name
         expr.value = checked_inner
         expr.ctype = inner
         expr.own = inner_own
@@ -1680,6 +1926,8 @@ check_expr = function(expr)
         expr.mutable = inner_mutable
         expr.schema = inner_schema
         expr.elem_type = inner_elem
+        expr.entry_id = inner_id
+        expr.entry_name = inner_name
         return expr, inner
     end
 
@@ -1863,6 +2111,24 @@ check_expr = function(expr)
         return expr, inner
     end
 
+    if tag == "Move" then
+        local checked_inner, inner = check_expr(expr.value)
+        local inner_schema = checked_inner.schema
+        local inner_elem = checked_inner.elem_type
+        local inner_id = checked_inner.entry_id
+        local inner_name = checked_inner.entry_name or checked_inner.name
+        local inner_own = checked_inner.own
+        expr.value = checked_inner
+        expr.ctype = inner
+        expr.own = true
+        expr.schema = inner_schema
+        expr.elem_type = inner_elem
+        if inner_own ~= false and is_move_type(inner) then
+            mark_entry_moved(inner_id, inner_name, line, column)
+        end
+        return expr, inner
+    end
+
     if tag == "Borrow" then
         local checked_inner, inner = check_expr(expr.value)
         if checked_inner.tag ~= "Name" and checked_inner.tag ~= "Index"
@@ -1872,13 +2138,16 @@ check_expr = function(expr)
         end
         local inner_schema = checked_inner.schema
         local inner_elem = checked_inner.elem_type
-        expr.value = checked_inner
+        expr.value = clone checked_inner
+        local owner_id, owner_name = root_name_of(checked_inner)
         expr.ctype = inner
         expr.own = false
         expr.borrowed = true
         expr.mutable = false
         expr.schema = inner_schema
         expr.elem_type = inner_elem
+        expr.borrow_owner_id = owner_id
+        expr.borrow_owner_name = owner_name
         return expr, inner
     end
 
@@ -2044,7 +2313,12 @@ local function check_pcall_local(stmt, names, stmt_types, values)
                 "argument " .. tostring(i - 1) .. " of `" .. fname
                 .. "` in pcall", param.type, arg_type)
         end
-        target_args[i - 1] = coerce_literal(checked_arg, param.type)
+        checked_arg = coerce_literal(checked_arg, param.type)
+        if checked_arg.tag ~= "Clone" and checked_arg.tag ~= "Borrow"
+            and checked_arg.tag ~= "Move" then
+            consume_expr(clone checked_arg, checked_arg.line, checked_arg.column)
+        end
+        target_args[i - 1] = checked_arg
         i = i + 1
     end
 
@@ -2267,6 +2541,10 @@ local function check_local(stmt)
     local borrows = {}
     local schemas = {}
     local elem_types = {}
+    local alias_owner_ids = {}
+    local alias_owner_names = {}
+    local alias_lines = {}
+    local alias_columns = {}
     local i = 1
     while i <= #names do
         local declared = "auto"
@@ -2319,8 +2597,14 @@ local function check_local(stmt)
         if checked ~= nil then
             schemas[i] = checked.schema
             elem_types[i] = checked.elem_type
-        end
-        if checked ~= nil then
+            if is_borrow then
+                alias_owner_ids[i] = checked.borrow_owner_id
+                alias_owner_names[i] = checked.borrow_owner_name
+                alias_lines[i] = checked.line
+                alias_columns[i] = checked.column
+            elseif checked.tag ~= "Clone" and checked.tag ~= "Move" then
+                consume_expr(clone checked, checked.line, checked.column)
+            end
             values[i] = checked
         end
         i = i + 1
@@ -2330,6 +2614,13 @@ local function check_local(stmt)
     while i <= #names do
         scope_declare(names[i], resolved[i], owns[i], borrows[i], schemas[i],
             false, elem_types[i])
+        if borrows[i] and alias_owner_ids[i] ~= nil
+            and check_unsafe_depth == 0 then
+            local alias_entry = value_lookup(names[i])
+            add_immutable_borrow(alias_owner_ids[i], alias_owner_names[i],
+                names[i], alias_entry.id, alias_lines[i], alias_columns[i])
+            register_scope_alias(names[i], alias_owner_ids[i], alias_entry.id)
+        end
         i = i + 1
     end
     stmt.names = names
@@ -2371,10 +2662,18 @@ local function check_assign(stmt)
                 end
             end
             if entry.borrowed and check_unsafe_depth == 0 then
-                type_fail("E0314", target.line, target.column,
-                    "cannot assign through borrowed alias `" .. target.name
-                    .. "` outside an `unsafe` block")
+                type_fail("E1004", target.line, target.column,
+                    "cannot assign through immutable borrow `" .. target.name
+                    .. "`")
             end
+            local target_state = state_of(entry.id)
+            local target_note = note_from_state(target_state)
+            if target_note ~= nil and check_unsafe_depth == 0 then
+                ownership_fail("E1002", target.line, target.column,
+                    "cannot assign to `" .. target.name
+                    .. "` because it is borrowed", target_note)
+            end
+            target.entry_id = entry.id
             expected = entry.type
             entry.own = is_heap_type(entry.type)
         elseif target.tag == "Deref" then
@@ -2401,7 +2700,10 @@ local function check_assign(stmt)
             local table_borrowed = checked_table.borrowed
             local table_mutable = checked_table.mutable
             local table_label = checked_table.name
-            target.table = checked_table
+            target.table = clone checked_table
+            if check_unsafe_depth == 0 and table_borrowed ~= true then
+                check_owner_write(checked_table, target.line, target.column)
+            end
             if is_struct_type(table_type) then
                 local layout = borrow check_structs[table_type]
                 local field = borrow layout.fields[target.field_name]
@@ -2445,7 +2747,14 @@ local function check_assign(stmt)
                     .. "`", expected, actual)
             end
             checked = coerce_literal(checked, expected)
+            if checked.tag ~= "Clone" and checked.tag ~= "Borrow"
+                and checked.tag ~= "Move" then
+                consume_expr(clone checked, checked.line, checked.column)
+            end
             values[i] = checked
+        end
+        if target.tag == "Name" and target.entry_id ~= nil then
+            reset_entry_state(target.entry_id)
         end
         target_types[i] = expected
         targets[i] = target
@@ -2845,6 +3154,10 @@ check_stmt = function(stmt, top_level)
                 "return value", check_return_type, actual)
         end
         checked_value = coerce_literal(checked_value, check_return_type)
+        if checked_value.tag ~= "Clone" and checked_value.tag ~= "Borrow"
+            and checked_value.tag ~= "Move" then
+            consume_expr(clone checked_value, checked_value.line, checked_value.column)
+        end
         stmt.values[1] = checked_value
         stmt.ret_type = check_return_type
         return stmt
@@ -2874,6 +3187,8 @@ end
 local function check_program(ast)
     check_scopes = {}
     check_scope_count = 0
+    check_states = {}
+    check_next_state = 0
     check_globals = {}
     check_global_order = {}
     check_functions = {}
@@ -3252,7 +3567,8 @@ end
 
 local function unwrap_paren(expr)
     local current = expr
-    while current ~= nil and current.tag == "Paren" do
+    while current ~= nil
+        and (current.tag == "Paren" or current.tag == "Move") do
         current = current.value
     end
     return current
@@ -4276,7 +4592,8 @@ collect_strings_expr = function(expr)
         end
         return
     end
-    if tag == "Paren" or tag == "Unary" or tag == "Clone" or tag == "Borrow" then
+    if tag == "Paren" or tag == "Unary" or tag == "Clone"
+        or tag == "Borrow" or tag == "Move" then
         collect_strings_expr(expr.value)
         return
     end
@@ -4828,6 +5145,9 @@ emit_expr = function(expr)
         return inner
     end
     if tag == "Borrow" then
+        return emit_expr(expr.value)
+    end
+    if tag == "Move" then
         return emit_expr(expr.value)
     end
     if tag == "Table" then
@@ -6033,4 +6353,4 @@ function Compiler.self_compile(lexer, parser, path)
     }
 end
 
-return move(Compiler)
+return transfer(Compiler)

@@ -221,6 +221,10 @@ pub fn eval_expr(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr
             let v = eval_expr(interp, frame, e)?;
             Ok(v.deep_clone())
         }
+        ExprKind::Move { e } => {
+            let label = label_of(e);
+            eval_take_single(interp, frame, e, &label, e.span)
+        }
         ExprKind::Paren(inner) => eval_expr(interp, frame, inner),
         ExprKind::Vararg => {
             let first = frame.varargs.get(0).map(|v| v.clone()).unwrap_or(Value::Nil);
@@ -675,6 +679,7 @@ pub fn eval_take_single(
             rename_owner(&c, label, span);
             Ok(c)
         }
+        ExprKind::Move { e } => eval_take_single(interp, frame, e, label, span),
         other => {
             let v = eval_expr(
                 interp,

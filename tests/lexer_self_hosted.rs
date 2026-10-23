@@ -9,8 +9,8 @@ const LEXER: &str = include_str!("../lexer.lusa");
 fn program() -> String {
     let body = LEXER
         .trim_end()
-        .strip_suffix("return move(Lexer)")
-        .expect("lexer.lusa must end with `return move(Lexer)`");
+        .strip_suffix("return transfer(Lexer)")
+        .expect("lexer.lusa must end with `return transfer(Lexer)`");
 
     format!(
         r#"{body}

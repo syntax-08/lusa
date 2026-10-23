@@ -13,7 +13,10 @@ intrinsics. Module 12 adds cooperative coroutines and protects native runtime
 failures with checked `pcall` recovery and RAII cleanup. Module 13 adds one
 Lua-style string pattern engine shared by the interpreter, bytecode VM, and C11
 backend: `find`, `match`, `gmatch`, and `gsub` with bounded matching, static
-pattern diagnostics, and RAII-tracked temporary strings.
+pattern diagnostics, and RAII-tracked temporary strings. Module 14 completes
+the v1.0.0 language with a compile-time borrow checker, explicit `move`
+expressions, stronger aliasing diagnostics, and borrow support in the bytecode
+VM.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -93,6 +96,7 @@ See [`examples/`](examples/):
 | `stdlib.lusa`             | `string`, `table`, `math`, iterators                  |
 | `ownership.lusa`          | `clone` / `borrow` / move in action                   |
 | `ownership-error.lusa`    | E1001/E1002/E1004 error codes, commented              |
+| `borrow_checker.lusa`     | static aliasing, method borrows, explicit `move`, unsafe escape |
 | `typed_native.lusa`       | typed C11 build with RAII and native output           |
 | `unsafe_hardware.lusa`    | simulated MMIO registers and volatile intrinsics      |
 | `structs_pointers.lusa`   | static structs and raw pointer access                 |
@@ -118,12 +122,17 @@ cargo run -- examples/basics.lusa
   expressions; `\u{XXXX}` for unicode; `--` and `--[[ ... ]]` for comments.
 - **Values**: `nil bool number string` are *Copy* (value semantics).
   `table function` are *heap* and move by default:
-  - `local u = t` *moves* (t becomes a "moved-out" slot → uses raise **E1001**);
+  - `local u = t` and `local u = move t` transfer ownership; later uses raise
+    **E1001**;
   - `local v = clone t` deep-copies (**independent**);
-  - `local b = borrow t` creates an immutable alias; moving while aliased →
+  - `local b = borrow t` creates an immutable alias. Multiple immutable
+    aliases are allowed; moving or mutating the owner while an alias is live →
     **E1002**; writing through the immutable alias → **E1004**.
 - **Methods**: `o:m()` passes the receiver as a *mutable borrow* —
-  `function o:m() self.x = ... end` works naturally (mutating `self`).
+  `function o:m() self.x = ... end` works naturally. While the call evaluates
+  its arguments, other reads, borrows, or moves of the receiver are rejected
+  with **E1002**. The C11 front end performs the same analysis statically with
+  Cargo-style spans and zero generated-code overhead.
 - **stdlib**: `print type tostring tonumber error assert pcall pairs ipairs`
   `io_read_file` `io_write_binary` `io_read_binary` + `string` `table` `math`
   `json` modules, and `coroutine.create/resume/yield/status/close/isyieldable`.
@@ -444,6 +453,63 @@ lusalang run examples/string_patterns.lusa --vm
 lusalang run examples/string_patterns.lusa --native
 ```
 
+### Static borrow checking and explicit move (Module 14)
+
+The C11 front end runs a compile-time ownership pass over every typed function.
+It tracks moved variables and live aliases without emitting any runtime borrow
+machinery. The dynamic engines enforce the same rules through their ownership
+registry, so diagnostics and E-codes agree:
+
+```lusa
+local t = { x = 1 }
+do
+    local a = borrow t       -- multiple immutable aliases are allowed
+    local b = borrow t
+    print(a.x, b.x)
+end
+
+local copy = clone t         -- deep copy; t stays alive
+copy.x = 9
+
+function t:bump(n: i32): i32
+    self.x = self.x + n
+    return self.x
+end
+
+t:bump(2)                    -- mutable receiver borrow
+local u = move t             -- explicit transfer; t is now moved-out
+print(u.x, copy.x)           -- 3	9
+```
+
+The checker rejects these cases before C emission:
+
+```lusa
+local t = { 1 }
+local u = t
+print(t)                     -- error[E1001]: use of moved-out value `t`
+
+local t = { 1 }
+local view = borrow t
+local u = t                  -- error[E1002]: cannot move out of `t`
+                             -- note: borrowed by `view`
+
+local t = { x = 1 }
+local view = borrow t
+view.x = 2                   -- error[E1004]: write through immutable borrow
+```
+
+`move t` is now a real expression in the interpreter, bytecode VM, reference
+compiler, and C11 backend. The VM supports `borrow` directly and releases aliases
+at block/loop exit, including `break`. `unsafe do ... end` remains the explicit
+escape hatch: raw pointer operations and writes through aliases bypass the
+borrow rules while the surrounding safe code stays checked.
+
+```sh
+lusalang run examples/borrow_checker.lusa
+lusalang run examples/borrow_checker.lusa --vm
+lusalang run examples/borrow_checker.lusa --native
+```
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -511,8 +577,9 @@ Near-term milestones:
 - **v0.9.0 (shipped):** Lua-style string patterns (`find`, `match`, `gmatch`,
   `gsub`) backed by one bounded matcher shared across engines, with native
   static pattern diagnostics and RAII-tracked temporary strings.
-- **v1.0.0:** a compile-time borrow checker plus explicit `move`/`copy`
-  labels, golden diagnostics, and language stabilization.
+- **v1.0.0 (shipped):** compile-time borrow checking, explicit `move`,
+  `clone` deep copies, VM `borrow` support, golden diagnostics, and language
+  stabilization.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of
