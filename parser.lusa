@@ -557,6 +557,10 @@ parse_for = function()
     advance() -- for
 
     local vars = {expect_name()}
+    if at_value("=") then
+        fail_at(line, column,
+            "numeric `for` is not supported by the C backend; use `while` or `ipairs`")
+    end
     while at_value(",") do
         advance()
         vars[#vars + 1] = expect_name()

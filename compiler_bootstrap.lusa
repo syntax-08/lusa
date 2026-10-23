@@ -644,13 +644,16 @@ local function scope_leave()
     check_scope_count = check_scope_count - 1
 end
 
-local function scope_declare(name, type_name, own, borrowed, schema)
+local function scope_declare(name, type_name, own, borrowed, schema,
+                              mutable, elem_type)
     local entry = {
         name = name,
         type = type_name,
         own = own == true,
         borrowed = borrowed == true,
-        schema = schema
+        mutable = mutable == true,
+        schema = schema,
+        elem_type = elem_type
     }
     local scope = check_scopes[check_scope_count]
     scope.vars[name] = clone entry
@@ -691,7 +694,7 @@ local function value_lookup(name)
     return nil
 end
 
-local function declare_global(name, type_name, line, column)
+local function declare_global(name, type_name, line, column, schema, elem_type)
     if type_name == "void" or type_name == "auto" then
         type_fail("E0301", line, column,
             "global `" .. name .. "` cannot have type `" .. tostring(type_name) .. "`")
@@ -701,7 +704,10 @@ local function declare_global(name, type_name, line, column)
         type = type_name,
         own = is_heap_type(type_name),
         borrowed = false,
+        mutable = false,
         global = true,
+        schema = schema,
+        elem_type = elem_type,
         moved = false
     }
     check_globals[name] = clone entry
@@ -840,6 +846,12 @@ check_method_call = function(expr)
             "method dispatch requires a named table receiver")
     end
     local key = receiver_name .. ":" .. expr.name
+    if receiver_name == "self" and check_current_function ~= nil
+        and check_current_function.receiver ~= nil then
+        -- Inside a method, `self:other()` resolves through the enclosing
+        -- receiver's method namespace.
+        key = check_current_function.receiver .. ":" .. expr.name
+    end
     local signature = borrow check_functions[key]
     if signature == nil then
         type_fail("E0318", expr.line, expr.column,
@@ -990,7 +1002,9 @@ check_expr = function(expr)
         expr.ctype = entry.type
         expr.own = entry.own
         expr.borrowed = entry.borrowed
+        expr.mutable = entry.mutable
         expr.schema = entry.schema
+        expr.elem_type = entry.elem_type
         return expr, entry.type
     end
 
@@ -998,6 +1012,11 @@ check_expr = function(expr)
         local checked_inner, inner = check_expr(expr.value)
         expr.value = checked_inner
         expr.ctype = inner
+        expr.own = checked_inner.own
+        expr.borrowed = checked_inner.borrowed
+        expr.mutable = checked_inner.mutable
+        expr.schema = checked_inner.schema
+        expr.elem_type = checked_inner.elem_type
         return expr, inner
     end
 
@@ -1131,22 +1150,32 @@ check_expr = function(expr)
 
     if tag == "Clone" then
         local checked_inner, inner = check_expr(expr.value)
+        local inner_schema = checked_inner.schema
+        local inner_elem = checked_inner.elem_type
         expr.value = checked_inner
         expr.ctype = inner
         expr.own = true
+        expr.schema = inner_schema
+        expr.elem_type = inner_elem
         return expr, inner
     end
 
     if tag == "Borrow" then
         local checked_inner, inner = check_expr(expr.value)
-        if checked_inner.tag ~= "Name" and checked_inner.tag ~= "Index" then
+        if checked_inner.tag ~= "Name" and checked_inner.tag ~= "Index"
+            and checked_inner.tag ~= "Field" then
             type_fail("E0314", line, column,
-                "`borrow` requires a variable or index expression")
+                "`borrow` requires a variable, field, or index expression")
         end
+        local inner_schema = checked_inner.schema
+        local inner_elem = checked_inner.elem_type
         expr.value = checked_inner
         expr.ctype = inner
         expr.own = false
         expr.borrowed = true
+        expr.mutable = false
+        expr.schema = inner_schema
+        expr.elem_type = inner_elem
         return expr, inner
     end
 
@@ -1198,6 +1227,8 @@ check_expr = function(expr)
         end
         expr.ctype = element
         expr.elem_type = element
+        -- An array read is a view into the table; it never owns the element.
+        expr.own = false
         return expr, element
     end
 
@@ -1241,6 +1272,7 @@ local function check_local(stmt)
     local owns = {}
     local borrows = {}
     local schemas = {}
+    local elem_types = {}
     local i = 1
     while i <= #names do
         local declared = "auto"
@@ -1278,14 +1310,21 @@ local function check_local(stmt)
                 "local `" .. names[i] .. "` cannot have type `void`")
         end
         local own = is_heap_type(final_type)
-        if is_borrow or (checked ~= nil and checked.own == false) then
+        if is_borrow then
+            -- `borrow x` never owns its referent.
             own = false
+        elseif checked ~= nil and checked.own == false then
+            -- Strings are value types, so a field/index read is copied into
+            -- the new local. Tables stay non-owning aliases; the emitter
+            -- deep-copies them only when they must escape (return/store).
+            own = final_type == "string"
         end
         resolved[i] = final_type
         owns[i] = own
         borrows[i] = is_borrow
         if checked ~= nil then
             schemas[i] = checked.schema
+            elem_types[i] = checked.elem_type
         end
         if checked ~= nil then
             values[i] = checked
@@ -1295,7 +1334,8 @@ local function check_local(stmt)
 
     i = 1
     while i <= #names do
-        scope_declare(names[i], resolved[i], owns[i], borrows[i], schemas[i])
+        scope_declare(names[i], resolved[i], owns[i], borrows[i], schemas[i],
+            false, elem_types[i])
         i = i + 1
     end
     stmt.names = names
@@ -1326,9 +1366,10 @@ local function check_assign(stmt)
             local entry = value_lookup(target.name)
             if entry == nil then
                 if i <= #values then
-                    local _, actual = check_expr(clone values[i])
+                    local checked_value, actual = check_expr(clone values[i])
                     entry = declare_global(target.name, actual,
-                        target.line, target.column)
+                        target.line, target.column, checked_value.schema,
+                        checked_value.elem_type)
                 else
                     entry = declare_global(target.name, "nil",
                         target.line, target.column)
@@ -1344,10 +1385,19 @@ local function check_assign(stmt)
         else
             local checked_table, table_type = check_expr(target.table)
             local table_schema = checked_table.schema
+            local table_borrowed = checked_table.borrowed
+            local table_mutable = checked_table.mutable
+            local table_label = checked_table.name
             target.table = checked_table
             if not is_table_type(table_type) then
                 check_mismatch(target.line, target.column,
                     "field assignment", "table", table_type)
+            end
+            if table_borrowed and table_mutable ~= true
+                and check_unsafe_depth == 0 then
+                type_fail("E1004", target.line, target.column,
+                    "cannot write through immutable borrow `"
+                    .. tostring(table_label) .. "`")
             end
             local field = table_schema ~= nil
                 and table_schema[target.field_name] or nil
@@ -1400,13 +1450,20 @@ local function check_function(signature)
                 "method receiver `" .. tostring(signature.receiver)
                 .. "` is not declared")
         end
+        if not is_table_type(receiver.type) then
+            type_fail("E0318", signature.node.line, signature.node.column,
+                "method receiver `" .. tostring(signature.receiver)
+                .. "` must be a table, found `" .. tostring(receiver.type) .. "`")
+        end
         signature.params[1].schema = receiver.schema
     end
     scope_enter()
     local i = 1
     while i <= #signature.params do
         local param = borrow signature.params[i]
-        scope_declare(param.name, param.type, false, true, param.schema)
+        local is_self = signature.receiver ~= nil and i == 1
+        scope_declare(param.name, param.type, false, true, param.schema,
+            is_self, param.elem_type)
         local node_index = i
         if signature.receiver ~= nil then
             node_index = i - 1
@@ -1588,6 +1645,7 @@ check_stmt = function(stmt, top_level)
                 "generic `for` supports one or two loop variables")
         end
         local checked_table, table_type = check_expr(iter.args[1])
+        local mixed_element = checked_table.elem_type
         iter.args[1] = checked_table
         if not is_table_type(table_type) then
             check_mismatch(line, column, "generic `for` iterator",
@@ -1596,17 +1654,22 @@ check_stmt = function(stmt, top_level)
         local key_type = "string"
         local value_type = "value"
         local iter_kind = iter_name
+        local array_element = table_element(table_type)
+        if array_element == "nil" then
+            -- `{}` has no element type yet; keep the tagged value view.
+            array_element = nil
+        end
+        if mixed_element == "nil" then
+            mixed_element = nil
+        end
         if iter_name == "ipairs" then
             key_type = "i32"
-            value_type = table_element(table_type) or "value"
-            if table_element(table_type) == nil then
-                value_type = "value"
-            end
-        elseif table_element(table_type) ~= nil then
+            value_type = array_element or mixed_element or "value"
+        elseif array_element ~= nil then
             -- Dense arrays behave like ipairs for `pairs` in the native
             -- subset; keyed records continue to use the hash-map iterator.
             key_type = "i32"
-            value_type = table_element(table_type)
+            value_type = array_element
             iter_kind = "ipairs"
         end
         stmt.iter = iter
@@ -1712,14 +1775,33 @@ local function check_program(ast)
     check_return_type = "i32"
     ast.body = check_block(ast.body, true)
 
+    -- Named functions cannot capture top-level locals (the C backend has no
+    -- closures), but a method declaration still needs the receiver's schema.
+    -- Keep a snapshot of the top-level bindings and expose only the receiver
+    -- while checking each method body.
+    local top_level_vars = clone check_scopes[check_scope_count].vars
+    scope_leave()
+
     local i = 1
     while i <= #check_function_order do
         local name = check_function_order[i]
         local signature = borrow check_functions[name]
+        local receiver_entry = nil
+        if signature.receiver ~= nil then
+            receiver_entry = clone top_level_vars[signature.receiver]
+            if receiver_entry ~= nil then
+                scope_enter()
+                scope_declare(signature.receiver, receiver_entry.type,
+                    false, false, receiver_entry.schema, false,
+                    receiver_entry.elem_type)
+            end
+        end
         check_function(signature)
+        if receiver_entry ~= nil then
+            scope_leave()
+        end
         i = i + 1
     end
-    scope_leave()
 
     ast.function_names = check_function_order
     ast.signatures = check_functions
@@ -2223,7 +2305,7 @@ local RUNTIME = {
     "}",
     "",
     "static uint64_t lusa_string_hash(LusaString *key) {",
-    "    uint64_t hash = 1469598103934665603u;",
+    "    uint64_t hash = 14695981039346656037ull;",
     "    uint64_t i;",
     "    if (key == NULL) return 0u;",
     "    for (i = 0u; i < key->obj.length; i++) {",
@@ -2816,6 +2898,16 @@ local function emit_value_payload(expr, value)
     return "0u", "LUSA_ELEM_UNKNOWN"
 end
 
+local function emit_clone_heap(type_name, value)
+    if type_name == "string" then
+        return "lusa_string_clone(" .. value .. ")"
+    end
+    if is_table_type(type_name) then
+        return "lusa_table_clone(" .. value .. ")"
+    end
+    return value
+end
+
 local function emit_number(expr)
     local exact_int = expr.int
     local literal_float = expr.float == true
@@ -3010,7 +3102,7 @@ emit_expr = function(expr)
         if expr.ctype == "string" then
             return "lusa_string_clone(" .. inner .. ")"
         end
-        if table_element(expr.ctype) ~= nil then
+        if is_table_type(expr.ctype) then
             return "lusa_table_clone(" .. inner .. ")"
         end
         return inner
@@ -3037,6 +3129,11 @@ emit_expr = function(expr)
             local item = expr.items[i]
             local item_type = item.ctype
             local value = emit_expr(clone item)
+            if is_heap_type(item_type) and item.own == false then
+                -- A table owns its elements, so views and borrowed values are
+                -- copied instead of being aliased into the new table.
+                value = emit_clone_heap(item_type, value)
+            end
             local key = expr.keys ~= nil and expr.keys[i] or nil
             if key ~= nil then
                 local string_id = emit_string_ids[key]
@@ -3063,7 +3160,9 @@ emit_expr = function(expr)
                 end
                 position = position + 1
             end
-            null_moved_source(item, nil)
+            if item.own ~= false then
+                null_moved_source(item, nil)
+            end
             i = i + 1
         end
         return table_name
@@ -3225,8 +3324,15 @@ local function emit_local(stmt)
         local temp_name = fresh("init")
         if value ~= nil then
             local rendered = emit_expr(clone value)
+            if type_name == "string" and value.own == false
+                and value.tag ~= "Borrow" then
+                -- Strings are value types: reading a field/index copies it.
+                rendered = "lusa_string_clone(" .. rendered .. ")"
+            end
             line(c_type(type_name) .. " " .. temp_name .. " = " .. rendered .. ";")
-            null_moved_source(value, nil)
+            if value.own ~= false then
+                null_moved_source(value, nil)
+            end
         else
             line(c_type(type_name) .. " " .. temp_name .. " = "
                 .. default_c(type_name) .. ";")
@@ -3284,7 +3390,7 @@ local function emit_assign(stmt)
     while i <= #targets do
         local temp_name = fresh("assign")
         if i <= #values then
-            local rendered = emit_expr(values[i])
+            local rendered = emit_expr(clone values[i])
             line(c_type(target_types[i]) .. " " .. temp_name .. " = "
                 .. rendered .. ";")
         else
@@ -3302,10 +3408,15 @@ local function emit_assign(stmt)
             local entry = clone entries[i]
             if moved_seen[entry.cname] ~= true then
                 if entry.own and not entry.moved then
-                    emit_drop_entry(entry)
+                    emit_drop_entry(clone entry)
                 end
             end
-            line(entry.cname .. " = " .. temporaries[i] .. ";")
+            local assigned = temporaries[i]
+            if i <= #values and values[i].own == false
+                and is_heap_type(target_types[i]) then
+                assigned = emit_clone_heap(target_types[i], assigned)
+            end
+            line(entry.cname .. " = " .. assigned .. ";")
         else
             local table_value = emit_expr(target.table)
             local string_id = emit_string_ids[target.field_name]
@@ -3314,23 +3425,16 @@ local function emit_assign(stmt)
                     "internal: field key was not collected")
             end
             local value_expr = temporaries[i]
-            if is_heap_type(target_types[i])
-                and values[i] ~= nil
-                and values[i].own == false
-                and values[i].tag ~= "String" then
-                if target_types[i] == "string" then
-                    value_expr = "lusa_string_clone(" .. value_expr .. ")"
-                elseif target_types[i] == "table"
-                    or table_element(target_types[i]) ~= nil then
-                    value_expr = "lusa_table_clone(" .. value_expr .. ")"
-                end
+            if is_heap_type(target_types[i]) and values[i] ~= nil
+                and values[i].own == false then
+                value_expr = emit_clone_heap(target_types[i], value_expr)
             end
             local payload, value_kind = emit_value_payload(
                 { ctype = target_types[i] }, value_expr)
             line("lusa_table_set_string(" .. table_value
                 .. ", &lusa_str_" .. tostring(string_id) .. ", "
                 .. payload .. ", " .. value_kind .. ");")
-            if i <= #values then
+            if i <= #values and values[i].own ~= false then
                 null_moved_source(values[i], nil)
             end
         end
@@ -3342,7 +3446,7 @@ local function emit_assign(stmt)
     i = 1
     while i <= #values do
         local value = unwrap_paren(values[i])
-        if value.tag == "Name" then
+        if value ~= nil and value.tag == "Name" and value.own ~= false then
             local source = direct_heap_name(value)
             if source ~= nil and targets_seen[source.cname] ~= true then
                 line(source.cname .. " = NULL;")
@@ -3366,9 +3470,18 @@ local function table_getter_for_type(type_name)
 end
 
 local function emit_for_in(stmt)
-    local iter_table = fresh("iter")
+    local iter_expr = stmt.iter.args[1]
+    -- Only a freshly constructed iterator value is owned by the loop; a
+    -- variable or field passed to pairs/ipairs stays owned by its scope.
+    local iter_tag = unwrap_paren(clone iter_expr).tag
+    local iter_owns = iter_tag == "Table" or iter_tag == "Clone"
+        or iter_tag == "Call" or iter_tag == "MethodCall"
+    emit_scope_enter()
+    local iter_entry = emit_scope_declare("__lusa_iter", "table",
+        iter_owns and is_table_type(iter_expr.ctype), false)
+    local iter_table = iter_entry.cname
     line("LusaTable *" .. iter_table .. " = "
-        .. emit_expr(clone stmt.iter.args[1]) .. ";")
+        .. emit_expr(clone iter_expr) .. ";")
     local loop_scope = emit_scope_count
     emit_loop_stack[#emit_loop_stack + 1] = loop_scope
     if stmt.iter_kind == "ipairs" then
@@ -3416,6 +3529,7 @@ local function emit_for_in(stmt)
         line("}")
     end
     emit_loop_stack[#emit_loop_stack] = nil
+    emit_leave_scope()
 end
 
 local function emit_if(stmt)
@@ -3517,9 +3631,16 @@ local function emit_return(stmt)
 
     local value = values[1]
     local rendered = emit_expr(clone value)
+    if value.own == false and is_heap_type(return_type) then
+        -- The caller receives an owned value; a view into a local table (or a
+        -- borrowed parameter) must be copied before this scope is torn down.
+        rendered = emit_clone_heap(return_type, rendered)
+    end
     local temp_name = fresh("ret")
     line(c_type(return_type) .. " " .. temp_name .. " = " .. rendered .. ";")
-    null_moved_source(value, nil)
+    if value.own ~= false then
+        null_moved_source(value, nil)
+    end
     emit_all_drops()
     if emit_is_main then
         emit_global_drops()
