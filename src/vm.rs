@@ -897,6 +897,14 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
                 "borrow is not supported in bytecode mode yet; run this program with the interpreter",
             ))
         }
+        Instr::UnsafeEnter => {
+            interp.unsafe_depth += 1;
+            StepOutcome::Continue
+        }
+        Instr::UnsafeLeave => {
+            interp.unsafe_depth = interp.unsafe_depth.saturating_sub(1);
+            StepOutcome::Continue
+        }
         Instr::Jump(t) => {
             interp.vm.frames.last_mut().unwrap().pc = *t as usize;
             StepOutcome::Continue

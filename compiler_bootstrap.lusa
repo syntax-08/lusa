@@ -488,6 +488,33 @@ local function table_element(type_name)
     return nil
 end
 
+-- ---- raw pointer and struct types (module 11) ----------------------------
+
+local function pointer_element(type_name)
+    if type_name == nil then
+        return nil
+    end
+    if string.sub(type_name, 1, 7) == "*const " then
+        return string.sub(type_name, 8)
+    end
+    if string.sub(type_name, 1, 5) == "*mut " then
+        return string.sub(type_name, 6)
+    end
+    return nil
+end
+
+local function is_pointer_type(type_name)
+    return pointer_element(type_name) ~= nil
+end
+
+local function is_mut_pointer(type_name)
+    return type_name ~= nil and string.sub(type_name, 1, 5) == "*mut "
+end
+
+local function is_struct_type(type_name)
+    return type_name ~= nil and check_structs[type_name] ~= nil
+end
+
 local function canonical_type(name, line, column)
     if name == "auto" then
         return "auto"
@@ -503,6 +530,18 @@ local function canonical_type(name, line, column)
                 "invalid table element type `" .. tostring(canonical) .. "`")
         end
         return "table<" .. canonical .. ">"
+    end
+    if is_pointer_type(name) then
+        local element = pointer_element(name)
+        if element == "u32" or element == "i32" then
+            return name
+        end
+        type_fail("E0301", line, column,
+            "raw pointers support only `u32` and `i32` elements, found `"
+            .. tostring(element) .. "`")
+    end
+    if is_struct_type(name) then
+        return name
     end
     type_fail("E0301", line, column,
         "unknown type `" .. tostring(name) .. "`")
@@ -572,6 +611,17 @@ local function assignable(target, source, expr)
     if source == "nil" then
         return target == "nil" or is_heap_type(target)
     end
+    if is_pointer_type(target) then
+        -- integer addresses (literals or integer expressions) may initialize
+        -- or be assigned into raw pointers; the emitter inserts the cast.
+        if is_integer_type(source) then
+            return true
+        end
+        return false
+    end
+    if is_struct_type(target) and source == "nil" then
+        return false
+    end
     if is_integer_type(target) then
         local value = literal_int(expr)
         if value ~= nil and integer_fits(target, value) then
@@ -628,6 +678,8 @@ local check_globals = {}
 local check_global_order = {}
 local check_functions = {}
 local check_function_order = {}
+local check_structs = {}
+local check_struct_order = {}
 local check_loop_depth = 0
 local check_unsafe_depth = 0
 local check_return_type = "i32"
@@ -744,11 +796,70 @@ local function check_call(expr)
     local i = 1
 
     if name == "unsafe_ptr_cast" or name == "unsafe_read_mem"
-        or name == "unsafe_write_mem" then
+        or name == "unsafe_write_mem"
+        or name == "unsafe_alloc"
+        or name == "unsafe_nop" or name == "unsafe_asm" then
         if check_unsafe_depth == 0 then
             type_fail("E0316", expr.line, expr.column,
                 "raw pointer intrinsic `" .. name
                 .. "` is only allowed inside an `unsafe` block")
+        end
+        if name == "unsafe_nop" then
+            if #args ~= 0 then
+                type_fail("E0311", expr.line, expr.column,
+                    "`unsafe_nop` takes no arguments, found "
+                    .. tostring(#args))
+            end
+            expr.ctype = "void"
+            expr.builtin = name
+            expr.args = args
+            return expr, "void"
+        end
+        if name == "unsafe_asm" then
+            if #args ~= 1 then
+                type_fail("E0311", expr.line, expr.column,
+                    "`unsafe_asm` takes one string argument, found "
+                    .. tostring(#args))
+            end
+            local checked_text, text_type = check_expr(args[1])
+            if text_type ~= "string" then
+                check_mismatch(checked_text.line, checked_text.column,
+                    "`unsafe_asm` text", "string", text_type)
+            end
+            if checked_text.tag ~= "String" then
+                type_fail("E0312", checked_text.line, checked_text.column,
+                    "`unsafe_asm` requires a string literal")
+            end
+            local asm_text = checked_text.value or ""
+            if string.find(asm_text, '"', 1, true) ~= nil
+                or string.find(asm_text, "\\", 1, true) ~= nil
+                or string.find(asm_text, "\n", 1, true) ~= nil then
+                type_fail("E0312", checked_text.line, checked_text.column,
+                    "`unsafe_asm` text must not contain quotes, backslashes, or newlines")
+            end
+            args[1] = checked_text
+            expr.ctype = "void"
+            expr.builtin = name
+            expr.args = args
+            expr.asm_text = asm_text
+            return expr, "void"
+        end
+        if name == "unsafe_alloc" then
+            if #args ~= 1 then
+                type_fail("E0311", expr.line, expr.column,
+                    "`unsafe_alloc` takes one `u32` byte count, found "
+                    .. tostring(#args))
+            end
+            local checked_bytes, bytes_type = check_expr(args[1])
+            if not is_integer_type(bytes_type) then
+                check_mismatch(checked_bytes.line, checked_bytes.column,
+                    "`unsafe_alloc` size", "integer", bytes_type)
+            end
+            args[1] = checked_bytes
+            expr.ctype = "*mut u32"
+            expr.builtin = name
+            expr.args = args
+            return expr, "*mut u32"
         end
         local wanted = 1
         if name == "unsafe_write_mem" then
@@ -761,9 +872,9 @@ local function check_call(expr)
         end
         local checked_addr, addr_type = check_expr(args[1])
         args[1] = checked_addr
-        if not is_integer_type(addr_type) then
+        if not is_integer_type(addr_type) and not is_pointer_type(addr_type) then
             check_mismatch(args[1].line, args[1].column,
-                "raw pointer address", "integer", addr_type)
+                "raw pointer address", "integer or raw pointer", addr_type)
         end
         if name == "unsafe_write_mem" then
             local checked_value, value_type = check_expr(args[2])
@@ -793,6 +904,10 @@ local function check_call(expr)
             if arg_type == "void" then
                 type_fail("E0308", checked_arg.line, checked_arg.column,
                     "`print` cannot print a void expression")
+            end
+            if is_struct_type(arg_type) then
+                type_fail("E0308", checked_arg.line, checked_arg.column,
+                    "`print` cannot print a struct value")
             end
             args[i] = checked_arg
             i = i + 1
@@ -1010,13 +1125,18 @@ check_expr = function(expr)
 
     if tag == "Paren" then
         local checked_inner, inner = check_expr(expr.value)
+        local inner_own = checked_inner.own
+        local inner_borrowed = checked_inner.borrowed
+        local inner_mutable = checked_inner.mutable
+        local inner_schema = checked_inner.schema
+        local inner_elem = checked_inner.elem_type
         expr.value = checked_inner
         expr.ctype = inner
-        expr.own = checked_inner.own
-        expr.borrowed = checked_inner.borrowed
-        expr.mutable = checked_inner.mutable
-        expr.schema = checked_inner.schema
-        expr.elem_type = checked_inner.elem_type
+        expr.own = inner_own
+        expr.borrowed = inner_borrowed
+        expr.mutable = inner_mutable
+        expr.schema = inner_schema
+        expr.elem_type = inner_elem
         return expr, inner
     end
 
@@ -1062,6 +1182,46 @@ check_expr = function(expr)
         local checked_rhs, rhs_type = check_expr(expr.rhs)
         local op = expr.op
         local result_type = nil
+
+        -- Raw pointer arithmetic scales by the element size in the generated
+        -- C (`ptr + 1` advances `sizeof(T)` bytes); the dynamic engines treat
+        -- the same expression as a cell-index step.
+        local lhs_pointer = pointer_element(lhs_type)
+        local rhs_pointer = pointer_element(rhs_type)
+        if op == "+" or op == "-" then
+            if lhs_pointer ~= nil or rhs_pointer ~= nil then
+                if check_unsafe_depth == 0 then
+                    type_fail("E0320", line, column,
+                        "raw pointer arithmetic requires an `unsafe` block")
+                end
+                local pointer_type = nil
+                local offset_type = nil
+                if lhs_pointer ~= nil then
+                    if rhs_pointer ~= nil then
+                        type_fail("E0308", line, column,
+                            "cannot add or subtract two raw pointers")
+                    end
+                    pointer_type = lhs_type
+                    offset_type = rhs_type
+                else
+                    pointer_type = rhs_type
+                    offset_type = lhs_type
+                    if op == "-" then
+                        type_fail("E0308", line, column,
+                            "cannot subtract a raw pointer from an integer")
+                    end
+                end
+                if not is_integer_type(offset_type) then
+                    check_mismatch(line, column, "pointer arithmetic",
+                        "integer offset", offset_type)
+                end
+                expr.ctype = pointer_type
+                expr.ptr_math = true
+                expr.lhs = checked_lhs
+                expr.rhs = checked_rhs
+                return expr, pointer_type
+            end
+        end
 
         if op == ".." then
             if lhs_type ~= "string" or rhs_type ~= "string" then
@@ -1236,6 +1396,19 @@ check_expr = function(expr)
         local checked_table, table_type = check_expr(expr.table)
         local table_schema = checked_table.schema
         expr.table = checked_table
+        if is_struct_type(table_type) then
+            local layout = borrow check_structs[table_type]
+            local field = borrow layout.fields[expr.field_name]
+            if field == nil then
+                type_fail("E0309", line, column,
+                    "struct `" .. tostring(table_type) .. "` has no field `"
+                    .. tostring(expr.field_name) .. "`")
+            end
+            expr.ctype = field.type
+            expr.struct_access = true
+            expr.own = false
+            return expr, field.type
+        end
         if not is_table_type(table_type) then
             check_mismatch(line, column, "field access", "table", table_type)
         end
@@ -1249,6 +1422,24 @@ check_expr = function(expr)
         expr.schema = field.schema
         expr.own = false
         return expr, field.type
+    end
+
+    if tag == "Deref" then
+        local checked_inner, inner_type = check_expr(expr.value)
+        expr.value = checked_inner
+        local element = pointer_element(inner_type)
+        if element == nil then
+            check_mismatch(line, column, "pointer dereference",
+                "raw pointer", inner_type)
+        end
+        if check_unsafe_depth == 0 then
+            type_fail("E0321", line, column,
+                "raw pointer dereference requires an `unsafe` block")
+        end
+        expr.ctype = element
+        expr.deref = true
+        expr.own = false
+        return expr, element
     end
 
     if tag == "MethodCall" then
@@ -1357,9 +1548,10 @@ local function check_assign(stmt)
     local i = 1
     while i <= target_count do
         local target = targets[i]
-        if target.tag ~= "Name" and target.tag ~= "Field" then
+        if target.tag ~= "Name" and target.tag ~= "Field"
+            and target.tag ~= "Deref" then
             type_fail("E0312", target.line, target.column,
-                "only name and field assignment targets are supported by the C backend")
+                "only name, field, and dereference assignment targets are supported by the C backend")
         end
         local expected = nil
         if target.tag == "Name" then
@@ -1382,6 +1574,24 @@ local function check_assign(stmt)
             end
             expected = entry.type
             entry.own = is_heap_type(entry.type)
+        elseif target.tag == "Deref" then
+            local checked_inner, inner_type = check_expr(target.value)
+            target.value = checked_inner
+            local element = pointer_element(inner_type)
+            if element == nil then
+                check_mismatch(target.line, target.column,
+                    "pointer dereference assignment", "raw pointer", inner_type)
+            end
+            if check_unsafe_depth == 0 then
+                type_fail("E0321", target.line, target.column,
+                    "raw pointer dereference requires an `unsafe` block")
+            end
+            if not is_mut_pointer(inner_type) then
+                type_fail("E0322", target.line, target.column,
+                    "cannot write through a `*const` pointer")
+            end
+            expected = element
+            target.deref_target = true
         else
             local checked_table, table_type = check_expr(target.table)
             local table_schema = checked_table.schema
@@ -1389,24 +1599,37 @@ local function check_assign(stmt)
             local table_mutable = checked_table.mutable
             local table_label = checked_table.name
             target.table = checked_table
-            if not is_table_type(table_type) then
-                check_mismatch(target.line, target.column,
-                    "field assignment", "table", table_type)
+            if is_struct_type(table_type) then
+                local layout = borrow check_structs[table_type]
+                local field = borrow layout.fields[target.field_name]
+                if field == nil then
+                    type_fail("E0309", target.line, target.column,
+                        "struct `" .. tostring(table_type) .. "` has no field `"
+                        .. tostring(target.field_name) .. "`")
+                end
+                expected = field.type
+                target.struct_access = true
+                target.own = false
+            else
+                if not is_table_type(table_type) then
+                    check_mismatch(target.line, target.column,
+                        "field assignment", "table", table_type)
+                end
+                if table_borrowed and table_mutable ~= true
+                    and check_unsafe_depth == 0 then
+                    type_fail("E1004", target.line, target.column,
+                        "cannot write through immutable borrow `"
+                        .. tostring(table_label) .. "`")
+                end
+                local field = table_schema ~= nil
+                    and table_schema[target.field_name] or nil
+                if field == nil then
+                    type_fail("E0309", target.line, target.column,
+                        "table has no field `" .. tostring(target.field_name) .. "`")
+                end
+                expected = field.type
+                target.own = false
             end
-            if table_borrowed and table_mutable ~= true
-                and check_unsafe_depth == 0 then
-                type_fail("E1004", target.line, target.column,
-                    "cannot write through immutable borrow `"
-                    .. tostring(table_label) .. "`")
-            end
-            local field = table_schema ~= nil
-                and table_schema[target.field_name] or nil
-            if field == nil then
-                type_fail("E0309", target.line, target.column,
-                    "table has no field `" .. tostring(target.field_name) .. "`")
-            end
-            expected = field.type
-            target.own = false
         end
 
         local actual = nil
@@ -1565,6 +1788,43 @@ check_stmt = function(stmt, top_level)
     local tag = stmt.tag
     local line = stmt.line
     local column = stmt.column
+
+    if tag == "Struct" then
+        if not top_level then
+            type_fail("E0312", line, column,
+                "`struct` declarations are only allowed at the top level")
+        end
+        if check_structs[stmt.name] ~= nil then
+            type_fail("E0302", line, column,
+                "duplicate definition of struct `" .. stmt.name .. "`")
+        end
+        local layout = {}
+        local order = {}
+        local i = 1
+        while i <= #stmt.fields do
+            local field = clone stmt.fields[i]
+            local field_type = canonical_type(field.type, field.line, field.column)
+            local valid = field_type == "u32" or field_type == "i32"
+                or field_type == "f32" or field_type == "bool"
+            if not valid and not is_pointer_type(field_type) then
+                type_fail("E0312", field.line, field.column,
+                    "struct fields must be `u32`, `i32`, `f32`, `bool`, or raw pointers, found `"
+                    .. tostring(field_type) .. "`")
+            end
+            if layout[field.name] ~= nil then
+                type_fail("E0302", field.line, field.column,
+                    "duplicate struct field `" .. field.name .. "`")
+            end
+            layout[field.name] = { type = field_type }
+            order[#order + 1] = field.name
+            field.type = field_type
+            stmt.fields[i] = field
+            i = i + 1
+        end
+        check_structs[stmt.name] = { fields = layout, order = order }
+        check_struct_order[#check_struct_order + 1] = stmt.name
+        return stmt
+    end
 
     if tag == "Local" then
         return check_local(stmt)
@@ -1761,6 +2021,8 @@ local function check_program(ast)
     check_global_order = {}
     check_functions = {}
     check_function_order = {}
+    check_structs = {}
+    check_struct_order = {}
     check_loop_depth = 0
     check_unsafe_depth = 0
     check_return_type = "i32"
@@ -1805,6 +2067,10 @@ local function check_program(ast)
 
     ast.function_names = check_function_order
     ast.signatures = check_functions
+    ast.struct_names = clone check_struct_order
+    -- The emitter resolves struct names through `check_structs` as well, so
+    -- hand it a copy instead of moving the registry out.
+    ast.structs = clone check_structs
     ast.globals = check_global_order
     return ast
 end
@@ -1900,6 +2166,20 @@ local function c_type(type_name)
         return "LusaTable *"
     end
     if type_name == "value" then return "LusaValue" end
+    if pointer_element(type_name) ~= nil then
+        local element = pointer_element(type_name)
+        local base = "uint32_t"
+        if element == "i32" then
+            base = "int32_t"
+        end
+        if string.sub(type_name, 1, 5) == "*mut " then
+            return "volatile " .. base .. " *"
+        end
+        return "const volatile " .. base .. " *"
+    end
+    if is_struct_type(type_name) then
+        return type_name
+    end
     fail(0, 0, "internal: no C type for `" .. tostring(type_name) .. "`")
 end
 
@@ -1915,6 +2195,12 @@ local function default_c(type_name)
     end
     if type_name == "value" then
         return "(LusaValue){LUSA_ELEM_UNKNOWN, 0u}"
+    end
+    if pointer_element(type_name) ~= nil then
+        return "NULL"
+    end
+    if is_struct_type(type_name) then
+        return "{0}"
     end
     return ""
 end
@@ -2132,6 +2418,53 @@ local RUNTIME = {
     "#include <inttypes.h>",
     "#include <math.h>",
     "",
+    "/* Inline assembly hooks for `unsafe_asm`/`unsafe_nop`.  GCC and Clang",
+    "   receive the raw text as a volatile asm statement; MSVC and other",
+    "   toolchains keep the program buildable with a compiler barrier. */",
+    "#if defined(_MSC_VER)",
+    "#include <intrin.h>",
+    "#define LUSA_NOP() __nop()",
+    "#define LUSA_ASM(text) ((void)0)",
+    "#elif defined(__GNUC__) || defined(__clang__)",
+    -- Statement expressions keep the hooks usable in expression position.
+    '#define LUSA_NOP() ({ __asm__ __volatile__("nop"); })',
+    "#define LUSA_ASM(text) ({ __asm__ __volatile__(text); })",
+    "#else",
+    "#define LUSA_NOP() ((void)0)",
+    "#define LUSA_ASM(text) ((void)0)",
+    "#endif",
+    "",
+    "static void lusa_panic(const char *message);",
+    "",
+    "/* Tracked buffers behind `unsafe_alloc`; released before the program",
+    "   exits so tests and drivers can use them freely. */",
+    "static void **lusa_alloc_list = NULL;",
+    "static uint64_t lusa_alloc_count = 0u;",
+    "static void *lusa_unsafe_alloc(uint64_t bytes) {",
+    "    void *memory;",
+    "    void **grown;",
+    "    if (bytes == 0u) bytes = 1u;",
+    "    memory = calloc(1, (size_t)bytes);",
+    '    if (memory == NULL) lusa_panic("out of memory");',
+    "    grown = (void **)realloc(lusa_alloc_list,",
+    "        (size_t)(lusa_alloc_count + 1u) * sizeof(void *));",
+    '    if (grown == NULL) lusa_panic("out of memory");',
+    "    lusa_alloc_list = grown;",
+    "    lusa_alloc_list[lusa_alloc_count] = memory;",
+    "    lusa_alloc_count = lusa_alloc_count + 1u;",
+    "    return memory;",
+    "}",
+    "static void lusa_free_allocs(void) {",
+    "    uint64_t i;",
+    "    if (lusa_alloc_list == NULL) return;",
+    "    for (i = 0u; i < lusa_alloc_count; i++) {",
+    "        free(lusa_alloc_list[i]);",
+    "    }",
+    "    free(lusa_alloc_list);",
+    "    lusa_alloc_list = NULL;",
+    "    lusa_alloc_count = 0u;",
+    "}",
+    "",
     "#define LUSA_OBJ_STRING 1u",
     "#define LUSA_OBJ_TABLE  2u",
     "#define LUSA_OWNED      1u",
@@ -2216,6 +2549,7 @@ local RUNTIME = {
     "static void lusa_drop_string(LusaString **value);",
     "static void lusa_drop_table(LusaTable **value);",
     "static void lusa_drop_value(uint64_t kind, uint64_t *payload);",
+    "static void lusa_panic(const char *message);",
     "",
     "static LusaString *lusa_string_new(const char *bytes, uint64_t length) {",
     "    LusaString *value = (LusaString *)calloc(1, sizeof(LusaString));",
@@ -2908,6 +3242,17 @@ local function emit_clone_heap(type_name, value)
     return value
 end
 
+local function emit_cast_to(type_name, value)
+    if is_pointer_type(type_name) then
+        return "(" .. c_type(type_name) .. ")(uintptr_t)(" .. value .. ")"
+    end
+    if type_name == "u32" or type_name == "i32"
+        or type_name == "f32" or type_name == "bool" then
+        return "(" .. c_type(type_name) .. ")(" .. value .. ")"
+    end
+    return value
+end
+
 local function emit_number(expr)
     local exact_int = expr.int
     local literal_float = expr.float == true
@@ -3053,6 +3398,10 @@ emit_expr = function(expr)
         local lhs = emit_expr(expr.lhs)
         local rhs = emit_expr(expr.rhs)
         local op = expr.op
+        if expr.ptr_math then
+            -- Raw pointer arithmetic: C scales by the element size.
+            return "((" .. lhs .. ") " .. op .. " (" .. rhs .. "))"
+        end
         if op == "==" or op == "~=" or op == "<" or op == "<="
             or op == ">" or op == ">=" then
             return emit_comparison(expr, lhs, rhs)
@@ -3071,6 +3420,10 @@ emit_expr = function(expr)
         if expr.builtin == "unsafe_ptr_cast" then
             return "((uintptr_t)(" .. emit_expr(expr.args[1]) .. "))"
         end
+        if expr.builtin == "unsafe_alloc" then
+            return "((uintptr_t)(lusa_unsafe_alloc((uint64_t)("
+                .. emit_expr(expr.args[1]) .. "))))"
+        end
         if expr.builtin == "unsafe_read_mem" then
             return "(*(volatile uint32_t *)(uintptr_t)("
                 .. emit_expr(expr.args[1]) .. "))"
@@ -3080,6 +3433,12 @@ emit_expr = function(expr)
             local value = emit_expr(expr.args[2])
             return "((*(volatile uint32_t *)(uintptr_t)(" .. address
                 .. ")) = (uint32_t)(" .. value .. "))"
+        end
+        if expr.builtin == "unsafe_nop" then
+            return "LUSA_NOP()"
+        end
+        if expr.builtin == "unsafe_asm" then
+            return 'LUSA_ASM("' .. expr.asm_text .. '")'
         end
         if expr.builtin == "print" then
             fail(expr.line, expr.column,
@@ -3168,6 +3527,9 @@ emit_expr = function(expr)
         return table_name
     end
     if tag == "Field" then
+        if expr.struct_access then
+            return "(" .. emit_expr(expr.table) .. ")." .. expr.field_name
+        end
         local table_value = emit_expr(expr.table)
         local string_id = emit_string_ids[expr.field_name]
         if string_id == nil then
@@ -3193,6 +3555,9 @@ emit_expr = function(expr)
         end
         fail(expr.line, expr.column,
             "internal: unsupported field type `" .. tostring(field_type) .. "`")
+    end
+    if tag == "Deref" then
+        return "(*(" .. emit_expr(expr.value) .. "))"
     end
     if tag == "MethodCall" then
         local cname = emit_function_cnames[expr.fn_key]
@@ -3299,6 +3664,8 @@ local function emit_print_call(call)
             line("lusa_print_table(" .. value .. ");")
         elseif type_name == "value" then
             line("lusa_print_value(" .. value .. ");")
+        elseif pointer_element(type_name) ~= nil then
+            line("lusa_print_u32((uint32_t)(uintptr_t)(" .. value .. "));")
         elseif type_name == "nil" then
             line("lusa_print_nil();")
         else
@@ -3329,6 +3696,7 @@ local function emit_local(stmt)
                 -- Strings are value types: reading a field/index copies it.
                 rendered = "lusa_string_clone(" .. rendered .. ")"
             end
+            rendered = emit_cast_to(type_name, rendered)
             line(c_type(type_name) .. " " .. temp_name .. " = " .. rendered .. ";")
             if value.own ~= false then
                 null_moved_source(value, nil)
@@ -3416,7 +3784,17 @@ local function emit_assign(stmt)
                 and is_heap_type(target_types[i]) then
                 assigned = emit_clone_heap(target_types[i], assigned)
             end
+            assigned = emit_cast_to(target_types[i], assigned)
             line(entry.cname .. " = " .. assigned .. ";")
+        elseif target.tag == "Deref" then
+            local pointer_value = emit_expr(target.value)
+            local value_expr = emit_cast_to(target_types[i], temporaries[i])
+            line("(*(" .. pointer_value .. ")) = " .. value_expr .. ";")
+        elseif target.struct_access then
+            local table_value = emit_expr(target.table)
+            local value_expr = emit_cast_to(target_types[i], temporaries[i])
+            line("(" .. table_value .. ")." .. target.field_name
+                .. " = " .. value_expr .. ";")
         else
             local table_value = emit_expr(target.table)
             local string_id = emit_string_ids[target.field_name]
@@ -3636,6 +4014,7 @@ local function emit_return(stmt)
         -- borrowed parameter) must be copied before this scope is torn down.
         rendered = emit_clone_heap(return_type, rendered)
     end
+    rendered = emit_cast_to(return_type, rendered)
     local temp_name = fresh("ret")
     line(c_type(return_type) .. " " .. temp_name .. " = " .. rendered .. ";")
     if value.own ~= false then
@@ -3722,6 +4101,11 @@ emit_stmt = function(stmt)
     if tag == "Function" then
         return
     end
+    if tag == "Struct" then
+        -- The typedef is emitted once in the preamble; the statement itself
+        -- produces no runtime code.
+        return
+    end
     fail(stmt.line, stmt.column,
         "internal: unsupported statement node `" .. tostring(tag) .. "`")
 end
@@ -3767,6 +4151,31 @@ local function setup_symbols(ast)
         end
         emit_function_cnames[name] = cname
         emit_functions[#emit_functions + 1] = signature
+        i = i + 1
+    end
+end
+
+local function emit_struct_declarations(ast)
+    local names = ast.struct_names or {}
+    if #names == 0 then
+        return
+    end
+    local i = 1
+    while i <= #names do
+        local name = names[i]
+        local layout = borrow ast.structs[name]
+        line("typedef struct {")
+        emit_indent = emit_indent + 1
+        local j = 1
+        while j <= #layout.order do
+            local field_name = layout.order[j]
+            local field_type = layout.fields[field_name].type
+            line(c_type(field_type) .. " " .. field_name .. ";")
+            j = j + 1
+        end
+        emit_indent = emit_indent - 1
+        line("} " .. name .. ";")
+        line("")
         i = i + 1
     end
 end
@@ -3881,6 +4290,7 @@ local function emit_main(ast)
     emit_block_statements(ast.body)
     emit_leave_scope()
     emit_global_drops()
+    line("lusa_free_allocs();")
     line("return 0;")
     emit_indent = emit_indent - 1
     line("}")
@@ -3902,6 +4312,7 @@ local function emit_c_impl(ast)
     put("")
     emit_static_strings()
     emit_static_ints()
+    emit_struct_declarations(borrow ast)
     emit_globals_declarations()
     emit_function_prototypes()
 
@@ -3940,6 +4351,9 @@ function Compiler.memory_layout()
         keyed_table = "LusaEntry { LusaString *key; uint64_t value; uint64_t kind; } with linear probing and FNV-1a hashing",
         methods = "colon methods lower to static C functions; `self` is a non-owning LusaTable pointer",
         iterators = "ipairs walks the 1-based array part; pairs walks the keyed hash entries",
+        structs = "`struct Name { field: type, ... }` becomes a C typedef struct with natural alignment; field access compiles to direct member offsets",
+        pointers = "*mut u32/*const u32 and *mut i32/*const i32 lower to volatile C pointers; pointer arithmetic scales by the element size and dereferences are volatile reads/writes",
+        intrinsics = "unsafe_nop/unsafe_asm lower to LUSA_NOP()/LUSA_ASM(text) - __asm__ __volatile__ on GCC/Clang, compiler barriers elsewhere",
         table_kinds = {
             unknown = 0, i32 = 1, u32 = 2, i128 = 3,
             f32 = 4, bool = 5, string = 6, table = 7

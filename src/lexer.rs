@@ -26,6 +26,7 @@ const KEYWORDS: &[(&str, TokenKind)] = &[
     ("repeat", TokenKind::Repeat),
     ("until", TokenKind::Until),
     ("unsafe", TokenKind::Unsafe),
+    ("struct", TokenKind::Struct),
     ("return", TokenKind::Return),
     ("break", TokenKind::Break),
     ("and", TokenKind::And),
@@ -44,6 +45,10 @@ struct Lexer {
     last_num: Option<f64>,
     /// Exact digits when the last scanned number was a pure integer.
     last_int: Option<String>,
+    /// `true` when only whitespace (including at least one newline) separates
+    /// this position from the previous token.  A `*` in this position starts
+    /// a pointer dereference statement instead of continuing a multiplication.
+    at_line_start: bool,
 }
 
 pub fn is_name_start(c: char) -> bool {
@@ -64,6 +69,7 @@ impl Lexer {
             pos: 0,
             last_num: None,
             last_int: None,
+            at_line_start: true,
         }
     }
 
@@ -100,6 +106,8 @@ impl Lexer {
             }
             let start = self.pos;
             let c = self.peek();
+            let line_start = self.at_line_start;
+            self.at_line_start = false;
             if is_name_start(c) {
                 let kind = self.scan_name();
                 out.push(Token {
@@ -115,6 +123,10 @@ impl Lexer {
                 });
             } else {
                 let kind = self.scan_symbol()?;
+                let kind = match kind {
+                    TokenKind::Star if line_start => TokenKind::StarLine,
+                    other => other,
+                };
                 out.push(Token {
                     kind,
                     span: Span::new(start, self.pos),
@@ -127,7 +139,10 @@ impl Lexer {
     fn skip_trivia(&mut self) -> LResult<()> {
         loop {
             let c = self.peek();
-            if c.is_whitespace() {
+            if c == '\n' {
+                self.at_line_start = true;
+                self.pos += 1;
+            } else if c.is_whitespace() {
                 self.pos += 1;
             } else if c == '-' && self.peek2() == '-' {
                 self.pos += 2;

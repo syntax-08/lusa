@@ -6,13 +6,30 @@ The guiding rule is unchanged: every feature must have one documented
 semantics and must pass the same tests in the interpreter, the bytecode VM,
 and, where supported, the C11 backend.
 
-## Baseline after v0.6.1
+## Shipped in v0.7.0 - static structs, raw pointers, kernel intrinsics
+
+- **Static structs:** `struct Name { field: type }` lowers to a C typedef with
+  natural alignment; field access compiles to direct member offsets.
+- **Raw pointers:** `*mut u32`/`*const u32`/`*mut i32`/`*const i32` lower to
+  volatile C pointers; `ptr + n` scales by the element size; `*ptr` reads and
+  `*ptr = v` writes are volatile.
+- **Sandbox emulation:** the interpreter and VM simulate structs as
+  fixed-field buffers, pointers as indices into a virtual address space, and
+  `unsafe_alloc` as virtual regions, so bare-metal logic debugs dynamically.
+- **Intrinsics:** `unsafe_nop`/`unsafe_asm` emit `__asm__ __volatile__` hooks
+  on GCC/Clang (barriers elsewhere); `unsafe_alloc` returns tracked buffers.
+- **Safety diagnostics:** `E0320` (pointer arithmetic), `E0321` (dereference),
+  and `E0322` (write through `*const`) with Cargo-style spans.
+
+## Baseline after v0.7.0
 
 | Area | Interpreter | Bytecode VM | C11 backend |
 | --- | --- | --- | --- |
 | Keyed tables and nested fields | yes | yes | yes |
 | Colon methods | yes | yes | yes (static dispatch) |
 | `pairs` / `ipairs` | yes | yes | yes (native loops) |
+| Static structs | simulated buffers | simulated buffers | C typedef + member access |
+| Raw pointers | simulated addresses | simulated addresses | volatile C pointers |
 | `pcall` | yes (`src/builtins.rs`) | yes | no |
 | Coroutines | no | no | no |
 | String patterns | literal `find`/`gsub` only | literal only | no string library |
@@ -25,9 +42,9 @@ blocker for native protected calls. The dynamic engines already model the
 ownership rules at runtime, but the compiler does not yet prove them ahead of
 time.
 
-## Module 11 - Error Recovery and Coroutines (target v0.7.0)
+## Module 12 - Error Recovery and Coroutines (target v0.8.0)
 
-### 11.1 Native protected calls (`pcall`)
+### 12.1 Native protected calls (`pcall`)
 
 The dynamic `pcall(f, ...)` contract is already stable: success returns `true`
 followed by the callee's results; any error returns `false` and an
@@ -100,9 +117,9 @@ native builds without leaking heap values or skipping RAII drops.
 - Multiple native return values may require a small result struct; do not
   silently truncate.
 
-## Module 12 - String Utilities and Pattern Matching (target v0.8.0)
+## Module 13 - String Utilities and Pattern Matching (target v0.9.0)
 
-### 12.1 Pattern engine
+### 13.1 Pattern engine
 
 `string.find` and `string.gsub` currently compare literal character slices in
 `src/builtins.rs`. Module 12 adds a real pattern layer shared by all engines.
@@ -155,9 +172,9 @@ native builds without leaking heap values or skipping RAII drops.
   escape hatch.
 - Backtracking performance needs a budget from day one.
 
-## Module 13 - Advanced Lifetimes (target v0.9.0)
+## Module 14 - Advanced Lifetimes (target v1.0.0)
 
-### 13.1 Static borrow checker
+### 14.1 Static borrow checker
 
 The C backend currently tracks `own`, `borrowed`, and `mutable` flags in
 `compiler_bootstrap.lusa`; the dynamic engines enforce rules in the runtime
@@ -237,10 +254,10 @@ compile-time analysis and makes explicit transfer syntax part of the language.
 
 | Version | Theme | Required before tagging |
 | --- | --- | --- |
-| v0.7.0 | Native `pcall`, coroutines | three-OS CI, native unwind/leak suite, parity tests |
-| v0.8.0 | Pattern matching and string utilities | shared matcher, fuzz corpus, native/VM/interpreter parity |
-| v0.9.0 | Static borrow checker, explicit `move`/`copy` | golden diagnostics, migration report, full suite |
-| v1.0.0 | Language stabilization | frozen semantics, no known memory-safety defects |
+| v0.7.0 | Static structs, raw pointers, kernel intrinsics (shipped) | three-OS CI, sandbox parity, native volatile access |
+| v0.8.0 | Native `pcall`, coroutines | three-OS CI, native unwind/leak suite, parity tests |
+| v0.9.0 | Pattern matching and string utilities | shared matcher, fuzz corpus, native/VM/interpreter parity |
+| v1.0.0 | Static borrow checker, explicit `move`/`copy`, stabilization | golden diagnostics, migration report, frozen semantics |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

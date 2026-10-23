@@ -83,7 +83,20 @@ fn b_unsafe_ptr_cast(_i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<V
     one(Value::Number(addr as f64))
 }
 
+fn require_unsafe(interp: &Interp, what: &str, span: Span) -> LResult<()> {
+    if interp.unsafe_depth == 0 {
+        return Err(LusaError::new(
+            crate::error::E_PTR_DEREF,
+            Some(span),
+            format!("{what} requires an `unsafe` block"),
+        )
+        .note("wrap the call in `unsafe do ... end`", None));
+    }
+    Ok(())
+}
+
 fn b_unsafe_write_mem(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    require_unsafe(i, "raw memory access", span)?;
     let addr = mem_addr(&args, span)?;
     let value = need_num(get(&args, 1, "value", span)?, "value", span)? as u32;
     i.unsafe_mem.insert(addr, value);
@@ -91,9 +104,40 @@ fn b_unsafe_write_mem(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<V
 }
 
 fn b_unsafe_read_mem(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    require_unsafe(i, "raw memory access", span)?;
     let addr = mem_addr(&args, span)?;
     let value = i.unsafe_mem.get(&addr).copied().unwrap_or(0);
     one(Value::Number(value as f64))
+}
+
+/// `unsafe_alloc(bytes)`: reserves a fresh region of the simulated address
+/// space and returns its base address.  The native backend allocates a real
+/// zeroed buffer; the sandbox hands out cell-aligned virtual addresses.
+fn b_unsafe_alloc(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    require_unsafe(i, "`unsafe_alloc`", span)?;
+    let bytes = need_num(get(&args, 0, "bytes", span)?, "bytes", span)?;
+    if !bytes.is_finite() || bytes < 0.0 {
+        return Err(LusaError::new(E_NUM, Some(span), "unsafe_alloc size must be a non-negative number"));
+    }
+    let base = i.unsafe_alloc_next;
+    // 16 cells per allocation keeps the sandbox deterministic and roomy.
+    i.unsafe_alloc_next = i.unsafe_alloc_next.saturating_add(64).max(base + 64);
+    one(Value::Number(base as f64))
+}
+
+/// `unsafe_nop()` - a portable no-op intrinsic.  The native backend lowers it
+/// to a compiler barrier/nop; the sandbox treats it as a plain no-op.
+fn b_unsafe_nop(i: &mut Interp, _args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    require_unsafe(i, "`unsafe_nop`", span)?;
+    Ok(Vec::new())
+}
+
+/// `unsafe_asm("text")` - inline assembly hook.  The native backend forwards
+/// the string to the host compiler (`__asm__ __volatile__` on GCC/Clang); the
+/// dynamic sandbox ignores it and never executes real instructions.
+fn b_unsafe_asm(i: &mut Interp, _args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    require_unsafe(i, "`unsafe_asm`", span)?;
+    Ok(Vec::new())
 }
 
 /// `io_read_file(path)`: reads a UTF-8 text file and returns its contents.
@@ -509,6 +553,9 @@ pub fn all() -> Vec<(&'static str, BF)> {
         ("unsafe_ptr_cast", Box::new(b_unsafe_ptr_cast)),
         ("unsafe_write_mem", Box::new(b_unsafe_write_mem)),
         ("unsafe_read_mem", Box::new(b_unsafe_read_mem)),
+        ("unsafe_alloc", Box::new(b_unsafe_alloc)),
+        ("unsafe_nop", Box::new(b_unsafe_nop)),
+        ("unsafe_asm", Box::new(b_unsafe_asm)),
         ("io_read_file", Box::new(b_io_read_file)),
         ("io_write_binary", Box::new(b_io_write_binary)),
         ("io_read_binary", Box::new(b_io_read_binary)),

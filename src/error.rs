@@ -128,6 +128,14 @@ pub const E_MUT_IMMUT: &str = "E1004"; // mutate through immutable borrow
 #[allow(dead_code)]
 pub const E_MOVE_ALIAS: &str = "E1005";
 
+// raw pointer rules (C11 backend and dynamic emulation)
+/// raw pointer arithmetic outside an `unsafe` block
+pub const E_PTR_ARITH: &str = "E0320";
+/// raw pointer dereference outside an `unsafe` block
+pub const E_PTR_DEREF: &str = "E0321";
+/// write through a `*const` pointer
+pub const E_PTR_CONST: &str = "E0322";
+
 // runtime type errors
 pub const E_ARITH: &str = "E2001";
 pub const E_CONCAT: &str = "E2002";

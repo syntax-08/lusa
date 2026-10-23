@@ -38,6 +38,7 @@ pub enum TokenKind {
     Repeat,
     Until,
     Unsafe,
+    Struct,
     Return,
     Break,
     And,
@@ -57,6 +58,9 @@ pub enum TokenKind {
     Dot,
     DotDotDot,
     Len, // `#`
+    /// `*` at the start of a line - begins a pointer dereference instead of
+    /// continuing a multiplication.
+    StarLine,
     Eq,
     Ne,
     Lt,
@@ -106,6 +110,7 @@ impl Token {
             TokenKind::Repeat => "`repeat`".into(),
             TokenKind::Until => "`until`".into(),
             TokenKind::Unsafe => "`unsafe`".into(),
+            TokenKind::Struct => "`struct`".into(),
             TokenKind::Return => "`return`".into(),
             TokenKind::Break => "`break`".into(),
             TokenKind::And => "`and`".into(),
@@ -124,6 +129,7 @@ impl Token {
             TokenKind::Dot => "`.`".into(),
             TokenKind::DotDotDot => "`...`".into(),
             TokenKind::Len => "`#`".into(),
+            TokenKind::StarLine => "`*`".into(),
             TokenKind::Eq => "`==`".into(),
             TokenKind::Ne => "`~=`".into(),
             TokenKind::Lt => "`<`".into(),

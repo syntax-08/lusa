@@ -163,6 +163,9 @@ pub enum Instr {
     JumpIfFalse(i32),     // pops tested value
     JumpIfTrueKeep(i32),  // peeks: true keeps (or), false pops
     JumpIfFalseKeep(i32), // peeks: false keeps (and), true pops
+    // `unsafe do ... end` depth tracking for the pointer sandbox
+    UnsafeEnter,
+    UnsafeLeave,
     // stack-value fixups
     TruncateToOne, // keep the FIRST of the last_ret values (Lua rule)
     DropValues,    // statement calls: discard last_ret values
@@ -305,6 +308,9 @@ struct Compiler {
     frames: Vec<Frame>,
     /// Shared by every chunk produced from this source file.
     source: Arc<SourceMap>,
+    /// `struct` declarations seen so far (declaration order matters, like
+    /// the interpreter's runtime registration).
+    struct_defs: HashMap<String, Vec<(String, String)>>,
 }
 
 impl Frame {
@@ -768,6 +774,21 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
             c.patch(skip, end);
         }
         ExprKind::Un { op, e: inner } => {
+            if matches!(op, UnOp::Deref) {
+                // `*ptr` reads a simulated memory cell through the builtin,
+                // so the VM enforces the same `unsafe` sandbox as the
+                // interpreter (checked inside the builtin).
+                let callee = Expr {
+                    kind: ExprKind::Var(Box::new("unsafe_read_mem".to_string())),
+                    span: e.span,
+                };
+                compile_expr(c, &callee)?;
+                compile_expr(c, inner)?;
+                truncate_if_expansion(c, inner);
+                c.set_line(e.span);
+                c.em(Instr::CallOne(1, 0));
+                return Ok(());
+            }
             compile_expr(c, inner)?;
             truncate_if_expansion(c, inner);
             c.set_line(e.span);
@@ -775,6 +796,7 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
                 UnOp::Neg => Instr::Neg,
                 UnOp::Not => Instr::Not,
                 UnOp::Len => Instr::Len,
+                UnOp::Deref => unreachable!("handled above"),
             });
         }
         ExprKind::Borrow { .. } => {
@@ -1007,7 +1029,23 @@ fn compile_block(c: &mut Compiler, block: &Block) -> LResult<()> {
 fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
     c.set_line(st.span);
     match &st.kind {
-        StKind::Local { targets, values } => compile_local(c, targets, values, st.span)?,
+        StKind::Local { targets, values, annotations } => {
+            compile_local(c, targets, values, annotations, st.span)?
+        }
+        StKind::Struct { name, fields } => {
+            let list = fields
+                .iter()
+                .map(|f| (f.name.clone(), f.ty.clone()))
+                .collect::<Vec<_>>();
+            c.struct_defs.insert(name.clone(), list);
+        }
+        StKind::Unsafe { body } => {
+            c.set_line(st.span);
+            c.em(Instr::UnsafeEnter);
+            compile_block(c, body)?;
+            c.set_line(st.span);
+            c.em(Instr::UnsafeLeave);
+        }
         StKind::Assign { targets, values } => compile_assign(c, targets, values, st.span)?,
         StKind::ExprSt(e) => {
             compile_expr(c, e)?;
@@ -1054,7 +1092,13 @@ fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
 
 /// `local a, b = v1, v2`: values first, then fresh slots (Lua rule: the value
 /// expressions see enclosing variables of the same name).
-fn compile_local(c: &mut Compiler, targets: &[String], values: &[Expr], span: Span) -> LResult<()> {
+fn compile_local(
+    c: &mut Compiler,
+    targets: &[String],
+    values: &[Expr],
+    annotations: &[Option<String>],
+    span: Span,
+) -> LResult<()> {
     c.set_line(span);
     c.em(Instr::SegStart);
     // slots pre-declared before their value (`local function f()` recursion)
@@ -1073,6 +1117,35 @@ fn compile_local(c: &mut Compiler, targets: &[String], values: &[Expr], span: Sp
         let _ = compile_take_value(c, v, dest, false)?;
         if i + 1 < n {
             truncate_if_expansion(c, v);
+        }
+    }
+    // Locals without an initializer default to nil; struct and raw-pointer
+    // annotations get their zero values (matching the interpreter's sandbox).
+    for i in values.len()..targets.len() {
+        match annotations.get(i).and_then(|a| a.as_deref()) {
+            Some(ann) if ann.starts_with('*') => {
+                let k = c.konst(&ConstKey::Num(0.0f64.to_bits()));
+                let _ = c.em(Instr::LoadConst(k));
+            }
+            Some(ann) if c.struct_defs.contains_key(ann) => {
+                c.em(Instr::NewTable);
+                let fields = c.struct_defs.get(ann).cloned().unwrap_or_default();
+                for (fname, ty) in &fields {
+                    let name_k = c.konst_str(fname);
+                    let zero = if ty == "bool" {
+                        ConstKey::Bool(false)
+                    } else {
+                        ConstKey::Num(0.0f64.to_bits())
+                    };
+                    let zero_k = c.konst(&zero);
+                    c.em(Instr::LoadConst(name_k));
+                    c.em(Instr::LoadConst(zero_k));
+                    c.em(Instr::SetIndex);
+                }
+            }
+            _ => {
+                let _ = c.em(Instr::LoadNil);
+            }
         }
     }
     // bind targets to slots — fresh for plain locals, reusing the pre-declared
@@ -1100,6 +1173,22 @@ fn compile_assign(c: &mut Compiler, targets: &[Expr], values: &[Expr], span: Spa
     // to account for multi-value groups, but here it only costs three extra
     // instructions. Emit a direct store instead (the hot loop assignment path).
     if targets.len() == 1 && values.len() == 1 && !is_expansion(&values[0]) {
+        if let ExprKind::Un { op: UnOp::Deref, e } = &targets[0].kind {
+            // `*ptr = value` - a simulated-memory write through the builtin.
+            let callee = Expr {
+                kind: ExprKind::Var(Box::new("unsafe_write_mem".to_string())),
+                span: targets[0].span,
+            };
+            compile_expr(c, &callee)?;
+            compile_expr(c, e)?;
+            truncate_if_expansion(c, e);
+            let dest = format!("`*ptr` (deref)");
+            let _ = compile_take_value(c, &values[0], &dest, false)?;
+            c.set_line(targets[0].span);
+            c.em(Instr::CallOne(2, 0));
+            c.em(Instr::DropValues);
+            return Ok(());
+        }
         if let ExprKind::Var(name) = &targets[0].kind {
             let dest = format!("`{}`", name);
             let _ = compile_take_value(c, &values[0], &dest, false)?;
@@ -1400,6 +1489,7 @@ pub fn compile_program(src: &str) -> LResult<Rc<Compiled>> {
     let c = &mut Compiler {
         frames: vec![Frame::new("main", None)],
         source,
+        struct_defs: HashMap::new(),
     };
     {
         let f = c.cur();

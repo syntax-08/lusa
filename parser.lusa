@@ -86,6 +86,7 @@ local parse_repeat
 local parse_for
 local parse_do
 local parse_unsafe
+local parse_struct
 local parse_return
 local parse_break
 local parse_assign_or_call
@@ -366,6 +367,17 @@ parse_type = function()
         return "table<" .. element .. ">"
     end
 
+    if at_value("*") then
+        advance()
+        local qualifier = expect_name()
+        if qualifier ~= "mut" and qualifier ~= "const" then
+            fail("expected `mut` or `const` after `*` in a pointer type, found `"
+                .. tostring(qualifier) .. "`")
+        end
+        local element = expect_name()
+        return "*" .. qualifier .. " " .. element
+    end
+
     if peek_kind() ~= "name" then
         fail("expected a type name, found " .. describe_token())
     end
@@ -619,6 +631,42 @@ parse_unsafe = function()
     }
 end
 
+parse_struct = function()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- struct
+
+    local name = expect_name()
+    expect_value("{", "`{` to open the struct fields")
+    local fields = {}
+    while not at_value("}") do
+        local field_line = peek_line()
+        local field_column = peek_column()
+        local field_name = expect_name()
+        expect_value(":", "`:` after the field name")
+        local field_type = parse_type()
+        fields[#fields + 1] = {
+            name = field_name,
+            type = field_type,
+            line = field_line,
+            column = field_column
+        }
+        if not at_value(",") and not at_value(";") then
+            break
+        end
+        advance()
+    end
+    expect_value("}", "`}` to close the struct")
+
+    return {
+        tag = "Struct",
+        name = name,
+        fields = fields,
+        line = line,
+        column = column
+    }
+end
+
 parse_return = function()
     local line = peek_line()
     local column = peek_column()
@@ -669,9 +717,10 @@ parse_assign_or_call = function()
         local target_count = #targets
         local i = 1
         while i <= target_count do
-            if targets[i].tag ~= "Name" and targets[i].tag ~= "Field" then
+            if targets[i].tag ~= "Name" and targets[i].tag ~= "Field"
+                and targets[i].tag ~= "Deref" then
                 fail_at(targets[i].line, targets[i].column,
-                    "invalid assignment target (expected a name or field)")
+                    "invalid assignment target (expected a name, field, or dereference)")
             end
             i = i + 1
         end
@@ -724,8 +773,12 @@ parse_stmt = function()
             return parse_break()
         elseif value == "for" then
             return parse_for()
+        elseif value == "struct" then
+            return parse_struct()
         end
     elseif kind == "name" then
+        return parse_assign_or_call()
+    elseif kind == "operator" and value == "*" then
         return parse_assign_or_call()
     end
 
@@ -753,6 +806,14 @@ subexpr = function(limit)
         local value = peek_value()
         local precedence = 0
         local right_assoc = false
+
+        -- A `*` at the start of a line is a pointer dereference, not the
+        -- continuation of a multiplication.
+        if value == "*" and pos > 1 and tokens[pos].line ~= nil
+            and tokens[pos - 1].line ~= nil
+            and tokens[pos].line > tokens[pos - 1].line then
+            break
+        end
 
         if kind == "keyword" and value == "or" then
             precedence = 1
@@ -883,7 +944,7 @@ parse_prefix = function()
     local column = peek_column()
 
     local is_unary = false
-    if kind == "operator" and (value == "-" or value == "#") then
+    if kind == "operator" and (value == "-" or value == "#" or value == "*") then
         is_unary = true
     elseif kind == "keyword" and (value == "not" or value == "borrow" or value == "clone") then
         is_unary = true
@@ -897,6 +958,8 @@ parse_prefix = function()
             tag = "Borrow"
         elseif value == "clone" then
             tag = "Clone"
+        elseif value == "*" then
+            tag = "Deref"
         end
         local node = {
             tag = tag,

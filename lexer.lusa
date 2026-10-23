@@ -55,6 +55,7 @@ local KEYWORDS = {
     ["repeat"] = true,
     ["until"] = true,
     ["unsafe"] = true,
+    ["struct"] = true,
     ["return"] = true,
     ["break"] = true,
     ["and"] = true,

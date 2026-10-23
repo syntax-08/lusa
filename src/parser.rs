@@ -167,13 +167,14 @@ impl Parser {
             TK::Unsafe => {
                 self.bump();
                 // `unsafe do ... end` and the shorter `unsafe ... end` both
-                // work.  The dynamic engines execute the block normally; raw
-                // pointer intrinsics use their simulated-memory builtins.
+                // work.  The dynamic engines track the block so raw pointer
+                // dereferences and intrinsics can enforce their sandbox rules.
                 self.eat(TK::Do);
                 let body = self.parse_block()?;
                 self.expect(TK::End, "`end` to close the `unsafe` block")?;
-                St { kind: StKind::Do { body }, span: tk.span }
+                St { kind: StKind::Unsafe { body }, span: tk.span }
             }
+            TK::Struct => self.parse_struct_st()?,
             TK::Function => self.parse_func_st()?,
             TK::Break => {
                 self.bump();
@@ -186,6 +187,7 @@ impl Parser {
                 St { kind: StKind::ExprSt(e), span: tk.span }
             }
             TK::Name(_) => self.parse_assign_or_expr()?,
+            TK::Star | TK::StarLine => self.parse_assign_or_expr()?,
             other => {
                 let tk = self.peek().clone();
                 let _ = other;
@@ -207,10 +209,13 @@ impl Parser {
             while self.eat(TK::Comma) {
                 let t = self.parse_prefix()?;
                 match &t.kind {
-                    ExprKind::Var(_) | ExprKind::Field { .. } | ExprKind::Index { .. } => {}
+                    ExprKind::Var(_)
+                    | ExprKind::Field { .. }
+                    | ExprKind::Index { .. }
+                    | ExprKind::Un { op: UnOp::Deref, .. } => {}
                     _ => {
                         return Err(LusaError::new(E_PARSE, Some(t.span), "invalid assignment target")
-                            .help("valid targets are names (`x`), fields (`t.k`) and indices (`t[k]`)"));
+                            .help("valid targets are names (`x`), fields (`t.k`), indices (`t[k]`) and dereferences (`*ptr`)"));
                     }
                 }
                 targets.push(t);
@@ -220,10 +225,13 @@ impl Parser {
             let end = values.last().map(|e| e.span).unwrap_or(start);
             for t in &targets {
                 match &t.kind {
-                    ExprKind::Var(_) | ExprKind::Field { .. } | ExprKind::Index { .. } => {}
+                    ExprKind::Var(_)
+                    | ExprKind::Field { .. }
+                    | ExprKind::Index { .. }
+                    | ExprKind::Un { op: UnOp::Deref, .. } => {}
                     _ => {
                         return Err(LusaError::new(E_PARSE, Some(t.span), "invalid assignment target")
-                            .help("valid targets are names (`x`), fields (`t.k`) and indices (`t[k]`)"));
+                            .help("valid targets are names (`x`), fields (`t.k`), indices (`t[k]`) and dereferences (`*ptr`)"));
                     }
                 }
             }
@@ -245,21 +253,54 @@ impl Parser {
         Ok(St { kind: StKind::ExprSt(first), span: first_span })
     }
 
-    /// Consumes a runtime-irrelevant type annotation.  The dynamic engines
-    /// deliberately ignore `u32`, `i128`, `[T]`, `table<T>` and friends; the
-    /// C11 backend performs the actual static checking.
-    fn parse_type_annotation(&mut self) -> LResult<()> {
+    /// Consumes a type annotation and returns its spelling.  The dynamic
+    /// engines use it for the struct/pointer emulation layer; the C11 backend
+    /// performs the actual static checking on the same spellings.
+    fn parse_type_annotation(&mut self) -> LResult<String> {
         if self.eat(TK::LBracket) {
-            self.parse_type_annotation()?;
+            let element = self.parse_type_annotation()?;
             self.expect(TK::RBracket, "`]` to close the table type")?;
-            return Ok(());
+            return Ok(format!("table<{element}>"));
+        }
+        if self.eat(TK::Star) {
+            let (qual, _) = self.expect_name()?;
+            if qual != "mut" && qual != "const" {
+                return Err(LusaError::new(
+                    E_PARSE,
+                    Some(self.toks[self.pos - 1].span),
+                    format!("expected `mut` or `const` after `*` in a pointer type, found `{qual}`"),
+                ));
+            }
+            let (elem, _) = self.expect_name()?;
+            return Ok(format!("*{qual} {elem}"));
         }
         let (name, _) = self.expect_name()?;
         if name == "table" && self.eat(TK::Lt) {
-            self.parse_type_annotation()?;
+            let inner = self.parse_type_annotation()?;
             self.expect(TK::Gt, "`>` to close the table type")?;
+            return Ok(format!("table<{inner}>"));
         }
-        Ok(())
+        Ok(name)
+    }
+
+    fn parse_struct_st(&mut self) -> LResult<St> {
+        let kw = self.bump();
+        let (name, name_span) = self.expect_name()?;
+        self.expect(TK::LBrace, "`{` to open the struct fields")?;
+        let mut fields = Vec::new();
+        while !self.at(TK::RBrace) {
+            let (fname, fspan) = self.expect_name()?;
+            self.expect(TK::Colon, "`:` after the field name")?;
+            let ty = self.parse_type_annotation()?;
+            fields.push(StructField { name: fname, ty, span: fspan });
+            if !self.eat(TK::Comma) && !self.at(TK::Semi) {
+                break;
+            }
+            self.eat(TK::Semi);
+        }
+        self.expect(TK::RBrace, "`}` to close the struct")?;
+        let span = merge(kw.span, name_span);
+        Ok(St { kind: StKind::Struct { name, fields }, span })
     }
 
     fn parse_local_st(&mut self) -> LResult<St> {
@@ -270,27 +311,35 @@ impl Parser {
             let func = self.parse_funclit()?;
             let fexpr = Expr { kind: ExprKind::Func(func), span: merge(kw.span, span) };
             return Ok(St {
-                kind: StKind::Local { targets: vec![name], values: vec![fexpr] },
+                kind: StKind::Local {
+                    targets: vec![name],
+                    values: vec![fexpr],
+                    annotations: vec![None],
+                },
                 span: kw.span,
             });
         }
         let (n0, _) = self.expect_name()?;
-        if self.eat(TK::Colon) {
-            self.parse_type_annotation()?;
-        }
+        let mut annotations = vec![if self.eat(TK::Colon) {
+            Some(self.parse_type_annotation()?)
+        } else {
+            None
+        }];
         let mut targets = vec![n0];
         while self.eat(TK::Comma) {
             let (n, _) = self.expect_name()?;
-            if self.eat(TK::Colon) {
-                self.parse_type_annotation()?;
-            }
+            annotations.push(if self.eat(TK::Colon) {
+                Some(self.parse_type_annotation()?)
+            } else {
+                None
+            });
             targets.push(n);
         }
         let mut values = Vec::new();
         if self.eat(TK::Assign) {
             values = self.parse_exprlist()?;
         }
-        Ok(St { kind: StKind::Local { targets, values }, span: kw.span })
+        Ok(St { kind: StKind::Local { targets, values, annotations }, span: kw.span })
     }
 
     fn parse_if(&mut self) -> LResult<St> {
@@ -398,7 +447,7 @@ impl Parser {
         Ok(St { kind: StKind::FuncSt { target, func }, span: kw.span })
     }
 
-    /// parses `(params) body end` — the `function` keyword and optional name were consumed.
+    /// parses `(params) body end` â€” the `function` keyword and optional name were consumed.
     fn parse_funclit(&mut self) -> LResult<FuncLit> {
         self.parse_funclit_from(Vec::new())
     }
@@ -415,7 +464,7 @@ impl Parser {
                 }
                 let (n, _) = self.expect_name()?;
                 if self.eat(TK::Colon) {
-                    self.parse_type_annotation()?;
+                    let _ = self.parse_type_annotation()?;
                 }
                 params.push(n);
                 if !self.eat(TK::Comma) {
@@ -425,7 +474,7 @@ impl Parser {
         }
         self.expect(TK::RParen, "`)`")?;
         if self.eat(TK::Colon) {
-            self.parse_type_annotation()?;
+            let _ = self.parse_type_annotation()?;
         }
         let body = self.parse_block()?;
         let end = self.expect(TK::End, "`end` to close the `function`")?;
@@ -470,6 +519,11 @@ impl Parser {
         let mut lhs = self.parse_prefix()?;
         loop {
             let tk = self.peek().clone();
+            // A `*` at the start of a line is a dereference, not a
+            // continuation of a multiplication.
+            if tk.kind == TK::StarLine {
+                break;
+            }
             let (prec, right) = match tk.kind {
                 TK::Or => (PREC_OR, false),
                 TK::And => (PREC_AND, false),
@@ -510,7 +564,7 @@ impl Parser {
     fn parse_prefix(&mut self) -> LResult<Expr> {
         let tk = self.peek().clone();
         match tk.kind {
-            TK::Not | TK::Minus | TK::Len | TK::Borrow | TK::Clone => {
+            TK::Not | TK::Minus | TK::Len | TK::Star | TK::StarLine | TK::Borrow | TK::Clone => {
                 let op = tk.kind.clone();
                 self.bump();
                 let e = self.subexpr(PREC_UNARY)?;
@@ -519,6 +573,7 @@ impl Parser {
                     TK::Not => ExprKind::Un { op: UnOp::Not, e: Box::new(e) },
                     TK::Minus => ExprKind::Un { op: UnOp::Neg, e: Box::new(e) },
                     TK::Len => ExprKind::Un { op: UnOp::Len, e: Box::new(e) },
+                    TK::Star | TK::StarLine => ExprKind::Un { op: UnOp::Deref, e: Box::new(e) },
                     TK::Borrow => ExprKind::Borrow { e: Box::new(e), is_mut: false },
                     _ => ExprKind::Clone { e: Box::new(e) },
                 };
@@ -533,7 +588,7 @@ impl Parser {
         }
     }
 
-    /// suffixes (for the leftmost expression only — calls, fields, indexes)
+    /// suffixes (for the leftmost expression only â€” calls, fields, indexes)
     fn parse_suffixes_applicable(&mut self, mut e: Expr) -> LResult<Expr> {
         loop {
             let t = self.peek().clone();

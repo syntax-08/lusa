@@ -1,0 +1,35 @@
+-- Module 11 example: static structs, raw pointers, and kernel intrinsics.
+--   lusalang run examples/structs_pointers.lusa
+--   lusalang run examples/structs_pointers.lusa --vm
+--   lusalang build examples/structs_pointers.lusa
+
+struct RegisterBank {
+    control: u32,
+    data: i32,
+    status: u32,
+}
+
+local bank: RegisterBank
+bank.control = 7
+bank.data = -3
+
+unsafe do
+    -- A real zeroed buffer in native builds; a virtual region in the
+    -- interpreter and VM sandbox.
+    local regs: *mut u32 = unsafe_alloc(64)
+
+    unsafe_write_mem(regs, 11)
+    local v: u32 = unsafe_read_mem(regs)
+
+    -- Pointer arithmetic scales by the element size in C; the sandbox steps
+    -- one cell per element, so both engines observe the same values.
+    *(regs + 1) = 9
+    local w: u32 = *(regs + 1)
+    *(regs + 2) = *(regs) + *(regs + 1)
+
+    unsafe_nop()
+    print("inside:", bank.control, bank.data, v, w, *(regs + 2))
+end
+
+print("outside:", bank.control, bank.status)
+return 0

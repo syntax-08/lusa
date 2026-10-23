@@ -377,13 +377,16 @@ The detailed engineering plan lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 Near-term milestones:
 
-- **v0.7.0:** native `pcall` and coroutines, with the same error contract as
+- **v0.7.0 (shipped):** static `struct` declarations, raw pointer types with
+  arithmetic and volatile dereferences inside `unsafe`, kernel intrinsics
+  (`unsafe_nop`, `unsafe_asm`, `unsafe_alloc`), and safe sandbox emulation in
   the interpreter and bytecode VM.
-- **v0.8.0:** Lua-style string patterns (`find`, `match`, `gmatch`, `gsub`)
+- **v0.8.0:** native `pcall` and coroutines, with the same error contract as
+  the interpreter and bytecode VM.
+- **v0.9.0:** Lua-style string patterns (`find`, `match`, `gmatch`, `gsub`)
   backed by one matcher shared across engines.
-- **v0.9.0:** a compile-time borrow checker plus explicit `move`/`copy`
-  labels and golden diagnostics.
-- **v1.0.0:** language stabilization.
+- **v1.0.0:** a compile-time borrow checker plus explicit `move`/`copy`
+  labels, golden diagnostics, and language stabilization.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

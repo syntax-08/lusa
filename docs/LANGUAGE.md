@@ -278,6 +278,9 @@ Codes `E{category}{n}`, like rustc:
 | E0316  | unsafe   | C11 backend: raw pointer intrinsic used outside `unsafe` |
 | E0318  | static   | C11 backend: missing method or invalid method receiver |
 | E0319  | static   | C11 backend: unsupported generic `for` iterator |
+| E0320  | unsafe   | raw pointer arithmetic outside an `unsafe` block |
+| E0321  | unsafe   | raw pointer dereference outside an `unsafe` block |
+| E0322  | unsafe   | write through a `*const` pointer |
 | E9000  | runtime  | `error(msg)` |
 | E9100  | runtime  | `assert(false, msg)` |
 | E9999  | runtime  | internal error (umbrella; includes stack overflow for calls > 200 — catchable with `pcall`) |
@@ -463,13 +466,71 @@ end
 `ipairs` values retain their array element type. Per-iteration locals are
 dropped by the normal RAII scope machinery.
 
-### 9.5 Native subset limits
+### 9.5 Static structs and raw pointers (Module 11)
+
+`struct` declarations give the native backend rigid, compile-time layouts.
+Each field is a scalar (`u32`, `i32`, `f32`, `bool`) or a raw pointer type;
+the declaration becomes a plain C typedef, and field access compiles to a
+direct member access with zero hashing or lookup overhead:
+
+```lusa
+struct RegisterBank { control: u32, data: i32, status: u32 }
+
+local bank: RegisterBank
+bank.control = 7
+bank.data = -3
+print(bank.control)          -- (bank).control in C
+```
+
+Raw pointer types follow the Rust spelling:
+
+```lusa
+local regs: *mut u32 = 0x1000   -- volatile uint32_t *
+local rom:  *const u32 = 0x2000 -- const volatile uint32_t *
+```
+
+Pointer arithmetic and dereferences are only legal inside `unsafe do ... end`;
+outside it they report `E0320` (arithmetic) and `E0321` (dereference):
+
+```lusa
+unsafe do
+    local p: *mut u32 = unsafe_alloc(64)
+    *(p + 1) = 9                 -- volatile write, scales by sizeof(u32)
+    print(*(p + 1))              -- volatile read
+end
+```
+
+Writes through a `*const` pointer are rejected with `E0322`. `unsafe_alloc(n)`
+returns a zeroed `n`-byte buffer tracked by the generated runtime and freed
+before the program exits. The kernel-level intrinsics lower to compiler
+hooks: `unsafe_nop()` becomes a `nop`/`__nop()` and `unsafe_asm("text")`
+becomes `__asm__ __volatile__(text)` on GCC/Clang (a compiler barrier on
+toolchains without inline assembly):
+
+```lusa
+unsafe do
+    unsafe_nop()
+    unsafe_asm("wfe")
+end
+```
+
+The interpreter and `--vm` emulate the same source safely: structs become
+fixed-field buffers, raw pointers are indices into a simulated address space,
+and `unsafe_alloc` hands out virtual regions. `unsafe_nop`/`unsafe_asm` are
+sandboxed no-ops, and dereferencing outside `unsafe` still reports `E0321`,
+so bare-metal logic can be debugged before native compilation.
+
+### 9.6 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 array/keyed table literals, nested keyed tables, field reads/writes, colon
 methods, `pairs`/`ipairs` generic `for`, one-based array indexing, `#`, `if`,
 `while`, `repeat`, `do`, `return`, `break`, assignments, globals, `print`,
-`clone`, `borrow`, `unsafe` blocks, and the raw intrinsics above.
+`clone`, `borrow`, `unsafe` blocks, static `struct` declarations, raw pointer
+types (`*mut u32`, `*const u32`, `*mut i32`, `*const i32`), pointer arithmetic
+and volatile dereferences inside `unsafe`, and the raw intrinsics above
+(`unsafe_ptr_cast`, `unsafe_read_mem`, `unsafe_write_mem`, `unsafe_alloc`,
+`unsafe_nop`, `unsafe_asm`).
 
 Not supported by the C emitter: numeric `for`, arbitrary dynamic key
 construction in table literals, assignment through a dynamic index, varargs,

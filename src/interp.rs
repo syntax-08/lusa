@@ -17,6 +17,14 @@ use crate::value::{
 
 pub const MAX_CALL_DEPTH: usize = 200;
 
+/// A registered `struct` declaration, used by the safe emulation layer.
+#[derive(Clone, Debug)]
+pub struct StructDef {
+    pub name: String,
+    /// (field name, type annotation)
+    pub fields: Vec<(String, String)>,
+}
+
 /// A storage location for a variable name.
 pub struct SlotLoc {
     pub scope: ScopeRef,
@@ -32,6 +40,12 @@ pub struct Interp {
     /// Safe simulation of `unsafe_write_mem`/`unsafe_read_mem`.  Addresses are
     /// process-local keys; the dynamic engines never dereference real memory.
     pub unsafe_mem: HashMap<u64, u32>,
+    /// nesting depth of `unsafe do ... end` blocks (enforced in both engines)
+    pub unsafe_depth: usize,
+    /// `struct` declarations registered by the running program.
+    pub struct_defs: HashMap<String, StructDef>,
+    /// next simulated base address handed out by `unsafe_alloc`
+    pub unsafe_alloc_next: u64,
 }
 
 pub struct Frame {
@@ -71,6 +85,9 @@ impl Interp {
             depth: 0,
             vm: crate::vm::Vm::new(),
             unsafe_mem: HashMap::new(),
+            unsafe_depth: 0,
+            struct_defs: HashMap::new(),
+            unsafe_alloc_next: 0x1000,
         }
     }
 
@@ -411,8 +428,24 @@ impl Interp {
 
     fn exec_st(&mut self, frame: &mut Frame, st: &St) -> LResult<bool> {
         match &st.kind {
-            StKind::Local { targets, values } => self.exec_local(frame, targets, values, st.span),
+            StKind::Local { targets, values, annotations } => {
+                self.exec_local(frame, targets, values, annotations, st.span)
+            }
             StKind::Assign { targets, values } => self.exec_assign(frame, targets, values),
+            StKind::Struct { name, fields } => {
+                let def = StructDef {
+                    name: name.clone(),
+                    fields: fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
+                };
+                self.struct_defs.insert(name.clone(), def);
+                Ok(true)
+            }
+            StKind::Unsafe { body } => {
+                self.unsafe_depth += 1;
+                let result = self.exec_block(frame, body);
+                self.unsafe_depth -= 1;
+                result
+            }
             StKind::ExprSt(e) => {
                 eval::eval_discard(self, frame, e, st.span)?;
                 Ok(true)
@@ -732,14 +765,43 @@ impl Interp {
         frame: &mut Frame,
         targets: &[String],
         values: &[Expr],
+        annotations: &[Option<String>],
         span: Span,
     ) -> LResult<bool> {
-        let vals = self.eval_aligned_values(frame, targets, values)?;
+        let mut vals = self.eval_aligned_values(frame, targets, values)?;
+        for i in 0..targets.len() {
+            let is_nil = matches!(vals[i], Value::Nil);
+            if !is_nil {
+                continue;
+            }
+            if let Some(ann) = annotations.get(i).and_then(|a| a.as_deref()) {
+                if ann.starts_with('*') {
+                    // raw pointer: a cell index into the simulated address space
+                    vals[i] = Value::Number(0.0);
+                } else if self.struct_defs.contains_key(ann) {
+                    // static struct: a fixed-field simulated buffer
+                    if let Some(v) = self.default_struct_value(ann) {
+                        vals[i] = v;
+                    }
+                }
+            }
+        }
         for (name, v) in targets.iter().zip(vals.into_iter()) {
             self.rename_to_owner(&v, name, span);
             self.var_declare(frame, name, SlotV::Set(v));
         }
         Ok(true)
+    }
+
+    /// Builds a zero-initialized struct instance for the dynamic engines.
+    fn default_struct_value(&self, name: &str) -> Option<Value> {
+        let def = self.struct_defs.get(name)?;
+        let table = TableObj::new();
+        for (fname, ty) in &def.fields {
+            let zero = if ty == "bool" { Value::Bool(false) } else { Value::Number(0.0) };
+            let _ = table.set(Value::Str(Arc::from(fname.as_str())), zero);
+        }
+        Some(Value::Table(Rc::new(table)))
     }
 
     fn exec_assign(
@@ -754,6 +816,7 @@ impl Interp {
         enum Dst {
             Var(String),
             Field { obj: Value, key: Value, desc: String, span: Span },
+            Deref { addr: u64, desc: String, span: Span },
         }
         let mut dsts: Vec<Dst> = Vec::with_capacity(targets.len());
         for t in targets {
@@ -769,6 +832,10 @@ impl Interp {
                     let k = crate::eval::eval_key(self, frame, key)?;
                     dsts.push(Dst::Field { obj: o, key: k, desc: label_of(t), span: t.span });
                 }
+                ExprKind::Un { op: UnOp::Deref, e } => {
+                    let addr = crate::eval::eval_deref_addr(self, frame, e, t.span)?;
+                    dsts.push(Dst::Deref { addr, desc: label_of(t), span: t.span });
+                }
                 _ => unreachable!("parser validates assignment targets"),
             }
         }
@@ -777,6 +844,7 @@ impl Interp {
             .map(|d| match d {
                 Dst::Var(n) => n.clone(),
                 Dst::Field { desc, .. } => desc.clone(),
+                Dst::Deref { desc, .. } => desc.clone(),
             })
             .collect();
         let vals = self.eval_aligned_values(frame, &desc, values)?;
@@ -803,6 +871,33 @@ impl Interp {
                 }
                 Dst::Field { obj, key, desc, span } => {
                     self.write_table_slot(obj, key, v, &desc, span)?;
+                }
+                Dst::Deref { addr, desc, span } => {
+                    if self.unsafe_depth == 0 {
+                        return Err(LusaError::new(
+                            crate::error::E_PTR_DEREF,
+                            Some(span),
+                            "raw pointer dereference requires an `unsafe` block",
+                        )
+                        .note(
+                            format!("wrap the write to `{desc}` in `unsafe do ... end`"),
+                            None,
+                        ));
+                    }
+                    let value = match v.base_value() {
+                        Value::Number(n) => *n as u32,
+                        other => {
+                            return Err(LusaError::new(
+                                crate::error::E_RUNTIME,
+                                Some(span),
+                                format!(
+                                    "cannot store a {} value through a raw pointer",
+                                    other.type_name()
+                                ),
+                            ))
+                        }
+                    };
+                    self.unsafe_mem.insert(addr, value);
                 }
             }
         }

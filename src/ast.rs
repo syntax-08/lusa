@@ -13,9 +13,21 @@ pub struct St {
 #[derive(Clone, Debug)]
 pub enum StKind {
     /// `local` declarations
-    Local { targets: Vec<String>, values: Vec<Expr> },
+    Local {
+        targets: Vec<String>,
+        values: Vec<Expr>,
+        /// static type annotations (`u32`, `*mut u32`, struct names) captured
+        /// for the dynamic engines' safe emulation layer.
+        annotations: Vec<Option<String>>,
+    },
     /// `name = value` and `t.a = value` assignments
     Assign { targets: Vec<Expr>, values: Vec<Expr> },
+    /// `struct Name { field: type, ... }` declaration.  The native backend
+    /// lowers it to a C struct; the dynamic engines simulate it as a
+    /// fixed-field buffer.
+    Struct { name: String, fields: Vec<StructField> },
+    /// `unsafe do ... end` block (raw pointers and intrinsics only).
+    Unsafe { body: Block },
     /// expression statement (usually a call)
     ExprSt(Expr),
     If {
@@ -111,6 +123,15 @@ pub struct TableEntry {
     pub span: Span,
 }
 
+/// A field of a static `struct` declaration.
+#[derive(Clone, Debug)]
+pub struct StructField {
+    pub name: String,
+    /// type annotation string, e.g. `u32` or `*mut u32`.
+    pub ty: String,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug)]
 pub struct FuncLit {
     pub params: Vec<String>,
@@ -148,4 +169,6 @@ pub enum UnOp {
     Neg,
     Not,
     Len,
+    /// raw pointer dereference - `*ptr`
+    Deref,
 }

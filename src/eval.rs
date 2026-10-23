@@ -209,7 +209,7 @@ pub fn eval_expr(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr
         }
         ExprKind::Un { op, e } => {
             let v = eval_expr(interp, frame, e)?;
-            eval_un(*op, v, e.span)
+            eval_un(interp, *op, v, e.span)
         }
         ExprKind::Borrow { e, .. } => {
             let v = eval_expr(interp, frame, e)?;
@@ -255,7 +255,7 @@ pub fn eval_key(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr)
     Ok(k)
 }
 
-fn eval_un(op: UnOp, v: Value, span: Span) -> LResult<Value> {
+fn eval_un(interp: &mut Interp, op: UnOp, v: Value, span: Span) -> LResult<Value> {
     match op {
         UnOp::Not => Ok(Value::Bool(!v.truthy())),
         UnOp::Neg => match v {
@@ -283,6 +283,62 @@ fn eval_un(op: UnOp, v: Value, span: Span) -> LResult<Value> {
                 ),
             )),
         },
+        UnOp::Deref => {
+            if interp.unsafe_depth == 0 {
+                return Err(LusaError::new(
+                    crate::error::E_PTR_DEREF,
+                    Some(span),
+                    "raw pointer dereference requires an `unsafe` block",
+                )
+                .note("wrap the read in `unsafe do ... end`", None));
+            }
+            match v.base_value() {
+                Value::Number(n) => {
+                    let cell = interp.unsafe_mem.get(&(*n as u64)).copied().unwrap_or(0);
+                    Ok(Value::Number(cell as f64))
+                }
+                other => Err(LusaError::new(
+                    crate::error::E_RUNTIME,
+                    Some(span),
+                    format!(
+                        "cannot dereference a {} value ({}) - raw pointers are simulated addresses",
+                        other.type_name(),
+                        other.fmt_value()
+                    ),
+                )),
+            }
+        }
+    }
+}
+
+/// Evaluates a pointer expression to a simulated address for `*ptr = value`,
+/// enforcing the `unsafe` rule on the write itself.
+pub fn eval_deref_addr(
+    interp: &mut Interp,
+    frame: &mut crate::interp::Frame,
+    e: &Expr,
+    span: Span,
+) -> LResult<u64> {
+    if interp.unsafe_depth == 0 {
+        return Err(LusaError::new(
+            crate::error::E_PTR_DEREF,
+            Some(span),
+            "raw pointer dereference requires an `unsafe` block",
+        )
+        .note("wrap the write in `unsafe do ... end`", None));
+    }
+    let v = eval_expr(interp, frame, e)?;
+    match v.base_value() {
+        Value::Number(n) if !n.is_nan() && *n >= 0.0 => Ok(*n as u64),
+        other => Err(LusaError::new(
+            crate::error::E_RUNTIME,
+            Some(span),
+            format!(
+                "raw pointer address must be a non-negative number, found {} ({})",
+                other.type_name(),
+                other.fmt_value()
+            ),
+        )),
     }
 }
 
