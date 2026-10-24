@@ -38,8 +38,10 @@ pub struct Interp {
     /// bytecode VM state (`--vm` runs compile + execute here)
     pub vm: crate::vm::Vm,
     /// Safe simulation of `unsafe_write_mem`/`unsafe_read_mem`.  Addresses are
-    /// process-local keys; the dynamic engines never dereference real memory.
-    pub unsafe_mem: HashMap<u64, u32>,
+    /// process-local keys and values are `f64` cells, so fractional register
+    /// values round-trip without truncation.  The dynamic engines never
+    /// dereference real memory.
+    pub unsafe_mem: HashMap<u64, f64>,
     /// nesting depth of `unsafe do ... end` blocks (enforced in both engines)
     pub unsafe_depth: usize,
     /// `struct` declarations registered by the running program.
@@ -895,7 +897,7 @@ impl Interp {
                         ));
                     }
                     let value = match v.base_value() {
-                        Value::Number(n) => *n as u32,
+                        Value::Number(n) => *n,
                         other => {
                             return Err(LusaError::new(
                                 crate::error::E_RUNTIME,

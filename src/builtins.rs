@@ -152,7 +152,7 @@ fn require_unsafe(interp: &Interp, what: &str, span: Span) -> LResult<()> {
 fn b_unsafe_write_mem(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
     require_unsafe(i, "raw memory access", span)?;
     let addr = mem_addr(&args, span)?;
-    let value = need_num(get(&args, 1, "value", span)?, "value", span)? as u32;
+    let value = need_num(get(&args, 1, "value", span)?, "value", span)?;
     i.unsafe_mem.insert(addr, value);
     Ok(Vec::new())
 }
@@ -160,8 +160,8 @@ fn b_unsafe_write_mem(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<V
 fn b_unsafe_read_mem(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
     require_unsafe(i, "raw memory access", span)?;
     let addr = mem_addr(&args, span)?;
-    let value = i.unsafe_mem.get(&addr).copied().unwrap_or(0);
-    one(Value::Number(value as f64))
+    let value = i.unsafe_mem.get(&addr).copied().unwrap_or(0.0);
+    one(Value::Number(value))
 }
 
 /// `unsafe_alloc(bytes)`: reserves a fresh region of the simulated address

@@ -522,9 +522,10 @@ only with addresses that are valid on the target board/process; the native
 backend intentionally does not add bounds checks or a memory sandbox.
 
 The interpreter and `--vm` give the same source a **safe simulation**: the
-intrinsics read/write a process-local `HashMap<address, u32>` and never
-dereference real memory. This lets developers test register logic before
-compiling:
+intrinsics read/write a process-local `HashMap<address, f64>` and never
+dereference real memory. Cells hold full `f64` values, so fractional register
+values round-trip without truncation; unwritten addresses read as `0`. This
+lets developers test register logic before compiling:
 
 ```sh
 lusalang run hardware_test.lusa

@@ -282,6 +282,11 @@ struct Frame {
     breaks: Vec<Vec<usize>>,
     /// lexical scope depth at each enclosing loop entry
     loop_depths: Vec<usize>,
+    /// number of `unsafe` blocks currently open in this function
+    unsafe_depth: usize,
+    /// `unsafe_depth` at each enclosing loop entry, so `break` can leave only
+    /// the unsafe blocks it actually escapes
+    loop_unsafe_depths: Vec<usize>,
     nparams: usize,
     has_vararg: bool,
 }
@@ -344,6 +349,8 @@ impl Frame {
             decl_groups: Vec::new(),
             breaks: Vec::new(),
             loop_depths: Vec::new(),
+            unsafe_depth: 0,
+            loop_unsafe_depths: Vec::new(),
             nparams: 0,
             has_vararg: false,
         }
@@ -1212,7 +1219,10 @@ fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
         StKind::Unsafe { body } => {
             c.set_line(st.span);
             c.em(Instr::UnsafeEnter);
-            compile_block(c, body)?;
+            c.cur().unsafe_depth += 1;
+            let result = compile_block(c, body);
+            c.cur().unsafe_depth = c.cur().unsafe_depth.saturating_sub(1);
+            result?;
             c.set_line(st.span);
             c.em(Instr::UnsafeLeave);
         }
@@ -1246,6 +1256,19 @@ fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
             c.set_line(st.span);
             let loop_depth = c.cur().loop_depths.last().copied();
             if let Some(depth) = loop_depth {
+                // A `break` can escape one or more `unsafe` blocks that were
+                // opened inside the loop body.  Leave exactly those blocks
+                // before jumping out, so the sandbox capability is not leaked.
+                let loop_unsafe = c
+                    .cur()
+                    .loop_unsafe_depths
+                    .last()
+                    .copied()
+                    .unwrap_or(0);
+                let current_unsafe = c.cur().unsafe_depth;
+                for _ in loop_unsafe..current_unsafe {
+                    c.em(Instr::UnsafeLeave);
+                }
                 c.close_scopes_from(depth);
                 c.set_line(st.span);
             }
@@ -1472,9 +1495,12 @@ fn compile_while(c: &mut Compiler, cond: &Expr, body: &Block) -> LResult<()> {
     let exit = c.em(Instr::JumpIfFalse(0));
     c.cur().breaks.push(Vec::new());
     let loop_depth = c.cur().scopes.len();
+    let loop_unsafe = c.cur().unsafe_depth;
     c.cur().loop_depths.push(loop_depth);
+    c.cur().loop_unsafe_depths.push(loop_unsafe);
     compile_block(c, body)?;
     c.cur().loop_depths.pop();
+    c.cur().loop_unsafe_depths.pop();
     let breaks = c.cur().breaks.pop().expect("loop breaks pushed");
     let back = start;
     c.set_line(cond.span);
@@ -1491,7 +1517,9 @@ fn compile_repeat(c: &mut Compiler, body: &Block, cond: &Expr) -> LResult<()> {
     let start = c.pos();
     c.cur().breaks.push(Vec::new());
     let loop_depth = c.cur().scopes.len();
+    let loop_unsafe = c.cur().unsafe_depth;
     c.cur().loop_depths.push(loop_depth);
+    c.cur().loop_unsafe_depths.push(loop_unsafe);
     // repeat condition sees body locals
     c.push_shadow();
     for s in body {
@@ -1500,6 +1528,7 @@ fn compile_repeat(c: &mut Compiler, body: &Block, cond: &Expr) -> LResult<()> {
     compile_expr(c, cond)?;
     c.pop_shadow();
     c.cur().loop_depths.pop();
+    c.cur().loop_unsafe_depths.pop();
     let breaks = c.cur().breaks.pop().expect("loop breaks pushed");
     c.set_line(cond.span);
     let _ = c.em(Instr::JumpIfFalse(start as i32));
@@ -1542,11 +1571,14 @@ fn compile_for_num(
     let step_slot = c.declare("(for step)");
     c.cur().breaks.push(Vec::new());
     let loop_depth = c.cur().scopes.len();
+    let loop_unsafe = c.cur().unsafe_depth;
     c.cur().loop_depths.push(loop_depth);
+    c.cur().loop_unsafe_depths.push(loop_unsafe);
     c.set_line(span);
     let init = c.em(Instr::ForNumInit { var: var_slot, limit: limit_slot, step: step_slot, end: 0 });
     compile_block(c, body)?;
     c.cur().loop_depths.pop();
+    c.cur().loop_unsafe_depths.pop();
     c.set_line(span);
     let step_at = c.em(Instr::ForNumStep { var: var_slot, limit: limit_slot, step: step_slot, top: (init + 1) as i32, end: 0 });
     let breaks = c.cur().breaks.pop().expect("loop breaks pushed");
@@ -1587,11 +1619,14 @@ fn compile_for_iter(
     let nvars = vars.len() as u16;
     c.cur().breaks.push(Vec::new());
     let loop_depth = c.cur().scopes.len();
+    let loop_unsafe = c.cur().unsafe_depth;
     c.cur().loop_depths.push(loop_depth);
+    c.cur().loop_unsafe_depths.push(loop_unsafe);
     c.set_line(span);
     let setup = c.em(Instr::ForInSetup { iter: iter_slot, first, nvars, end: 0 });
     compile_block(c, body)?;
     c.cur().loop_depths.pop();
+    c.cur().loop_unsafe_depths.pop();
     c.set_line(span);
     let step_at = c.em(Instr::ForInStep { iter: iter_slot, first, nvars, top: (setup + 1) as i32, end: 0 });
     let breaks = c.cur().breaks.pop().expect("loop breaks pushed");

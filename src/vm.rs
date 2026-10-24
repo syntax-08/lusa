@@ -158,6 +158,9 @@ pub struct VmFrame {
     pub(crate) truncate_return: bool,
     /// deferred call-argument takes pending finalization by the next call op
     pub(crate) undo: Vec<UndoRec>,
+    /// `unsafe` depth of the caller at entry. Restored when this frame returns
+    /// or unwinds, so an early `return` cannot leak sandbox capability.
+    entry_unsafe_depth: usize,
 }
 
 impl Vm {
@@ -263,6 +266,9 @@ fn take_slot_vec(interp: &mut Interp, nlocals: usize) -> Vec<SlotCell> {
 /// frame starts clean without allocating.
 fn pop_frame_recycling(interp: &mut Interp) {
     let mut frame = interp.vm.frames.pop().expect("frame");
+    // Capability belongs to the frame that opened it. Restore the caller's
+    // depth on every exit path, including early returns and error unwinds.
+    interp.unsafe_depth = frame.entry_unsafe_depth;
     // Drop values first: a closure stored in this frame may be the only extra
     // owner of another slot in the same frame.
     frame.varargs.clear();
@@ -333,6 +339,7 @@ fn push_frame(
         pc: 0,
         truncate_return: false,
         undo: Vec::new(),
+        entry_unsafe_depth: interp.unsafe_depth,
     });
     Ok(())
 }
@@ -407,6 +414,7 @@ fn push_frame_at(
         pc: 0,
         truncate_return: false,
         undo: Vec::new(),
+        entry_unsafe_depth: interp.unsafe_depth,
     });
     Ok(())
 }

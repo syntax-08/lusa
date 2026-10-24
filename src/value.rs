@@ -166,6 +166,9 @@ pub struct CoroutineObj {
     pub capture_env: CaptureMap,
     /// the pending yield expression truncates its resume result to one value
     pub yield_one: bool,
+    /// `unsafe` depth saved while the coroutine is suspended. Each coroutine
+    /// owns its sandbox capability; it must not leak into the host.
+    pub unsafe_depth: usize,
 }
 
 impl CoroutineObj {
@@ -194,6 +197,7 @@ impl CoroutineObj {
             upvals,
             capture_env,
             yield_one: false,
+            unsafe_depth: 0,
         }
     }
 }

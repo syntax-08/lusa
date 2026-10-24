@@ -310,9 +310,9 @@ end
 This lowers to `*(volatile uint32_t *)(uintptr_t)address = value` in native
 builds. The raw intrinsics are rejected outside an `unsafe` block (`E0316`) by
 the C backend. The interpreter and `--vm` instead use a safe simulated-memory
-map, so the same script can be tested without touching hardware. Native
-execution requires valid addresses; the backend deliberately does no memory
-sandboxing or bounds checks.
+map with `f64` cells, so fractional values round-trip and the same script can be
+tested without touching hardware. Native execution requires valid addresses;
+the backend deliberately does no memory sandboxing or bounds checks.
 
 ### Keyed tables, methods, and iterators
 

@@ -300,8 +300,8 @@ fn eval_un(interp: &mut Interp, op: UnOp, v: Value, span: Span) -> LResult<Value
             }
             match v.base_value() {
                 Value::Number(n) => {
-                    let cell = interp.unsafe_mem.get(&(*n as u64)).copied().unwrap_or(0);
-                    Ok(Value::Number(cell as f64))
+                    let cell = interp.unsafe_mem.get(&(*n as u64)).copied().unwrap_or(0.0);
+                    Ok(Value::Number(cell))
                 }
                 other => Err(LusaError::new(
                     crate::error::E_RUNTIME,

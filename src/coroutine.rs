@@ -191,6 +191,11 @@ pub fn resume(
         std::mem::replace(&mut co.vm, Vm::new())
     };
     let host_vm = std::mem::replace(&mut i.vm, coro_vm);
+    // Sandbox capability is part of the suspended execution state. A
+    // coroutine that yielded inside `unsafe` resumes there, while the host
+    // continues with its own (usually zero) depth.
+    let host_unsafe = i.unsafe_depth;
+    i.unsafe_depth = target.borrow().unsafe_depth;
 
     i.active_coroutines.push(id);
     i.coroutine_captures
@@ -225,10 +230,13 @@ pub fn resume(
         }
     };
 
+    let coro_unsafe = i.unsafe_depth;
     let coro_vm = std::mem::replace(&mut i.vm, host_vm);
+    i.unsafe_depth = host_unsafe;
     {
         let mut co = target.borrow_mut();
         co.vm = coro_vm;
+        co.unsafe_depth = coro_unsafe;
         match &done {
             Done::Yield(_, one) => {
                 co.state = CoroState::Suspended;
@@ -304,6 +312,7 @@ fn b_close(_i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>>
     co.upvals = None;
     co.capture_env.clear();
     co.state = CoroState::Dead;
+    co.unsafe_depth = 0;
     let vm = std::mem::replace(&mut co.vm, Vm::new());
     drop(vm);
     drop(co);

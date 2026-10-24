@@ -118,6 +118,90 @@ fn dynamic_engines_reject_deref_outside_unsafe() {
 }
 
 #[test]
+fn unsafe_capability_does_not_leak_through_early_exits() {
+    let cases = [
+        // `return` bypasses the trailing UnsafeLeave; the frame boundary must
+        // restore the caller's depth.
+        "function early()\n\
+             unsafe do\n\
+                 return 1\n\
+             end\n\
+         end\n\
+         print(early())\n\
+         unsafe_read_mem(0x4000)\n",
+        // `break` jumps past the trailing UnsafeLeave, so the compiler must
+        // emit the leave before the jump.
+        "for i = 1, 1 do\n\
+             unsafe do\n\
+                 break\n\
+             end\n\
+         end\n\
+         unsafe_read_mem(0x4000)\n",
+        // An error unwinds the frame; the protected call must not leave the
+        // sandbox capability enabled.
+        "local ok = pcall(function()\n\
+             unsafe do\n\
+                 error(\"boom\")\n\
+             end\n\
+         end)\n\
+         print(ok)\n\
+         unsafe_read_mem(0x4000)\n",
+    ];
+
+    for src in cases {
+        let err = lusa::run_source(src).expect_err("interpreter leaked unsafe capability");
+        assert_eq!(err.code, "E0321", "interpreter: {}", err.msg);
+        let err = lusa::vm::run_source_vm(src).expect_err("VM leaked unsafe capability");
+        assert_eq!(err.code, "E0321", "VM: {}", err.msg);
+    }
+}
+
+#[test]
+fn break_leaves_only_the_unsafe_blocks_it_escapes() {
+    let src = r#"
+function probe()
+    unsafe do
+        for i = 1, 1 do
+            unsafe do
+                break
+            end
+        end
+        return unsafe_read_mem(0x5000)
+    end
+end
+
+print(probe())
+"#;
+    let (interp, vm) = both_engines(src);
+    assert_eq!(interp, "0");
+    assert_eq!(vm, interp);
+}
+
+#[test]
+fn coroutine_suspension_keeps_its_own_unsafe_capability() {
+    let src = r#"
+local co = coroutine.create(function()
+    unsafe do
+        unsafe_write_mem(0x6000, 7)
+        coroutine.yield()
+        unsafe_write_mem(0x6000, unsafe_read_mem(0x6000) + 1)
+        return unsafe_read_mem(0x6000)
+    end
+end)
+
+print(coroutine.resume(co))
+local ok, err = pcall(function()
+    return unsafe_read_mem(0x6000)
+end)
+print(ok, err ~= nil)
+print(coroutine.resume(co))
+"#;
+    let (interp, vm) = both_engines(src);
+    assert_eq!(interp, "true\nfalse true\ntrue 8");
+    assert_eq!(vm, interp);
+}
+
+#[test]
 fn native_struct_pointer_and_intrinsic_program_runs() {
     let compiler = match cbackend::find_compiler(None) {
         Ok(cc) => cc,
