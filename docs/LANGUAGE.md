@@ -52,6 +52,8 @@ local m1, m2 = f()         -- multiple return values adjusted (Lua-style)
 -- Module 8.5 typed subset (C11 backend)
 local count: u32 = 10
 local ratio: f32 = 0.5
+local active: bool = true
+local label: string = "sensor"
 local grid: [[i32]] = {{1, 2}, {3, 4}}
 ```
 
@@ -459,6 +461,8 @@ local count: u32 = 10
 local signed: i32 = -5
 local wide: i128 = 1234567890123
 local sensor: f32 = 2.5
+local active: bool = true
+local label: string = "pin"
 
 function ler_sensor(pino: u32): f32
     return 1.5
@@ -471,12 +475,16 @@ end
 | `i32` | `int32_t` |
 | `i128` | `lusa_i128` (`__int128`, or `long long` on MSVC) |
 | `f32` | `float` |
+| `bool` | `bool` (`<stdbool.h>`) |
+| `string` | `LusaString *` (length + NUL-terminated `.data`) |
 | `[T]` / `[[T]]` | `LusaTable *` with a homogeneous element kind |
 | untyped integer literal | inferred as `i32` |
 | untyped decimal literal | inferred as `f32` |
 
-Pure integer literals keep their original decimal or hexadecimal spelling in
-the token/AST stream. The C11 backend passes that text to
+Unannotated locals use this static native inference (`i32` for integers, `f32`
+for decimals); there is no dynamic `double` fallback in generated C. Pure
+integer literals keep their original decimal or hexadecimal spelling in the
+token/AST stream. The C11 backend passes that text to
 `lusa_i128_parse("...")`, so constants above 2^53 retain all bits up to
 `__int128`. The dynamic interpreter/VM still expose numbers as `f64` for
 Lua-compatible arithmetic; use `build`/`run --native` when exact 128-bit
@@ -511,15 +519,17 @@ The intrinsics lower to volatile C accesses:
 
 ```c
 lusa_i128 v = ((uintptr_t)(0x40000000));
-(*(volatile uint32_t *)(uintptr_t)(v)) = (uint32_t)(1);
-uint32_t read = (*(volatile uint32_t *)(uintptr_t)(v));
+(void)(((*(volatile uint32_t *)(uintptr_t)(v)) = (uint32_t)(1)));
+uint32_t read = (uint32_t)((*(volatile uint32_t *)(uintptr_t)(v)));
 ```
 
-`unsafe_ptr_cast(address) -> i128` (a `uintptr_t` in C),
-`unsafe_read_mem(address) -> u32`, and `unsafe_write_mem(address, value)` are
-rejected outside an `unsafe` block with `E0316` in the C backend. Use these
-only with addresses that are valid on the target board/process; the native
-backend intentionally does not add bounds checks or a memory sandbox.
+Both reads and writes use the same `volatile uint32_t` lvalue form, which is
+valid C11 for GCC, Clang, TCC, and MSVC. `unsafe_ptr_cast(address) -> i128` (a
+`uintptr_t` in C), `unsafe_read_mem(address) -> u32`, and
+`unsafe_write_mem(address, value)` are rejected outside an `unsafe` block with
+`E0316` in the C backend. Use these only with addresses that are valid on the
+target board/process; the native backend intentionally does not add bounds
+checks or a memory sandbox.
 
 The interpreter and `--vm` give the same source a **safe simulation**: the
 intrinsics read/write a process-local `HashMap<address, f64>` and never
@@ -546,10 +556,14 @@ lusalang build hardware_test.lusa   # real volatile access
   `VirtualAlloc`/`mmap` dependency.
 - Owned locals and globals are deep-dropped in reverse declaration order at
   lexical exits, before `return`/`break`, and before an assignment overwrites
-  an owned value.
+  an owned value. The drop list is compile-time metadata and is never consumed
+  while emitting declarations or error paths, so normal nested-scope exits run
+  exactly once.
 - A `move` clears the source slot and cancels its drop; `clone` performs a deep
   copy for strings and tables; `borrow` emits an alias without allocation or
   drop.
+- `LusaString` tracks its byte length in `LusaObj` (embedded NUL bytes are
+  valid) and keeps `data` NUL-terminated for C/FFI interoperability.
 
 ### 9.4 Native keyed tables, methods, and generic iterators
 

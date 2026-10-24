@@ -176,10 +176,10 @@ static const char lusa_int_1[] = "123456789012345678901234567890";
 lusa_i128 init = lusa_i128_parse(lusa_int_1);
 ```
 
-Floating literals remain `f64`/`f32` values. The Rust lexer uses the same
-split (`TokenKind::Int(String)` vs `TokenKind::Num(f64)`), so the dynamic
-engines still run, while the C11 pipeline preserves every bit up to
-`__int128`.
+Floating literals infer `f32` in the native backend, while the dynamic engines
+keep their runtime numbers as `f64`. The Rust lexer uses the same split
+(`TokenKind::Int(String)` vs `TokenKind::Num(f64)`), so the dynamic engines
+still run, while the C11 pipeline preserves every bit up to `__int128`.
 
 ### Unsafe blocks and raw pointers
 
@@ -200,17 +200,18 @@ Generated C:
 
 ```c
 lusa_i128 v = ((uintptr_t)(0x40000000));
-(*(volatile uint32_t *)(uintptr_t)(v)) = (uint32_t)(1);
-uint32_t read = (*(volatile uint32_t *)(uintptr_t)(v));
+(void)(((*(volatile uint32_t *)(uintptr_t)(v)) = (uint32_t)(1)));
+uint32_t read = (uint32_t)((*(volatile uint32_t *)(uintptr_t)(v)));
 ```
 
 Intrinsics (`unsafe_ptr_cast`, `unsafe_read_mem`, `unsafe_write_mem`) are
-rejected outside an unsafe block with `E0316` by the C backend. They perform no
-bounds checks or memory sandboxing: the caller is responsible for using valid
-hardware or process addresses.
+rejected outside an unsafe block with `E0316` by the C backend. Both directions
+use the same `volatile uint32_t` lvalue, valid C11 for GCC, Clang, TCC, and
+MSVC. They perform no bounds checks or memory sandboxing: the caller is
+responsible for using valid hardware or process addresses.
 
 The interpreter and bytecode VM implement the same names as safe builtins over
-a process-local `HashMap<u64, u32>`. `lusalang run` and `lusalang run --vm`
+a process-local `HashMap<u64, f64>`. `lusalang run` and `lusalang run --vm`
 therefore simulate register writes/reads without dereferencing memory; the
 `build`/`run --native` path emits the volatile pointer access shown above.
 
@@ -258,12 +259,16 @@ typedef struct LusaTable {
   release string/table elements before `free`.
 - Owned locals/globals are dropped in reverse declaration order at every
   lexical exit, before `return`/`break`, and before an assignment overwrites an
-  owned value.
+  owned value. Drop lists are compile-time metadata; emitting declarations or
+  error-path cleanup does not consume them, so normal nested exits still run
+  exactly once.
 - A move stores the pointer in the destination, clears the source slot
   (`= NULL`), and cancels the source drop.
 - `clone` deep-copies strings and tables (`lusa_string_clone`,
   `lusa_table_clone`); scalar clone is a copy.
 - `borrow` emits an alias with no allocation and no drop.
+- `LusaString` keeps its byte length in `LusaObj` (embedded NUL bytes are
+  valid) and a NUL-terminated `data` pointer for C/FFI calls.
 
 ### Diagnostics
 

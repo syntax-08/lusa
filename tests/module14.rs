@@ -285,3 +285,36 @@ return 0
     assert!(output.status.success(), "native program failed: {output:?}");
     assert_eq!(stdout(&output), expected);
 }
+
+#[test]
+fn nested_scope_raii_deep_drops_run_without_double_free() {
+    let source = r#"
+do
+    local outer = clone "outer"
+    do
+        local inner = clone "inner"
+        print(inner)
+    end
+    print(outer)
+end
+do
+    local values: [string] = {"a", "b"}
+    local copy = clone values
+    print(#values, #copy)
+end
+print("done")
+return 0
+"#;
+    let expected = "inner\nouter\n2 2\ndone\n";
+    let interp = lusa::run_source(source).expect("interpreter failed");
+    let vm = lusa::vm::run_source_vm(source).expect("VM failed");
+    assert_eq!(format!("{}\n", interp.join("\n")), expected);
+    assert_eq!(format!("{}\n", vm.join("\n")), expected);
+
+    let Some(exe) = build_native("raii-nested", source) else {
+        return;
+    };
+    let output = run_exe(&exe);
+    assert!(output.status.success(), "native program failed: {output:?}");
+    assert_eq!(stdout(&output), expected);
+}

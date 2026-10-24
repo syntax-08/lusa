@@ -3476,7 +3476,11 @@ local function emit_scope_drops(scope_index)
     local order = scope.order
     local i = #order
     while i >= 1 do
-        emit_drop_entry(order[i])
+        -- Drop metadata is read-only.  Pass a copy so traversing the scope
+        -- does not move the entry out of `order` (Lusa moves table values
+        -- into function arguments), which would otherwise make later
+        -- traversals -- notably the real lexical exit -- see an empty list.
+        emit_drop_entry(clone order[i])
         i = i - 1
     end
     scope.order = order
@@ -3497,11 +3501,15 @@ local function emit_all_drops()
 end
 
 local function emit_global_drops()
-    local i = #emit_global_order
+    local order = emit_global_order
+    local i = #order
     while i >= 1 do
-        emit_drop_entry(emit_global_order[i])
+        -- Same rule as `emit_scope_drops`: dropping must not consume the
+        -- entry, because several error paths may emit the cleanup list.
+        emit_drop_entry(clone order[i])
         i = i - 1
     end
+    emit_global_order = order
 end
 
 -- Propagate a recorded runtime error through the normal function return path
@@ -6069,7 +6077,9 @@ end
 local function emit_globals_declarations()
     local i = 1
     while i <= #emit_global_order do
-        local global = emit_global_order[i]
+        -- Declaration only inspects metadata; cloning keeps the entry in the
+        -- drop list for the normal and error exits of `main`.
+        local global = clone emit_global_order[i]
         line("static " .. c_type(global.type) .. " " .. global.cname
             .. " = " .. default_c(global.type) .. ";")
         i = i + 1
@@ -6221,7 +6231,10 @@ function Compiler.memory_layout()
             u32 = "uint32_t",
             i32 = "int32_t",
             i128 = "lusa_i128 (__int128 when the C compiler provides it)",
-            f32 = "float"
+            f32 = "float",
+            bool = "bool (<stdbool.h>)",
+            string = "LusaString * (LusaObj length + NUL-terminated data)",
+            table = "LusaTable *"
         },
         value_header = {
             size = 32,
@@ -6248,7 +6261,7 @@ function Compiler.memory_layout()
             release = "free",
             table = "realloc-backed reserve, deep drop recursively frees string/table items"
         },
-        drop_rule = "reverse declaration order at lexical exit, before return/break, and before assignment overwrites an owned value",
+        drop_rule = "reverse declaration order at lexical exit, before return/break, and before assignment overwrites an owned value; compile-time drop lists are never consumed by declarations or error paths",
         move_rule = "the destination takes the pointer, the source slot is cleared, and the source drop is cancelled",
         borrow_rule = "no allocation and no drop; the alias is only valid while the owner lives",
         clone_rule = "deep clone for strings and tables; scalar clone is a copy",
@@ -6257,7 +6270,7 @@ function Compiler.memory_layout()
             pointer_cast = "unsafe_ptr_cast(address) -> i128 (C uintptr_t)",
             read_mem = "unsafe_read_mem(address) -> u32",
             write_mem = "unsafe_write_mem(address, value) -> void",
-            c_access = "*(volatile uint32_t *)(uintptr_t)address = value"
+            c_access = "writes: *(volatile uint32_t *)(uintptr_t)address = value; reads: (*(volatile uint32_t *)(uintptr_t)address)"
         }
     }
 end

@@ -122,6 +122,96 @@ fn unsafe_block_emits_volatile_pointer_access() {
 }
 
 #[test]
+fn volatile_mmio_lowering_is_exact_c11() {
+    let c = emit(
+        "unsafe do\n\
+             local reg: i128 = unsafe_ptr_cast(0x40000000)\n\
+             unsafe_write_mem(reg, 7)\n\
+             local value: u32 = unsafe_read_mem(reg)\n\
+             print(value)\n\
+         end\n\
+         return 0\n",
+    );
+    // MMIO reads and writes both go through the same volatile 32-bit lvalue.
+    assert_has(&c, "(*(volatile uint32_t *)(uintptr_t)(");
+    assert_has(&c, ") = (uint32_t)(");
+    assert_has(&c, "uint32_t init");
+    // Nothing may lower to a plain, non-volatile dereference.
+    assert!(
+        !c.contains("(*(uint32_t *)(uintptr_t)("),
+        "MMIO access must stay volatile:\n{c}"
+    );
+}
+
+#[test]
+fn full_native_type_matrix_includes_bool_and_string() {
+    let c = emit(
+        "local flag: bool = true\n\
+         local label: string = \"lusa\"\n\
+         local count: u32 = 1\n\
+         local signed: i32 = -1\n\
+         local wide: i128 = 1\n\
+         local ratio: f32 = 0.5\n\
+         print(flag, label, count, signed, wide, ratio)\n\
+         return 0\n",
+    );
+    assert_has(&c, "bool init");
+    assert_has(&c, "LusaString * init");
+    assert_has(&c, "uint32_t init");
+    assert_has(&c, "int32_t init");
+    assert_has(&c, "lusa_i128 init");
+    assert_has(&c, "float init");
+    assert_has(&c, "lusa_print_bool");
+    assert_has(&c, "lusa_print_string");
+    assert_has(&c, "typedef struct LusaString");
+}
+
+#[test]
+fn normal_scope_exits_emit_raii_drops() {
+    let c = emit(
+        "do\n\
+             local text = clone \"owned\"\n\
+         end\n\
+         do\n\
+             local values: [i32] = {1, 2}\n\
+         end\n\
+         return 0\n",
+    );
+    // Each scope has one normal-exit drop plus the error-path drop emitted
+    // after the local.  A bug that consumes drop metadata would leave only
+    // the error-path drop, so require two of each.  Restrict the count to
+    // `main` so the runtime's own drop helpers cannot satisfy the assertion.
+    let main_start = c.find("int main(void) {").expect("generated main");
+    let rest = &c[main_start..];
+    let main_end = rest.find("\n}").expect("end of main") + 2;
+    let main_body = &rest[..main_end];
+    assert!(
+        main_body.matches("lusa_drop_string(&").count() >= 2,
+        "lexical exits must drop owned strings, not only error paths:\n{main_body}"
+    );
+    assert!(
+        main_body.matches("lusa_drop_table(&").count() >= 2,
+        "lexical exits must drop owned tables, not only error paths:\n{main_body}"
+    );
+}
+
+#[test]
+fn global_cleanup_survives_declaration_and_error_paths() {
+    let c = emit("text = clone \"global\"\nreturn 0\n");
+    assert_has(&c, "static LusaString * g");
+    let main_start = c.find("int main(void) {").expect("generated main");
+    let rest = &c[main_start..];
+    let main_end = rest.find("\n}").expect("end of main") + 2;
+    let main_body = &rest[..main_end];
+    // One drop runs on each checked error path and one on the normal return.
+    // Declaring the global must not consume its drop metadata.
+    assert!(
+        main_body.matches("lusa_drop_string(&g").count() >= 2,
+        "globals must be dropped on normal and error exits:\n{main_body}"
+    );
+}
+
+#[test]
 fn unsafe_intrinsics_require_an_unsafe_block() {
     let err = cbackend::emit_c(
         "local reg: i128 = unsafe_ptr_cast(0x40000000)\n\

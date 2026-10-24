@@ -3,10 +3,11 @@
 **Lusa** is a dynamic language inspired by Lua, written 100% in Rust (only
 `std`, zero dependencies), with an optional twist of **Rust-style ownership**
 — value moves, borrows and clones with **cargo-style diagnostics**. Module 8.5
-adds a typed C11 backend (`u32`/`i32`/`i128`/`f32`), RAII drops, host-toolchain
-native builds, and `unsafe` volatile access for hardware registers. Module 9
-brings the same typed/`unsafe` surface to the interpreter and bytecode VM
-(with safe simulated memory), plus exact `i128` integer literals. Module 10
+adds a typed C11 backend (`u32`/`i32`/`i128`/`f32`/`bool`/`string`), RAII drops,
+host-toolchain native builds, and `unsafe` volatile access for hardware
+registers. Module 9 brings the same typed/`unsafe` surface to the interpreter
+and bytecode VM (with safe simulated memory), plus exact `i128` integer
+literals. Module 10
 adds native keyed tables, colon methods, and `pairs`/`ipairs` lowering to the
 C11 backend. Module 11 adds static structs, raw pointers, and kernel
 intrinsics. Module 12 adds cooperative coroutines and protects native runtime
@@ -271,10 +272,14 @@ self-hosted parser. Supported types map to C11 as follows:
 | `i32` | `int32_t` |
 | `i128` | `lusa_i128` (`__int128`, or `long long` on MSVC) |
 | `f32` | `float` |
+| `bool` | `bool` (`<stdbool.h>`) |
+| `string` | `LusaString *` (`.data` is NUL-terminated for C/FFI) |
 | `[T]` / `[[T]]` | `LusaTable *` with a homogeneous element kind |
 
 Untyped integer literals infer `i32`; untyped decimal literals infer `f32`.
-The checker runs before emission and aborts with Cargo-style diagnostics such as
+Unannotated locals keep this static native inference; the interpreter and
+bytecode VM continue to represent every number as `f64`. The checker runs
+before emission and aborts with Cargo-style diagnostics such as
 `error[E0308]: mismatched types ... --> lusa:1:16`.
 
 Pure integer tokens keep their exact spelling. A literal such as
@@ -292,9 +297,13 @@ fallback is 64-bit.
 - Allocation uses `malloc`/`calloc`/`realloc`; release uses `free`.
 - Owned locals and globals are deep-dropped in reverse declaration order at
   lexical exits, before `return`/`break`, and before an assignment overwrites
-  an owned value.
+  an owned value. The static drop list is never consumed while emitting
+  declarations or error paths, so ordinary nested-scope exits clean up exactly
+  once.
 - A move clears the source slot and cancels its drop; `clone` deep-copies
   strings/tables; `borrow` emits a non-owning alias with no drop.
+- Strings keep a length in `LusaObj` (embedded NUL bytes are valid) and a
+  NUL-terminated `data` pointer for calls into C.
 
 ### Unsafe hardware access
 
@@ -307,12 +316,14 @@ unsafe do
 end
 ```
 
-This lowers to `*(volatile uint32_t *)(uintptr_t)address = value` in native
-builds. The raw intrinsics are rejected outside an `unsafe` block (`E0316`) by
-the C backend. The interpreter and `--vm` instead use a safe simulated-memory
-map with `f64` cells, so fractional values round-trip and the same script can be
-tested without touching hardware. Native execution requires valid addresses;
-the backend deliberately does no memory sandboxing or bounds checks.
+This lowers to `*(volatile uint32_t *)(uintptr_t)address = value` for writes and
+`(*(volatile uint32_t *)(uintptr_t)address)` for reads in native builds - valid
+C11 for GCC, Clang, TCC, and MSVC. The raw intrinsics are rejected outside an
+`unsafe` block (`E0316`) by the C backend. The interpreter and `--vm` instead
+use a safe simulated-memory map with `f64` cells, so fractional values
+round-trip and the same script can be tested without touching hardware. Native
+execution requires valid addresses; the backend deliberately does no memory
+sandboxing or bounds checks.
 
 ### Keyed tables, methods, and iterators
 
@@ -503,6 +514,10 @@ compiler, and C11 backend. The VM supports `borrow` directly and releases aliase
 at block/loop exit, including `break`. `unsafe do ... end` remains the explicit
 escape hatch: raw pointer operations and writes through aliases bypass the
 borrow rules while the surrounding safe code stays checked.
+
+Borrow analysis is zero-cost: generated C carries no borrow metadata. RAII
+cleanup remains a compile-time drop list, emitted in reverse declaration order
+at normal scope exits, `return`/`break`, and checked error paths.
 
 ```sh
 lusalang run examples/borrow_checker.lusa
