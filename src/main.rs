@@ -1,7 +1,7 @@
 //! Lusa CLI: run `.lusa` files or fall into the REPL.
 
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use lusa::ast;
 use lusa::cbackend;
@@ -122,7 +122,11 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            std::process::exit(run_source(&src, path));
+            std::process::exit(run_source_with_base(
+                &src,
+                path,
+                Path::new(path).parent(),
+            ));
         }
         None => {
             std::process::exit(repl());
@@ -196,7 +200,7 @@ fn cmd_run(args: &[String]) -> i32 {
     };
 
     if want_native {
-        return match cbackend::run_native(&src, cc.as_deref(), &program_args) {
+        return match cbackend::run_native_file(Path::new(&path), cc.as_deref(), &program_args) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("lusa: C11 backend failed:\n{}", e);
@@ -205,7 +209,7 @@ fn cmd_run(args: &[String]) -> i32 {
         };
     }
     if want_vm {
-        match lusa::vm::run_source_vm(&src) {
+        match lusa::vm::run_source_vm_with_base(&src, Path::new(&path).parent()) {
             Ok(lines) => {
                 for line in lines {
                     println!("{}", line);
@@ -225,7 +229,7 @@ fn cmd_run(args: &[String]) -> i32 {
     if !program_args.is_empty() {
         eprintln!("lusa: program arguments require --native");
     }
-    run_source(&src, &path)
+    run_source_with_base(&src, &path, Path::new(&path).parent())
 }
 
 /// `lusalang build <file> [-o <output>] [--cc <cc>] [--emit-c]`.
@@ -295,7 +299,7 @@ fn cmd_build(args: &[String]) -> i32 {
 
     if emit_c {
         let c_path = output.unwrap_or_else(|| input.with_extension("c"));
-        return match cbackend::emit_c_file(&src, &c_path) {
+        return match cbackend::emit_c_file_with_base(&src, &c_path, input.parent()) {
             Ok(()) => {
                 println!("C11 emitted: {}", c_path.display());
                 0
@@ -308,7 +312,7 @@ fn cmd_build(args: &[String]) -> i32 {
     }
 
     let output = output.unwrap_or_else(|| cbackend::default_output(&input));
-    match cbackend::build(&src, &output, cc.as_deref()) {
+    match cbackend::build_with_base(&src, &output, cc.as_deref(), input.parent()) {
         Ok(compiler) => {
             println!(
                 "built {} with {}",
@@ -361,7 +365,7 @@ fn cmd_check(args: &[String]) -> i32 {
         Err(code) => return code,
     };
     if typed {
-        return match cbackend::emit_c(&src) {
+        return match cbackend::emit_c_with_base(&src, Path::new(&path).parent()) {
             Ok(c) => {
                 println!("check ok (typed): {} ({} bytes of C11)", path, c.len());
                 0
@@ -372,7 +376,7 @@ fn cmd_check(args: &[String]) -> i32 {
             }
         };
     }
-    match parser::parse(&src) {
+    match parser::parse_with_base(&src, Path::new(&path).parent()) {
         Ok(block) => {
             println!("check ok: {} ({} statements)", path, block.len());
             0
@@ -700,7 +704,12 @@ pub fn run_vm_source(src: &str, filename: &str) -> i32 {
 
 /// Runs a complete program; 0 on success, 1 on error.
 pub fn run_source(src: &str, filename: &str) -> i32 {
-    match lusa::run_source(src) {
+    run_source_with_base(src, filename, None)
+}
+
+/// Runs a complete program with imports resolved relative to `base`.
+pub fn run_source_with_base(src: &str, filename: &str, base: Option<&Path>) -> i32 {
+    match lusa::run_source_with_base(src, base) {
         Ok(lines) => {
             for line in lines {
                 println!("{}", line);

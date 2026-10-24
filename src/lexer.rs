@@ -35,6 +35,10 @@ const KEYWORDS: &[(&str, TokenKind)] = &[
     ("borrow", TokenKind::Borrow),
     ("clone", TokenKind::Clone),
     ("move", TokenKind::Move),
+    ("match", TokenKind::Match),
+    ("with", TokenKind::With),
+    ("import", TokenKind::Import),
+    ("mod", TokenKind::Mod),
     ("nil", TokenKind::Nil),
     ("true", TokenKind::True),
     ("false", TokenKind::False),
@@ -232,10 +236,14 @@ impl Lexer {
                 if self.peek() == '=' {
                     self.pos += 1;
                     TokenKind::Eq
+                } else if self.peek() == '>' {
+                    self.pos += 1;
+                    TokenKind::FatArrow
                 } else {
                     TokenKind::Assign
                 }
             }
+            '|' => TokenKind::Pipe,
             '<' => {
                 if self.peek() == '=' {
                     self.pos += 1;

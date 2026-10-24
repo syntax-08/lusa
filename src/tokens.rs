@@ -47,6 +47,10 @@ pub enum TokenKind {
     Borrow,
     Clone,
     Move,
+    Match,
+    With,
+    Import,
+    Mod,
     // operators
     Plus,
     Minus,
@@ -69,6 +73,10 @@ pub enum TokenKind {
     Le,
     Ge,
     Assign,
+    /// `=>` separating a match pattern from its arm body.
+    FatArrow,
+    /// `|` separating match arms.
+    Pipe,
     LParen,
     RParen,
     LBrace,
@@ -85,6 +93,43 @@ pub enum TokenKind {
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
+}
+
+impl TokenKind {
+    /// Text of a keyword token, for positions such as `obj.field` where a
+    /// keyword is a valid member name (for example `string.match`).
+    pub fn keyword_text(&self) -> Option<&'static str> {
+        Some(match self {
+            TokenKind::Local => "local",
+            TokenKind::Function => "function",
+            TokenKind::End => "end",
+            TokenKind::If => "if",
+            TokenKind::Then => "then",
+            TokenKind::Elseif => "elseif",
+            TokenKind::Else => "else",
+            TokenKind::For => "for",
+            TokenKind::In => "in",
+            TokenKind::Do => "do",
+            TokenKind::While => "while",
+            TokenKind::Repeat => "repeat",
+            TokenKind::Until => "until",
+            TokenKind::Unsafe => "unsafe",
+            TokenKind::Struct => "struct",
+            TokenKind::Return => "return",
+            TokenKind::Break => "break",
+            TokenKind::And => "and",
+            TokenKind::Or => "or",
+            TokenKind::Not => "not",
+            TokenKind::Borrow => "borrow",
+            TokenKind::Clone => "clone",
+            TokenKind::Move => "move",
+            TokenKind::Match => "match",
+            TokenKind::With => "with",
+            TokenKind::Import => "import",
+            TokenKind::Mod => "mod",
+            _ => return None,
+        })
+    }
 }
 
 impl Token {
@@ -120,6 +165,10 @@ impl Token {
             TokenKind::Borrow => "`borrow`".into(),
             TokenKind::Clone => "`clone`".into(),
             TokenKind::Move => "`move`".into(),
+            TokenKind::Match => "`match`".into(),
+            TokenKind::With => "`with`".into(),
+            TokenKind::Import => "`import`".into(),
+            TokenKind::Mod => "`mod`".into(),
             TokenKind::Plus => "`+`".into(),
             TokenKind::Minus => "`-`".into(),
             TokenKind::Star => "`*`".into(),
@@ -139,6 +188,8 @@ impl Token {
             TokenKind::Le => "`<=`".into(),
             TokenKind::Ge => "`>=`".into(),
             TokenKind::Assign => "`=`".into(),
+            TokenKind::FatArrow => "`=>`".into(),
+            TokenKind::Pipe => "`|`".into(),
             TokenKind::LParen => "`(`".into(),
             TokenKind::RParen => "`)`".into(),
             TokenKind::LBrace => "`{`".into(),

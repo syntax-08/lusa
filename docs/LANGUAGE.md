@@ -16,6 +16,7 @@ error-code table.
 | string   | Copy      | `"abc"`, `'abc'`   |
 | table    | **Move**  | `{1, 2, k = "v"}`  |
 | function | **Move**  | closures and builtins |
+| struct   | Copy when scalar-only, otherwise **Move** | `Point{x: 1, y: 2}` |
 | iterator | (internal)| result of `pairs`/`ipairs` |
 
 Numbers are `f64` (like Lua). Truthiness: only `nil` and `false` are false —
@@ -79,10 +80,17 @@ for k, v in pairs(t) do ... end           -- generic (1 iterator)
 
 do ... end                                -- block (new scope)
 function f(a, b, ...) return a, b, ... end
+
+match value with                          -- literal arms, then optional
+| 0 => print("zero")                      -- binding or wildcard arm
+| 1 => print("one")
+| other => print("many", other)
+end
 ```
 
 `break` exits the innermost loop. `return f()` returns **all** of `f`'s
-results (same rule as Lua).
+results (same rule as Lua). `match` is lowered to an ordinary `if` chain by the
+parser and follows the ownership rules in section 5 per arm.
 
 Operators (Lua precedence): `or < and < (== ~= < > <= >=) < .. (right) <
 + - < * / // % < unary (- not #) < ^ (right)`.
@@ -97,7 +105,8 @@ Operators (Lua precedence): `or < and < (== ~= < > <= >=) < .. (right) <
 
 1. Scalars (`nil bool number string`) are **Copy**: assigning, passing as
    an argument or returning copies the value.
-2. Heap values (`table function`) **move by default** — a read in a
+2. Heap values (`table function`, and structs that own `string`/`table`
+   fields) **move by default** — a read in a
    *consuming context* (assignment, user-function argument, `return`,
    table literal) transfers ownership:
    ```lusa
@@ -138,6 +147,12 @@ Operators (Lua precedence): `or < and < (== ~= < > <= >=) < .. (right) <
    method call through a `borrow` alias is rejected with `E1004`.
 7. `and`, `or` evaluate their operands without consuming anything (plain
    reads are Copy in expression context).
+
+Struct values follow the same model: a struct containing only scalar fields
+(including nested scalar-only structs) is **Copy**, while a struct with a
+`string`/`table` field, directly or through a nested struct, moves like a
+table. Struct literals consume heap-valued field expressions unless they are
+wrapped in `clone` or `move`.
 
 ### Order of checks (runtime)
 
@@ -399,8 +414,11 @@ Codes `E{category}{n}`, like rustc:
 | E2010  | pattern  | malformed string pattern or replacement |
 | E2011  | pattern  | pattern exceeded the bounded matching budget |
 | E0301  | static   | C11 backend: missing/invalid function parameter or return type |
+| E0302  | static   | C11 backend: duplicate struct/field definition or duplicate struct-literal field |
 | E0308  | static   | C11 backend: mismatched types (assignment, return, call, condition) |
+| E0309  | static   | C11 backend: struct/table has no such field |
 | E0311  | static   | C11 backend: wrong argument/initializer count |
+| E0312  | static   | C11 backend: unsupported struct field type |
 | E0313  | static   | C11 backend: zero or one return value only; void/value return mismatch |
 | E0316  | unsafe   | C11 backend: raw pointer intrinsic used outside `unsafe` |
 | E0317  | static   | C11 backend: `pcall`, `coroutine.resume`, or `string.gmatch` used outside its required local/loop form |
@@ -478,6 +496,7 @@ end
 | `bool` | `bool` (`<stdbool.h>`) |
 | `string` | `LusaString *` (length + NUL-terminated `.data`) |
 | `[T]` / `[[T]]` | `LusaTable *` with a homogeneous element kind |
+| `struct S` | native `S` typedef with fields in declaration order |
 | untyped integer literal | inferred as `i32` |
 | untyped decimal literal | inferred as `f32` |
 
@@ -609,12 +628,27 @@ end
 `ipairs` values retain their array element type. Per-iteration locals are
 dropped by the normal RAII scope machinery.
 
-### 9.5 Static structs and raw pointers (Module 11)
+### 9.5 Static structs, literals, and raw pointers (Modules 11 and 15)
 
-`struct` declarations give the native backend rigid, compile-time layouts.
-Each field is a scalar (`u32`, `i32`, `f32`, `bool`) or a raw pointer type;
-the declaration becomes a plain C typedef, and field access compiles to a
-direct member access with zero hashing or lookup overhead:
+`struct` declarations give the native backend rigid, compile-time layouts. Both
+brace and bare forms are accepted:
+
+```lusa
+struct RegisterBank { control: u32, data: i32, status: u32 }
+
+struct Frame
+    origin: Point,
+    label: string,
+    payload: table<i32>
+end
+```
+
+Fields may be scalars (`u32`, `i32`, `i128`, `f32`, `bool`), `string`,
+`table`/`table<T>`, a raw pointer type, or a previously declared struct.
+Forward references are rejected: declare `Point` before using it as a field
+type. A declaration becomes a plain C typedef with fields in declaration order,
+and field access compiles to direct member access with zero hashing or lookup
+overhead:
 
 ```lusa
 struct RegisterBank { control: u32, data: i32, status: u32 }
@@ -624,6 +658,36 @@ bank.control = 7
 bank.data = -3
 print(bank.control)          -- (bank).control in C
 ```
+
+Struct literals initialize any subset of fields; omitted fields use the same
+defaults as an uninitialized typed local:
+
+```lusa
+struct Point { x: i32, y: i32 }
+struct Label
+    origin: Point,
+    text: string
+end
+
+local p = Point{x: 10}                 -- y = 0
+local tag = Label{origin: p, text: "corner"}
+print(tag.origin.x, tag.origin.y)      -- 10	0
+```
+
+Scalar fields default to zero/`false` and heap fields to `nil` (`NULL` in C).
+Both `:` and `=` are accepted between a literal field name and its value. The
+checker rejects unknown fields (`E0309`), duplicate fields (`E0302`), and
+mismatched values (`E0308`).
+
+In the dynamic engines, a struct whose fields are all scalar (including nested
+scalar-only structs) is **Copy**: reading it returns an independent value.
+Structs that own a `string`/`table` field, directly or through a nested struct,
+move like tables and must be `clone`d to keep both values. The native checker
+enforces the same ownership model. Generated C carries a
+`lusa_drop_<Name>`/`lusa_clone_<Name>` pair; drops recurse through nested
+struct, string, and table fields, and clone deep-copies them. Moved struct
+values are tracked in the emitter's static move table because C has no null
+representation for a struct value.
 
 Raw pointer types follow the Rust spelling:
 
@@ -646,9 +710,10 @@ end
 Writes through a `*const` pointer are rejected with `E0322`. `unsafe_alloc(n)`
 returns a zeroed `n`-byte buffer tracked by the generated runtime and freed
 before the program exits. The kernel-level intrinsics lower to compiler
-hooks: `unsafe_nop()` becomes a `nop`/`__nop()` and `unsafe_asm("text")`
-becomes `__asm__ __volatile__(text)` on GCC/Clang (a compiler barrier on
-toolchains without inline assembly):
+hooks: `unsafe_nop()` becomes `nop`/`__nop()`, and `unsafe_asm("text")` becomes
+`LUSA_ASM("text")`, which expands to `({ __asm__ volatile (text : : ); })` on
+GCC/Clang (a no-op on toolchains without inline assembly). The assembly text
+must be a plain string literal without quotes, backslashes, or newlines:
 
 ```lusa
 unsafe do
@@ -806,14 +871,72 @@ backtracking branch fails so sibling branches observe consistent state. Native
 string literals are emitted as UTF-8 bytes, so pattern results containing
 multibyte characters print and compare correctly.
 
-### 9.8 Native subset limits
+### 9.8 `match`, imports, and modules (Module 15)
+
+`match` evaluates its value once and compares it with literal patterns:
+
+```lusa
+match status with
+| 0 => print("idle")
+| 1 => print("busy")
+| code => print("unknown", code)
+end
+```
+
+- Patterns are numbers (including negative literals), strings, booleans, `nil`,
+  a single binding name, or `_`.
+- Literal arms compare with `==` and do not consume the value.
+- A binding arm (`| value =>`) moves the matched value into a new local. `_`
+  is the wildcard and performs no binding.
+- A binding or wildcard arm must be last; another arm after it is a parse
+  error.
+- `match` is syntactic sugar. Both parsers lower it to a `do` block, one
+  hidden local, and an `if`/`elseif` chain. There is no match bytecode
+  instruction and no C dispatcher. Ownership is checked independently in each
+  arm, so a move in one arm cannot leak into another:
+
+```lusa
+function pick(flag: bool, p: Point): Point
+    match flag with
+    | true => return p
+    | _ => return clone p
+    end
+end
+```
+
+Imports are compile-time composition:
+
+```lusa
+import "geo/point.lusa"   -- exact path, relative to the importing file
+mod counter               -- counter.lusa, counter/mod.lusa, or counter/main.lusa
+```
+
+- `import` expects a plain string literal (no interpolation) and resolves it
+  relative to the importing file, or as an absolute path.
+- `mod a.b` resolves to `a/b.lusa`, `a/b/mod.lusa`, or `a/b/main.lusa`.
+- Expansion is recursive; imported files may import or `mod` further files.
+- Every canonical path is included at most once, so shared dependencies
+  contribute their definitions once even when reached through several modules.
+- Expansion happens before parsing, and all files share one symbol table: there
+  is no namespace or export filter. Imported definitions are merged at the
+  textual include point, so a `struct` still has to be declared before the
+  literals or field types that use it.
+- The same expansion runs in the interpreter, bytecode VM, `build`,
+  `run --native`, `check`, and `--emit-c`. Missing files report `E0101` with a
+  help line describing the two forms.
+
+Inline assembly is covered in section 9.5.
+
+### 9.9 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 array/keyed table literals, nested keyed tables, field reads/writes, colon
 methods, `pairs`/`ipairs` generic `for`, one-based array indexing, `#`, `if`,
 `while`, `repeat`, `do`, `return`, `break`, assignments, globals, `print`,
 `clone`, `borrow`, `move`, the compile-time borrow checker, `unsafe` blocks,
-static `struct` declarations, raw pointer
+static `struct` declarations in brace and bare form, struct literals with
+defaults (scalar, `string`, `table`, pointer, and previously declared struct
+fields), `match`, compile-time `import`/`mod`, raw pointer
 types (`*mut u32`, `*const u32`, `*mut i32`, `*const i32`), pointer arithmetic
 and volatile dereferences inside `unsafe`, the raw intrinsics above
 (`unsafe_ptr_cast`, `unsafe_read_mem`, `unsafe_write_mem`, `unsafe_alloc`,
@@ -824,7 +947,8 @@ section 9.6.
 
 Not supported by the C emitter: numeric `for`, arbitrary dynamic key
 construction in table literals, assignment through a dynamic index, varargs,
-interpolated strings, closures/nested functions, the rest of the dynamic string
+interpolated strings, closures/nested functions, forward struct references,
+namespaced or selectively exported imports, the rest of the dynamic string
 library, multiple function return values (`E0313`), dynamic `pcall`
 expressions, and general first-class coroutine operations. Native colon methods are static functions
 and are not stored as table fields, so `pairs(user)` does not enumerate method

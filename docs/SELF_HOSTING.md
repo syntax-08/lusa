@@ -42,12 +42,20 @@ before optimizing so a caller can retain its own copy.
 
 Statements: `local` (with optional `: type`), assignment, call statements,
 `if`/`elseif`/`else`, `while`, `repeat`, generic `for ... in ... do`,
-`do`, `unsafe do`, `function` (including colon methods), `return`, and `break`.
+`do`, `unsafe do`, `struct` (brace or bare form), `match`, `function`
+(including colon methods), `return`, and `break`.
 
 Expressions: `nil`, booleans, decimal and hexadecimal numbers, strings,
 names, calls, colon method calls, field reads (`t.name`), parentheses, unary
 `-`/`not`/`#`, arithmetic/concatenation/comparison operators, `and`/`or`,
-`clone`, `borrow`, array/keyed table constructors, and one-based index reads.
+`clone`, `borrow`, `move`, array/keyed table constructors, struct literals
+(`Point{x: 1}`), and one-based index reads.
+
+`match` is parser sugar: it becomes a `Do` block containing one hidden `Local`
+and an `If`/`elseif` chain. Literal arms become `==` conditions; a binding arm
+becomes a leading `local name = move __match_N`; `_` becomes the `else` body.
+The checker therefore sees ordinary scopes and applies ownership per arm.
+Imports are expanded before parsing, so `import` and `mod` never reach the AST.
 
 The reference parser intentionally rejects numeric `for`, dynamic key
 constructors (`{[expr] = value}` except string literals), assignment through a
@@ -82,7 +90,9 @@ Every node carries `tag`, `line`, and `column`.
 | `Field` | `table`, `field_name` |
 | `Table` | `items`, `keys` (`string | nil` per entry) |
 | `Index` | `table`, `index` |
-| `Clone` / `Borrow` | `value` |
+| `Struct` | `name`, `fields = { {name, type}... }` (declaration) |
+| `StructLit` | `name`, `fields = { {name, value}... }` (literal) |
+| `Clone` / `Borrow` / `Move` | `value` |
 
 ## Ownership and module state
 
@@ -103,6 +113,9 @@ Every node carries `tag`, `line`, and `column`.
 
 ```text
 source
+  │ import expansion (src/imports.rs: recursive, deduplicated)
+  ▼
+merged source
   │ lexer.lusa
   ▼
 tokens
@@ -122,6 +135,13 @@ program.c ──► host GCC / Clang / TCC / MSVC ──► native executable
 
 No PE/ELF headers or x86_64 instructions are emitted by the compiler. The C
 file is the portable intermediate and can be inspected with `--emit-c`.
+
+`import "file.lusa"` and `mod name` are resolved by the Rust front end
+(`src/imports.rs`) before the merged source is parsed. Expansion is recursive and
+relative to the importing file, and canonical paths are included once. The
+expander tokenizes each file to locate import statements; the merged source then
+goes through the normal lexer/parser pipeline, so the self-hosted parser never
+emits `Import` or `Mod` AST nodes.
 
 ### Public API
 
@@ -149,6 +169,7 @@ file is the portable intermediate and can be inspected with `--emit-c`.
 | `bool` | `bool` (`<stdbool.h>`) |
 | `string` | `LusaString *` |
 | `[T]`, `[[T]]` | `LusaTable *` with a homogeneous element kind |
+| `S` (declared `struct`) | native `S` typedef with declaration-order fields |
 
 Untyped integer literals infer `i32`; untyped decimal literals infer `f32`.
 The checker validates locals, assignments, function arguments/returns,
@@ -210,6 +231,12 @@ use the same `volatile uint32_t` lvalue, valid C11 for GCC, Clang, TCC, and
 MSVC. They perform no bounds checks or memory sandboxing: the caller is
 responsible for using valid hardware or process addresses.
 
+`unsafe_nop()` emits `LUSA_NOP()` and `unsafe_asm("wfe")` emits
+`LUSA_ASM("wfe")`. GCC/Clang define `LUSA_ASM(text)` as
+`({ __asm__ volatile (text : : ); })`; toolchains without inline assembly use a
+no-op definition. The text must be a plain string literal without quotes,
+backslashes, or newlines.
+
 The interpreter and bytecode VM implement the same names as safe builtins over
 a process-local `HashMap<u64, f64>`. `lusalang run` and `lusalang run --vm`
 therefore simulate register writes/reads without dereferencing memory; the
@@ -244,6 +271,21 @@ typedef struct LusaTable {
     LusaEntry *entries;
 } LusaTable;
 ```
+
+Struct declarations add one native typedef per declaration plus generated
+drop/clone helpers:
+
+```c
+typedef struct { int32_t x; int32_t y; } Point;
+static void lusa_drop_Point(Point *value);
+static Point lusa_clone_Point(Point value);
+```
+
+Fields are emitted in declaration order; `string` and table fields become
+pointers, and nested structs are embedded by value. Drop helpers release nested
+struct, string, and table fields; clone helpers deep-copy them. The emitter also
+records moved struct locals in a static move table because assigning `NULL` to a
+struct lvalue is invalid C.
 
 - Allocation uses `malloc`/`calloc`/`realloc`; release uses `free`.
 - The array part is one-based in Lusa and lowered to zero-based C indices.
@@ -320,18 +362,25 @@ locations, exact integer fields, and literals. `tests/module9.rs` checks typed
 annotations and unsafe simulation on both dynamic engines, plus exact integer
 AST tokens. `tests/module10.rs` covers native keyed tables, nested field
 writes, colon methods, `pairs`, `ipairs`, and per-iteration RAII.
+`tests/module15.rs` covers both struct declaration forms, literal defaults,
+nested deep clone/drop, `match` arms and per-arm ownership, recursive
+`import`/`mod` deduplication, and the GNU inline-assembly form.
 
 ### Current limits
 
 The C emitter supports the typed subset above, not the full dynamic language:
 numeric `for`, dynamic key construction in table literals, assignment through a
 dynamic index, varargs, interpolated strings, and closures/nested functions are
-rejected with diagnostics. Native colon methods are static functions rather
-than table fields, so `pairs` does not enumerate method names; use a separate
-data table when enumerating. The dynamic interpreter and bytecode VM remain the
-complete-language engines; they accept typed/`unsafe` source but use f64
-arithmetic and simulated memory, so exact 128-bit arithmetic is a C11-backend
-feature.
+rejected with diagnostics. Struct fields must name a scalar, `string`, table,
+raw pointer, or previously declared struct (no forward references). `match`
+patterns are literals, one binding name, or `_`; there are no destructuring,
+range, or guard arms. Imports are flat textual includes with one shared symbol
+table, not namespaces with selective exports. Native colon methods are static
+functions rather than table fields, so `pairs` does not enumerate method names;
+use a separate data table when enumerating. The dynamic interpreter and
+bytecode VM remain the complete-language engines; they accept typed/`unsafe`
+source but use f64 arithmetic and simulated memory, so exact 128-bit arithmetic
+is a C11-backend feature.
 
 ## Extension points
 

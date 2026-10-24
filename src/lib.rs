@@ -8,6 +8,7 @@ pub mod compiler;
 pub mod coroutine;
 pub mod error;
 pub mod eval;
+pub mod imports;
 pub mod interp;
 pub mod lexer;
 pub mod lsp;
@@ -20,10 +21,16 @@ pub mod value;
 pub mod vm;
 
 use error::LResult;
+use std::path::Path;
 
 /// Parses and runs a source file.
 /// Returns the lines `print` produced; errors bubble up as `LusaError`.
 pub fn run_source(src: &str) -> LResult<Vec<String>> {
+    run_source_with_base(src, None)
+}
+
+/// Parses and runs a source file, resolving imports relative to `base`.
+pub fn run_source_with_base(src: &str, base: Option<&Path>) -> LResult<Vec<String>> {
     // The evaluator recurses in Rust frames (one call level ≈ several
     // thousand stack bytes), and the logical `MAX_CALL_DEPTH` guard only
     // kicks in after those frames accumulate. Hosts run `run_source` from
@@ -33,7 +40,7 @@ pub fn run_source(src: &str) -> LResult<Vec<String>> {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .spawn_scoped(s, move || {
-                let ast = parser::parse(src)?;
+                let ast = parser::parse_with_base(src, base)?;
                 let mut interp = interp::Interp::new();
                 interp.install_stdlib();
                 let result = interp.run(&ast, "<source>");

@@ -101,6 +101,11 @@ pub enum ExprKind {
         span_args_end: Span,
     },
     Table(Vec<TableEntry>),
+    /// `Point{x: 10, y: 20}` static struct literal.
+    StructLit {
+        name: String,
+        fields: Vec<StructLitField>,
+    },
     Func(FuncLit),
     /// ordinary binary operators
     Bin { op: BinOp, l: Box<Expr>, r: Box<Expr> },
@@ -131,6 +136,14 @@ pub struct StructField {
     pub name: String,
     /// type annotation string, e.g. `u32` or `*mut u32`.
     pub ty: String,
+    pub span: Span,
+}
+
+/// One `name: value` entry of a struct literal.
+#[derive(Clone, Debug)]
+pub struct StructLitField {
+    pub name: String,
+    pub value: Expr,
     pub span: Span,
 }
 

@@ -60,8 +60,9 @@ fn intrinsics_emit_asm_hooks_and_allocator() {
          end\n\
          return 0\n",
     );
-    assert!(c.contains("__asm__ __volatile__(text)"));
+    assert!(c.contains("__asm__ volatile (text : : );"));
     assert!(c.contains("__asm__ __volatile__(\"nop\")"));
+    assert!(c.contains("LUSA_ASM(\"cli\")"));
     assert!(c.contains("lusa_unsafe_alloc("));
     assert!(c.contains("lusa_free_allocs();"));
 }

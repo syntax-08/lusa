@@ -1,9 +1,10 @@
 //! The interpreter: frames, statement execution, calls, loops, and the
 //! runtime ownership/borrow engine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::cell::RefCell;
 
 use crate::ast::*;
 use crate::error::{LResult, LusaError, Span, E_BORROW_CONFLICT, E_MOVED, E_RUNTIME};
@@ -46,6 +47,11 @@ pub struct Interp {
     pub unsafe_depth: usize,
     /// `struct` declarations registered by the running program.
     pub struct_defs: HashMap<String, StructDef>,
+    /// table ids created for struct instances, mapped to their struct name.
+    /// The dynamic engines emulate structs with tables; this map lets move
+    /// checks treat scalar-only structs as copyable values, matching the
+    /// native backend.
+    pub struct_tables: RefCell<HashMap<u64, String>>,
     /// next simulated base address handed out by `unsafe_alloc`
     pub unsafe_alloc_next: u64,
     /// ids of coroutines currently executing (innermost last)
@@ -94,6 +100,7 @@ impl Interp {
             unsafe_mem: HashMap::new(),
             unsafe_depth: 0,
             struct_defs: HashMap::new(),
+            struct_tables: RefCell::new(HashMap::new()),
             unsafe_alloc_next: 0x1000,
             active_coroutines: Vec::new(),
             coroutine_captures: Vec::new(),
@@ -285,6 +292,9 @@ impl Interp {
                 return Err(self.move_err(src_desc, &history, span));
             }
         };
+        if let Some(copy) = self.copy_struct_value(&v) {
+            return Ok(copy);
+        }
         match &v {
             Value::Table(_) | Value::Func(_) => {
                 let vid = v.vid().expect("heap value has vid");
@@ -327,6 +337,9 @@ impl Interp {
             }
             None => return Ok(Value::Nil), // missing key: nil, nothing moved
         };
+        if let Some(copy) = self.copy_struct_value(&v) {
+            return Ok(copy);
+        }
         match &v {
             Value::Table(_) | Value::Func(_) => {
                 let vid = v.vid().expect("heap value has vid");
@@ -806,11 +819,116 @@ impl Interp {
     }
 
     /// Builds a zero-initialized struct instance for the dynamic engines.
-    fn default_struct_value(&self, name: &str) -> Option<Value> {
+    pub(crate) fn default_struct_value(&self, name: &str) -> Option<Value> {
+        self.default_struct_value_at(name, 0)
+    }
+
+    fn struct_table_name(&self, value: &Value) -> Option<String> {
+        let vid = value.vid()?;
+        let name = self.struct_tables.borrow().get(&vid).cloned();
+        name
+    }
+
+    /// True when a struct owns heap values through any field, directly or via
+    /// a nested struct.  Such values follow move semantics; scalar-only
+    /// structs are ordinary copyable values.
+    fn struct_owns_heap(&self, name: &str) -> bool {
+        let mut pending = vec![name.to_string()];
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            let Some(def) = self.struct_defs.get(&current) else {
+                continue;
+            };
+            for (_, ty) in &def.fields {
+                if ty == "string" || ty == "table" || ty.starts_with("table<") {
+                    return true;
+                }
+                if self.struct_defs.contains_key(ty) {
+                    pending.push(ty.clone());
+                }
+            }
+        }
+        false
+    }
+
+    /// Returns an independent copy when `value` is a scalar-only struct
+    /// instance, matching the native backend's value semantics.  Heap-bearing
+    /// structs keep move semantics and return `None`.
+    pub(crate) fn copy_struct_value(&self, value: &Value) -> Option<Value> {
+        let name = self.struct_table_name(value)?;
+        if self.struct_owns_heap(&name) {
+            return None;
+        }
+        Some(self.deep_clone_value(value))
+    }
+
+    /// Deep-clones a value while carrying struct identity tags over to the
+    /// clone, including nested struct tables.  Cloned scalar-only structs must
+    /// keep copy semantics, otherwise the next field read would move them.
+    pub(crate) fn deep_clone_value(&self, value: &Value) -> Value {
+        let copy = value.deep_clone();
+        let mut visited = HashSet::new();
+        self.tag_cloned_structs(value, &copy, &mut visited);
+        copy
+    }
+
+    fn tag_cloned_structs(&self, src: &Value, copy: &Value, visited: &mut HashSet<u64>) {
+        if let (Value::Alias(src_alias), Value::Alias(copy_alias)) = (src, copy) {
+            self.tag_cloned_structs(&src_alias.base, &copy_alias.base, visited);
+            return;
+        }
+        let (Value::Table(src_t), Value::Table(copy_t)) = (src, copy) else {
+            return;
+        };
+        if !visited.insert(src_t.vid) {
+            return;
+        }
+        let tag = self.struct_tables.borrow().get(&src_t.vid).cloned();
+        if let Some(name) = tag {
+            self.struct_tables.borrow_mut().insert(copy_t.vid, name);
+        }
+        let pairs: Vec<(Value, Value)> = {
+            let source = src_t.cell.borrow();
+            let cloned = copy_t.cell.borrow();
+            source
+                .entries
+                .iter()
+                .zip(cloned.entries.iter())
+                .filter_map(|((_, source), (_, cloned))| match (source, cloned) {
+                    (SlotV::Set(source), SlotV::Set(cloned)) => {
+                        Some((source.clone(), cloned.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        for (source, cloned) in pairs {
+            self.tag_cloned_structs(&source, &cloned, visited);
+        }
+    }
+
+    fn default_struct_value_at(&self, name: &str, depth: usize) -> Option<Value> {
         let def = self.struct_defs.get(name)?;
         let table = TableObj::new();
+        self.struct_tables
+            .borrow_mut()
+            .insert(table.vid, name.to_string());
         for (fname, ty) in &def.fields {
-            let zero = if ty == "bool" { Value::Bool(false) } else { Value::Number(0.0) };
+            let zero = if ty == "bool" {
+                Value::Bool(false)
+            } else if ty == "string" || ty == "table" || ty.starts_with("table<")
+                || ty.starts_with('*') || ty == "nil"
+            {
+                Value::Nil
+            } else if depth < 8 && self.struct_defs.contains_key(ty) {
+                self.default_struct_value_at(ty, depth + 1)
+                    .unwrap_or(Value::Nil)
+            } else {
+                Value::Number(0.0)
+            };
             let _ = table.set(Value::Str(Arc::from(fname.as_str())), zero);
         }
         Some(Value::Table(Rc::new(table)))

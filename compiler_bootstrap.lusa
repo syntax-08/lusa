@@ -354,6 +354,17 @@ opt_stmt = function(stmt)
 
     if tag == "If" then
         local branches = stmt.branches
+        -- `match` lowers a lone binding/wildcard arm to an `If` with only an
+        -- `else` branch; there is no condition to optimize or emit.
+        if #branches == 0 then
+            if stmt.else_body == nil then
+                return {tag = "Do", body = {}, line = line, column = column}
+            end
+            return {
+                tag = "Do", body = opt_block(stmt.else_body),
+                line = line, column = column
+            }
+        end
         local first_cond = opt_expr(branches[1].cond)
         if first_cond.tag == "Bool" then
             if first_cond.value then
@@ -494,6 +505,11 @@ end
 
 -- ---- raw pointer and struct types (module 11) ----------------------------
 
+-- Struct layouts are populated while checking top-level declarations.  The
+-- table must exist before `is_struct_type` is defined so every helper closes
+-- over the same local.
+local check_structs = {}
+
 local function pointer_element(type_name)
     if type_name == nil then
         return nil
@@ -563,10 +579,55 @@ local function is_integer_type(type_name)
     return type_name == "i32" or type_name == "u32" or type_name == "i128"
 end
 
+local function struct_owns_heap(type_name)
+    local pending = {type_name}
+    local seen = {}
+    local cursor = 1
+    while cursor <= #pending do
+        local current = pending[cursor]
+        cursor = cursor + 1
+        if seen[current] ~= true then
+            seen[current] = true
+            local layout = borrow check_structs[current]
+            if layout ~= nil then
+                local i = 1
+                while i <= #layout.order do
+                    local field_name = clone layout.order[i]
+                    local field_slot = borrow layout.fields[field_name]
+                    if field_slot == nil then
+                        fail(0, 0, "internal: missing struct field "
+                            .. tostring(current) .. "." .. tostring(field_name))
+                    end
+                    local field_type = field_slot.type
+                    if field_type == "string" or field_type == "table"
+                        or table_element(field_type) ~= nil then
+                        return true
+                    end
+                    if check_structs[field_type] ~= nil
+                        and seen[field_type] ~= true then
+                        pending[#pending + 1] = field_type
+                    end
+                    i = i + 1
+                end
+            end
+        end
+    end
+    return false
+end
+
 local function is_heap_type(type_name)
-    return type_name == "string" or type_name == "table"
+    if type_name == "string" or type_name == "table"
         or type_name == "coroutine" or type_name == "gmatch"
-        or table_element(type_name) ~= nil
+        or table_element(type_name) ~= nil then
+        return true
+    end
+    if type_name == nil or check_structs[type_name] == nil then
+        return false
+    end
+    -- Structs are value types in C, but a struct that owns strings, tables, or
+    -- nested heap-bearing structs needs the same move/drop tracking as those
+    -- fields.  Scalar-only structs remain plain copyable values.
+    return struct_owns_heap(type_name)
 end
 
 local function is_table_type(type_name)
@@ -617,7 +678,8 @@ local function assignable(target, source, expr)
         return true
     end
     if source == "nil" then
-        return target == "nil" or is_heap_type(target)
+        return target == "nil"
+            or (is_heap_type(target) and not is_struct_type(target))
     end
     if is_pointer_type(target) then
         -- integer addresses (literals or integer expressions) may initialize
@@ -688,7 +750,6 @@ local check_globals = {}
 local check_global_order = {}
 local check_functions = {}
 local check_function_order = {}
-local check_structs = {}
 local check_struct_order = {}
 local check_loop_depth = 0
 local check_unsafe_depth = 0
@@ -1276,7 +1337,7 @@ end
 
 local string_methods = {
     find = true,
-    match = true,
+    ["match"] = true,
     gmatch = true,
     gsub = true
 }
@@ -1848,6 +1909,50 @@ local function check_table(expr)
     return expr, result_type
 end
 
+local function check_struct_lit(expr)
+    local layout = borrow check_structs[expr.name]
+    if layout == nil then
+        type_fail("E0301", expr.line, expr.column,
+            "unknown struct `" .. tostring(expr.name) .. "`")
+    end
+    local fields = expr.fields or {}
+    local seen = {}
+    local i = 1
+    while i <= #fields do
+        local field = clone fields[i]
+        local slot = borrow layout.fields[field.name]
+        if slot == nil then
+            type_fail("E0309", field.line, field.column,
+                "struct `" .. expr.name .. "` has no field `"
+                .. tostring(field.name) .. "`")
+        end
+        if seen[field.name] == true then
+            type_fail("E0302", field.line, field.column,
+                "duplicate field `" .. tostring(field.name)
+                .. "` in struct literal")
+        end
+        seen[field.name] = true
+        local checked, actual = check_expr(field.value)
+        if not assignable(slot.type, actual, clone checked) then
+            check_mismatch(checked.line, checked.column,
+                "field `" .. field.name .. "` of `" .. expr.name .. "`",
+                slot.type, actual)
+        end
+        checked = coerce_literal(checked, slot.type)
+        if checked.tag ~= "Clone" and checked.tag ~= "Borrow"
+            and checked.tag ~= "Move" then
+            consume_expr(clone checked, checked.line, checked.column)
+        end
+        field.value = checked
+        fields[i] = field
+        i = i + 1
+    end
+    expr.fields = fields
+    local struct_name = clone expr.name
+    expr.ctype = clone struct_name
+    return expr, struct_name
+end
+
 check_expr = function(expr)
     local tag = expr.tag
     local line = expr.line
@@ -2153,6 +2258,10 @@ check_expr = function(expr)
 
     if tag == "Table" then
         return check_table(expr)
+    end
+
+    if tag == "StructLit" then
+        return check_struct_lit(expr)
     end
 
     if tag == "Index" then
@@ -2586,10 +2695,11 @@ local function check_local(stmt)
             -- `borrow x` never owns its referent.
             own = false
         elseif checked ~= nil and checked.own == false then
-            -- Strings are value types, so a field/index read is copied into
-            -- the new local. Tables stay non-owning aliases; the emitter
-            -- deep-copies them only when they must escape (return/store).
-            own = final_type == "string"
+            -- Strings and structs are value types, so a field/index read is
+            -- copied into the new local. Tables stay non-owning aliases; the
+            -- emitter deep-copies them only when they must escape
+            -- (return/store).
+            own = final_type == "string" or is_struct_type(final_type)
         end
         resolved[i] = final_type
         owns[i] = own
@@ -2819,6 +2929,64 @@ local function check_function(signature)
     return signature
 end
 
+local function check_struct_decl(stmt)
+    local line = stmt.line
+    local column = stmt.column
+    if check_structs[stmt.name] ~= nil then
+        type_fail("E0302", line, column,
+            "duplicate definition of struct `" .. stmt.name .. "`")
+    end
+    local layout = {}
+    local order = {}
+    local i = 1
+    while i <= #stmt.fields do
+        local field = clone stmt.fields[i]
+        local field_type = canonical_type(field.type, field.line, field.column)
+        local valid = field_type == "u32" or field_type == "i32"
+            or field_type == "i128" or field_type == "f32"
+            or field_type == "bool" or field_type == "string"
+            or is_table_type(field_type)
+        if not valid and not is_pointer_type(field_type)
+            and not is_struct_type(field_type) then
+            type_fail("E0312", field.line, field.column,
+                "unsupported struct field type `" .. tostring(field_type)
+                .. "`; use a scalar, string, table, raw pointer, or a previously declared struct")
+        end
+        if layout[field.name] ~= nil then
+            type_fail("E0302", field.line, field.column,
+                "duplicate struct field `" .. field.name .. "`")
+        end
+        layout[field.name] = { type = field_type }
+        order[#order + 1] = field.name
+        field.type = field_type
+        stmt.fields[i] = field
+        i = i + 1
+    end
+    check_structs[stmt.name] = { fields = layout, order = order }
+    check_struct_order[#check_struct_order + 1] = stmt.name
+    stmt.struct_checked = true
+    return stmt
+end
+
+-- Register top-level structs before function signatures are resolved: a
+-- signature may name a struct while `scan_functions` runs ahead of the normal
+-- top-level check.
+local function scan_structs(body)
+    local i = 1
+    while i <= #body do
+        local stmt = body[i]
+        if stmt.tag == "Struct" then
+            body[i] = check_struct_decl(stmt)
+        else
+            -- Reading a table slot moves heap values out; put non-struct
+            -- statements back so the program body keeps every statement.
+            body[i] = stmt
+        end
+        i = i + 1
+    end
+    return body
+end
+
 local function scan_functions(body)
     local i = 1
     while i <= #body do
@@ -2906,36 +3074,10 @@ check_stmt = function(stmt, top_level)
             type_fail("E0312", line, column,
                 "`struct` declarations are only allowed at the top level")
         end
-        if check_structs[stmt.name] ~= nil then
-            type_fail("E0302", line, column,
-                "duplicate definition of struct `" .. stmt.name .. "`")
+        if stmt.struct_checked == true then
+            return stmt
         end
-        local layout = {}
-        local order = {}
-        local i = 1
-        while i <= #stmt.fields do
-            local field = clone stmt.fields[i]
-            local field_type = canonical_type(field.type, field.line, field.column)
-            local valid = field_type == "u32" or field_type == "i32"
-                or field_type == "f32" or field_type == "bool"
-            if not valid and not is_pointer_type(field_type) then
-                type_fail("E0312", field.line, field.column,
-                    "struct fields must be `u32`, `i32`, `f32`, `bool`, or raw pointers, found `"
-                    .. tostring(field_type) .. "`")
-            end
-            if layout[field.name] ~= nil then
-                type_fail("E0302", field.line, field.column,
-                    "duplicate struct field `" .. field.name .. "`")
-            end
-            layout[field.name] = { type = field_type }
-            order[#order + 1] = field.name
-            field.type = field_type
-            stmt.fields[i] = field
-            i = i + 1
-        end
-        check_structs[stmt.name] = { fields = layout, order = order }
-        check_struct_order[#check_struct_order + 1] = stmt.name
-        return stmt
+        return check_struct_decl(stmt)
     end
 
     if tag == "Local" then
@@ -2966,12 +3108,18 @@ check_stmt = function(stmt, top_level)
             local branch = stmt.branches[i]
             local checked_cond, _ = check_condition(branch.cond, "if condition")
             branch.cond = checked_cond
+            -- Each arm owns its bindings: a `local` declared in one branch
+            -- must not leak into the checker's view of the next branch.
+            scope_enter()
             branch.body = check_block(branch.body, false)
+            scope_leave()
             stmt.branches[i] = branch
             i = i + 1
         end
         if stmt.else_body ~= nil then
+            scope_enter()
             stmt.else_body = check_block(stmt.else_body, false)
+            scope_leave()
         end
         return stmt
     end
@@ -3201,6 +3349,7 @@ local function check_program(ast)
     check_in_function = false
     check_current_function = nil
 
+    ast.body = scan_structs(ast.body)
     scan_functions(clone ast.body)
 
     -- Check the top-level body first so its implicit globals are available to
@@ -3375,7 +3524,7 @@ local function default_c(type_name)
         return "NULL"
     end
     if is_struct_type(type_name) then
-        return "{0}"
+        return "(" .. type_name .. "){0}"
     end
     return ""
 end
@@ -3430,6 +3579,61 @@ local function emit_value_lookup(name)
     return nil
 end
 
+-- Persist a move into the live scope/global metadata.  `emit_value_lookup`
+-- returns a copy (so move semantics do not mutate the entry it hands out), but
+-- drop lists are traversed later; struct moves have no `NULL` sentinel, so the
+-- moved flag itself must survive until scope exit.
+local function emit_mark_moved(name)
+    local i = emit_scope_count
+    while i >= 1 do
+        local scope = emit_scopes[i]
+        local entry = scope.vars[name]
+        if entry ~= nil then
+            local cname = clone entry.cname
+            entry.moved = true
+            scope.vars[name] = entry
+            local order = scope.order
+            local j = 1
+            while j <= #order do
+                local item = order[j]
+                local item_cname = clone item.cname
+                if item_cname == cname then
+                    item.moved = true
+                end
+                order[j] = item
+                j = j + 1
+            end
+            scope.order = order
+            emit_scopes[i] = scope
+            return true
+        end
+        -- The lookup moved the scope table out of its slot; put it back
+        -- even when the name is not declared in this scope.
+        emit_scopes[i] = scope
+        i = i - 1
+    end
+    local global = emit_globals[name]
+    if global ~= nil then
+        local cname = clone global.cname
+        global.moved = true
+        emit_globals[name] = global
+        local order = emit_global_order
+        local j = 1
+        while j <= #order do
+            local item = order[j]
+            local item_cname = clone item.cname
+            if item_cname == cname then
+                item.moved = true
+            end
+            order[j] = item
+            j = j + 1
+        end
+        emit_global_order = order
+        return true
+    end
+    return false
+end
+
 local function emit_scope_declare(name, type_name, own, borrowed)
     local entry = {
         name = name,
@@ -3465,6 +3669,8 @@ local function emit_drop_entry(entry)
         line("lusa_drop_coroutine(&" .. entry.cname .. ");")
     elseif entry.type == "gmatch" then
         line("lusa_drop_gmatch(&" .. entry.cname .. ");")
+    elseif is_struct_type(entry.type) then
+        line("lusa_drop_" .. entry.type .. "(&" .. entry.cname .. ");")
     end
 end
 
@@ -3628,6 +3834,14 @@ local function null_moved_source(expr, skip)
     if skip ~= nil and skip[entry.cname] == true then
         return
     end
+    emit_mark_moved(entry.name)
+    if is_struct_type(entry.type) then
+        -- A moved struct is a value, not a pointer.  There is no NULL to
+        -- store; the persisted moved flag alone prevents the scope drop from
+        -- touching the aliased fields.
+        entry.moved = true
+        return
+    end
     line(entry.cname .. " = NULL;")
     entry.moved = true
 end
@@ -3657,7 +3871,7 @@ local RUNTIME = {
     "#elif defined(__GNUC__) || defined(__clang__)",
     -- Statement expressions keep the hooks usable in expression position.
     '#define LUSA_NOP() ({ __asm__ __volatile__("nop"); })',
-    "#define LUSA_ASM(text) ({ __asm__ __volatile__(text); })",
+    "#define LUSA_ASM(text) ({ __asm__ volatile (text : : ); })",
     "#else",
     "#define LUSA_NOP() ((void)0)",
     "#define LUSA_ASM(text) ((void)0)",
@@ -4644,6 +4858,15 @@ collect_strings_expr = function(expr)
         end
         return
     end
+    if tag == "StructLit" then
+        local i = 1
+        while i <= #expr.fields do
+            local field = expr.fields[i]
+            collect_strings_expr(field.value)
+            i = i + 1
+        end
+        return
+    end
     if tag == "Index" then
         collect_strings_expr(expr.table)
         collect_strings_expr(expr.index)
@@ -4827,6 +5050,9 @@ local function emit_clone_heap(type_name, value)
     end
     if is_table_type(type_name) then
         return "lusa_table_clone(" .. value .. ")"
+    end
+    if is_struct_type(type_name) then
+        return "lusa_clone_" .. type_name .. "(" .. value .. ")"
     end
     return value
 end
@@ -5150,6 +5376,9 @@ emit_expr = function(expr)
         if is_table_type(expr.ctype) then
             return "lusa_table_clone(" .. inner .. ")"
         end
+        if is_struct_type(expr.ctype) then
+            return "lusa_clone_" .. expr.ctype .. "(" .. inner .. ")"
+        end
         return inner
     end
     if tag == "Borrow" then
@@ -5157,6 +5386,47 @@ emit_expr = function(expr)
     end
     if tag == "Move" then
         return emit_expr(expr.value)
+    end
+    if tag == "StructLit" then
+        local layout = borrow check_structs[expr.name]
+        if layout == nil then
+            fail(expr.line, expr.column,
+                "internal: unknown struct `" .. tostring(expr.name) .. "`")
+        end
+        local fields = expr.fields or {}
+        local parts = {}
+        local i = 1
+        while i <= #fields do
+            local field = clone fields[i]
+            local field_type = clone (borrow layout.fields[field.name]).type
+            local value_type = field.value.ctype or "nil"
+            local rendered = emit_expr(clone field.value)
+            if is_heap_type(value_type) and field.value.own == false
+                and field.value.tag ~= "Borrow" then
+                -- The literal owns its fields. A view into another value
+                -- (notably `other.field`) must be deep-copied.
+                rendered = emit_clone_heap(value_type, rendered)
+            end
+            rendered = emit_cast_to(field_type, rendered)
+            parts[#parts + 1] = "." .. field.name .. " = " .. rendered
+            i = i + 1
+        end
+        local name = fresh("struct")
+        if #parts == 0 then
+            line(expr.name .. " " .. name .. " = (" .. expr.name .. "){0};")
+        else
+            line(expr.name .. " " .. name .. " = (" .. expr.name .. "){ "
+                .. table.concat(parts, ", ") .. " };")
+        end
+        i = 1
+        while i <= #fields do
+            local field = fields[i]
+            if field.value.own ~= false then
+                null_moved_source(field.value, nil)
+            end
+            i = i + 1
+        end
+        return name
     end
     if tag == "Table" then
         local array_count = 0
@@ -5523,10 +5793,11 @@ local function emit_local(stmt)
         local temp_name = fresh("init")
         if value ~= nil then
             local rendered = emit_expr(clone value)
-            if type_name == "string" and value.own == false
-                and value.tag ~= "Borrow" then
-                -- Strings are value types: reading a field/index copies it.
-                rendered = "lusa_string_clone(" .. rendered .. ")"
+            if (type_name == "string" or is_struct_type(type_name))
+                and value.own == false and value.tag ~= "Borrow" then
+                -- Strings and structs are value types: reading a field/index
+                -- copies it, including nested heap fields.
+                rendered = emit_clone_heap(type_name, rendered)
             end
             rendered = emit_cast_to(type_name, rendered)
             line(c_type(type_name) .. " " .. temp_name .. " = " .. rendered .. ";")
@@ -5606,15 +5877,15 @@ local function emit_assign(stmt)
         local target = targets[i]
         if target.tag == "Name" then
             local entry = clone entries[i]
-            if moved_seen[entry.cname] ~= true then
-                if entry.own and not entry.moved then
-                    emit_drop_entry(clone entry)
-                end
-            end
             local assigned = temporaries[i]
             if i <= #values and values[i].own == false
                 and is_heap_type(target_types[i]) then
                 assigned = emit_clone_heap(target_types[i], assigned)
+            end
+            if moved_seen[entry.cname] ~= true then
+                if entry.own and not entry.moved then
+                    emit_drop_entry(clone entry)
+                end
             end
             assigned = emit_cast_to(target_types[i], assigned)
             line(entry.cname .. " = " .. assigned .. ";")
@@ -5624,9 +5895,24 @@ local function emit_assign(stmt)
             line("(*(" .. pointer_value .. ")) = " .. value_expr .. ";")
         elseif target.struct_access then
             local table_value = emit_expr(target.table)
-            local value_expr = emit_cast_to(target_types[i], temporaries[i])
-            line("(" .. table_value .. ")." .. target.field_name
-                .. " = " .. value_expr .. ";")
+            local assigned = temporaries[i]
+            if i <= #values and values[i].own == false
+                and is_heap_type(target_types[i]) then
+                assigned = emit_clone_heap(target_types[i], assigned)
+            end
+            assigned = emit_cast_to(target_types[i], assigned)
+            local access = "(" .. table_value .. ")." .. target.field_name
+            if is_heap_type(target_types[i]) then
+                if target_types[i] == "string" then
+                    line("lusa_drop_string(&" .. access .. ");")
+                elseif is_table_type(target_types[i]) then
+                    line("lusa_drop_table(&" .. access .. ");")
+                elseif is_struct_type(target_types[i]) then
+                    line("lusa_drop_" .. target_types[i] .. "(&"
+                        .. access .. ");")
+                end
+            end
+            line(access .. " = " .. assigned .. ";")
         else
             local table_value = emit_expr(target.table)
             local string_id = emit_string_ids[target.field_name]
@@ -5659,8 +5945,7 @@ local function emit_assign(stmt)
         if value ~= nil and value.tag == "Name" and value.own ~= false then
             local source = direct_heap_name(value)
             if source ~= nil and targets_seen[source.cname] ~= true then
-                line(source.cname .. " = NULL;")
-                source.moved = true
+                null_moved_source(value, targets_seen)
             end
         end
         i = i + 1
@@ -6056,19 +6341,75 @@ local function emit_struct_declarations(ast)
     end
     local i = 1
     while i <= #names do
-        local name = names[i]
+        local name = clone names[i]
         local layout = borrow ast.structs[name]
         line("typedef struct {")
         emit_indent = emit_indent + 1
         local j = 1
         while j <= #layout.order do
-            local field_name = layout.order[j]
-            local field_type = layout.fields[field_name].type
+            local field_name = clone layout.order[j]
+            local field_type = clone (borrow layout.fields[field_name]).type
             line(c_type(field_type) .. " " .. field_name .. ";")
             j = j + 1
         end
         emit_indent = emit_indent - 1
         line("} " .. name .. ";")
+        line("")
+        i = i + 1
+    end
+
+    -- Deep drop/clone helpers. Structs may only contain previously declared
+    -- structs, so declaration order also defines helper dependency order.
+    i = 1
+    while i <= #names do
+        local name = clone names[i]
+        local layout = borrow ast.structs[name]
+        line("static void lusa_drop_" .. name .. "(" .. name .. " *value) {")
+        emit_indent = emit_indent + 1
+        line("if (value == NULL) return;")
+        local j = 1
+        while j <= #layout.order do
+            local field_name = clone layout.order[j]
+            local field_type = clone (borrow layout.fields[field_name]).type
+            local access = "value->" .. field_name
+            if field_type == "string" then
+                line("lusa_drop_string(&" .. access .. ");")
+            elseif field_type == "table"
+                or table_element(field_type) ~= nil then
+                line("lusa_drop_table(&" .. access .. ");")
+            elseif is_struct_type(field_type)
+                and is_heap_type(field_type) then
+                line("lusa_drop_" .. field_type .. "(&" .. access .. ");")
+            end
+            j = j + 1
+        end
+        emit_indent = emit_indent - 1
+        line("}")
+        line("")
+
+        line("static " .. name .. " lusa_clone_" .. name .. "("
+            .. name .. " value) {")
+        emit_indent = emit_indent + 1
+        j = 1
+        while j <= #layout.order do
+            local field_name = clone layout.order[j]
+            local field_type = clone (borrow layout.fields[field_name]).type
+            local access = "value." .. field_name
+            if field_type == "string" then
+                line(access .. " = lusa_string_clone(" .. access .. ");")
+            elseif field_type == "table"
+                or table_element(field_type) ~= nil then
+                line(access .. " = lusa_table_clone(" .. access .. ");")
+            elseif is_struct_type(field_type)
+                and is_heap_type(field_type) then
+                line(access .. " = lusa_clone_" .. field_type
+                    .. "(" .. access .. ");")
+            end
+            j = j + 1
+        end
+        line("return value;")
+        emit_indent = emit_indent - 1
+        line("}")
         line("")
         i = i + 1
     end
@@ -6234,7 +6575,8 @@ function Compiler.memory_layout()
             f32 = "float",
             bool = "bool (<stdbool.h>)",
             string = "LusaString * (LusaObj length + NUL-terminated data)",
-            table = "LusaTable *"
+            table = "LusaTable *",
+            ["struct"] = "native C typedef struct with fields in declaration order"
         },
         value_header = {
             size = 32,
@@ -6249,9 +6591,12 @@ function Compiler.memory_layout()
         keyed_table = "LusaEntry { LusaString *key; uint64_t value; uint64_t kind; } with linear probing and FNV-1a hashing",
         methods = "colon methods lower to static C functions; `self` is a non-owning LusaTable pointer",
         iterators = "ipairs walks the 1-based array part; pairs walks the keyed hash entries",
-        structs = "`struct Name { field: type, ... }` becomes a C typedef struct with natural alignment; field access compiles to direct member offsets",
+        structs = "both `struct Name { field: type, ... }` and `struct Name field: type, ... end` become a C typedef struct with natural alignment; `Name{field: value}` literals initialize fields by name, and `value.field` compiles to a direct member offset",
+        struct_drop = "each struct receives a generated `lusa_drop_Name`/`lusa_clone_Name` pair; heap fields (string, table, nested heap-bearing structs) are dropped in declaration order and deep-cloned on copy",
+        ["match"] = "`match value with | literal => ... | name => ... | _ => ... end` lowers to a hidden local plus an ordinary if/elseif chain; ownership is checked per arm at compile time with no runtime dispatch",
+        imports = "`import 'file.lusa'` and `mod name` are expanded at compile time relative to the importing file; the merged source shares one symbol table and each module is included once",
         pointers = "*mut u32/*const u32 and *mut i32/*const i32 lower to volatile C pointers; pointer arithmetic scales by the element size and dereferences are volatile reads/writes",
-        intrinsics = "unsafe_nop/unsafe_asm lower to LUSA_NOP()/LUSA_ASM(text) - __asm__ __volatile__ on GCC/Clang, compiler barriers elsewhere",
+        intrinsics = "unsafe_nop/unsafe_asm lower to LUSA_NOP()/LUSA_ASM(text) - `__asm__ volatile (text : : );` on GCC/Clang, no-ops elsewhere",
         table_kinds = {
             unknown = 0, i32 = 1, u32 = 2, i128 = 3,
             f32 = 4, bool = 5, string = 6, table = 7
@@ -6261,10 +6606,10 @@ function Compiler.memory_layout()
             release = "free",
             table = "realloc-backed reserve, deep drop recursively frees string/table items"
         },
-        drop_rule = "reverse declaration order at lexical exit, before return/break, and before assignment overwrites an owned value; compile-time drop lists are never consumed by declarations or error paths",
-        move_rule = "the destination takes the pointer, the source slot is cleared, and the source drop is cancelled",
+        drop_rule = "reverse declaration order at lexical exit, before return/break, and before assignment overwrites an owned value; compile-time drop lists are never consumed by declarations or error paths; struct locals use their generated deep-drop helper",
+        move_rule = "the destination takes the pointer, the source slot is cleared, and the source drop is cancelled; moved struct values have no NULL sentinel, so the persisted moved flag alone cancels their drop",
         borrow_rule = "no allocation and no drop; the alias is only valid while the owner lives",
-        clone_rule = "deep clone for strings and tables; scalar clone is a copy",
+        clone_rule = "deep clone for strings, tables, and structs with heap fields; scalar clone is a copy",
         ["unsafe"] = {
             block = "`unsafe do ... end`; disables the local borrow-assignment rule",
             pointer_cast = "unsafe_ptr_cast(address) -> i128 (C uintptr_t)",

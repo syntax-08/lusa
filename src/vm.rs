@@ -617,11 +617,17 @@ pub fn debug_dump(compiled: &Compiled) {
 
 /// Compiles and runs a program in bytecode mode. Mirrors `run_source`.
 pub fn run_source_vm(src: &str) -> LResult<Vec<String>> {
+    run_source_vm_with_base(src, None)
+}
+
+/// Compiles and runs a program in bytecode mode, resolving imports relative
+/// to `base`.
+pub fn run_source_vm_with_base(src: &str, base: Option<&std::path::Path>) -> LResult<Vec<String>> {
     let joined = std::thread::scope(|s| {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .spawn_scoped(s, move || {
-                let compiled = crate::compiler::compile_program(src)?;
+                let compiled = crate::compiler::compile_program_with_base(src, base)?;
                 debug_dump(&compiled);
                 let mut interp = Interp::new();
                 interp.install_stdlib();
@@ -766,6 +772,11 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
                 )?,
             };
             if matches!(v, Value::Table(_) | Value::Func(_)) {
+                if let Some(copy) = interp.copy_struct_value(&v) {
+                    interp.vm.stack.push(copy);
+                    interp.vm.last_ret = 1;
+                    return Ok(StepOutcome::Continue);
+                }
                 let vid = v.vid().expect("heap value has vid");
                 if !interp.borrowed_by(vid).is_empty() {
                     return Err(err_at(
@@ -839,6 +850,16 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
                 .stack
                 .push(Value::Table(Rc::new(TableObj::new())));
             interp.vm.last_ret = 1;
+            StepOutcome::Continue
+        }
+        Instr::MarkStruct(k) => {
+            let name = const_str(interp, *k)?;
+            if let Some(Value::Table(t)) = interp.vm.stack.last() {
+                interp
+                    .struct_tables
+                    .borrow_mut()
+                    .insert(t.vid, name.to_string());
+            }
             StepOutcome::Continue
         }
         Instr::GetField(k) => {
@@ -1034,7 +1055,7 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
         }
         Instr::CloneV => {
             let v = pop1(interp);
-            let c = v.base_value().deep_clone();
+            let c = interp.deep_clone_value(&v.base_value());
             interp.vm.stack.push(c);
             interp.vm.last_ret = 1;
             StepOutcome::Continue
@@ -1802,6 +1823,11 @@ fn take_slot_storage(
         Some(v) => v,
         None => return Err(moved_out_err(&src_label.to_string(), current_span(interp))),
     };
+    if let Some(copy) = interp.copy_struct_value(&v) {
+        interp.vm.stack.push(copy);
+        interp.vm.last_ret = 1;
+        return Ok(());
+    }
     if matches!(v, Value::Table(_) | Value::Func(_)) {
         let vid = v.vid().expect("heap value has vid");
         if !interp.borrowed_by(vid).is_empty() {
@@ -1854,6 +1880,11 @@ fn take_local_storage(
         cell.read_clone()
             .ok_or_else(|| moved_out_err(&src_label.to_string(), frame_span(frame)))?
     };
+    if let Some(copy) = interp.copy_struct_value(&v) {
+        interp.vm.stack.push(copy);
+        interp.vm.last_ret = 1;
+        return Ok(());
+    }
     if matches!(v, Value::Table(_) | Value::Func(_)) {
         let vid = v.vid().expect("heap value has vid");
         if !interp.borrowed_by(vid).is_empty() {
@@ -1897,6 +1928,11 @@ fn take_table_storage(
             return Ok(());
         }
     };
+    if let Some(copy) = interp.copy_struct_value(&v) {
+        interp.vm.stack.push(copy);
+        interp.vm.last_ret = 1;
+        return Ok(());
+    }
     if matches!(v, Value::Table(_) | Value::Func(_)) {
         let vid = v.vid().expect("heap value has vid");
         if !interp.borrowed_by(vid).is_empty() {
@@ -1970,7 +2006,7 @@ fn arg_push_local(
     src: &Arc<str>,
     dest: &str,
 ) -> LResult<()> {
-    let v = {
+    let mut v = {
         let frame = interp.vm.frames.last().expect("frame");
         let cell = frame.slots.get(slot).ok_or_else(|| {
             err(
@@ -1981,7 +2017,10 @@ fn arg_push_local(
         cell.read_clone()
             .ok_or_else(|| moved_out_err(&src.to_string(), frame_span(frame)))?
     };
-    let rec = if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_) | Value::Coroutine(_)) {
+    let rec = if let Some(copy) = interp.copy_struct_value(&v) {
+        v = copy;
+        UndoRec::Done
+    } else if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_) | Value::Coroutine(_)) {
         UndoRec::Local {
             slot,
             vid: v.vid(),
@@ -2005,11 +2044,14 @@ fn arg_push_slot(
     src: &Arc<str>,
     dest: &str,
 ) -> LResult<()> {
-    let v = match &*handle.borrow() {
+    let mut v = match &*handle.borrow() {
         SlotV::Set(v) => v.clone(),
         SlotV::Moved(_) => return Err(moved_out_err(&src.to_string(), current_span(interp))),
     };
-    let rec = if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_) | Value::Coroutine(_)) {
+    let rec = if let Some(copy) = interp.copy_struct_value(&v) {
+        v = copy;
+        UndoRec::Done
+    } else if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_) | Value::Coroutine(_)) {
         UndoRec::Slot {
             handle: handle.clone(),
             vid: v.vid(),
@@ -2027,8 +2069,11 @@ fn arg_push_slot(
 
 /// Same as `arg_push_slot` but for a global (restore goes by name).
 fn arg_push_glob(interp: &mut Interp, name: &str, dest: &str) -> LResult<()> {
-    let v = read_global_deferred_span(interp, name)?;
-    let rec = if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_) | Value::Coroutine(_)) {
+    let mut v = read_global_deferred_span(interp, name)?;
+    let rec = if let Some(copy) = interp.copy_struct_value(&v) {
+        v = copy;
+        UndoRec::Done
+    } else if matches!(v, Value::Table(_) | Value::Func(_) | Value::Iter(_) | Value::Coroutine(_)) {
         UndoRec::Glob {
             name: name.to_string(),
             vid: v.vid(),
@@ -2053,13 +2098,16 @@ fn arg_push_entry(
     src: &str,
     dest: &str,
 ) -> LResult<()> {
-    let v = match t.get_slot(key) {
+    let mut v = match t.get_slot(key) {
         Some(SlotV::Set(v)) => Some(v),
         Some(SlotV::Moved(_)) => return Err(moved_out_err(src, current_span(interp))),
         None => None,
     };
-    let rec = match &v {
-        Some(vv) if matches!(vv, Value::Table(_) | Value::Func(_) | Value::Iter(_) | Value::Coroutine(_)) => {
+    let rec = if let Some(copy) = v.as_ref().and_then(|value| interp.copy_struct_value(value)) {
+        v = Some(copy);
+        UndoRec::Done
+    } else if let Some(vv) = &v {
+        if matches!(vv, Value::Table(_) | Value::Func(_) | Value::Iter(_) | Value::Coroutine(_)) {
             UndoRec::Field {
                 table: t.clone(),
                 key: key.clone(),
@@ -2067,8 +2115,11 @@ fn arg_push_entry(
                 dest: dest.to_string(),
                 value: vv.clone(),
             }
+        } else {
+            UndoRec::Done
         }
-        _ => UndoRec::Done,
+    } else {
+        UndoRec::Done
     };
     interp.vm.stack.push(v.unwrap_or(Value::Nil));
     interp.vm.last_ret = 1;

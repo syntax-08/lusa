@@ -174,6 +174,49 @@ pub fn eval_expr(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr
             build_table(interp, frame, &tbl, entries)?;
             Ok(Value::Table(Rc::new(tbl)))
         }
+        ExprKind::StructLit { name, fields } => {
+            let def = match interp.struct_defs.get(name) {
+                Some(def) => def.clone(),
+                None => {
+                    return Err(LusaError::new(
+                        E_INDEX,
+                        Some(e.span),
+                        format!("unknown struct `{name}`"),
+                    )
+                    .help("declare it with `struct Name ... end` before using a struct literal"));
+                }
+            };
+            let base = interp
+                .default_struct_value(name)
+                .unwrap_or_else(|| Value::Table(Rc::new(TableObj::new())));
+            let tbl = match base {
+                Value::Table(tbl) => tbl,
+                _ => Rc::new(TableObj::new()),
+            };
+            let mut seen: Vec<&str> = Vec::new();
+            for field in fields {
+                if !def.fields.iter().any(|(fname, _)| fname == &field.name) {
+                    return Err(LusaError::new(
+                        E_INDEX,
+                        Some(field.span),
+                        format!("struct `{name}` has no field `{}`", field.name),
+                    ));
+                }
+                if seen.contains(&field.name.as_str()) {
+                    return Err(LusaError::new(
+                        E_INDEX,
+                        Some(field.span),
+                        format!("duplicate field `{}` in struct literal", field.name),
+                    ));
+                }
+                seen.push(field.name.as_str());
+                let label = format!("field `{}` of `{name}`", field.name);
+                let value = eval_take_single(interp, frame, &field.value, &label, field.span)?;
+                let key = Value::Str(Arc::from(field.name.as_str()));
+                tbl.set(key, value)?;
+            }
+            Ok(Value::Table(tbl))
+        }
         ExprKind::Func(lit) => {
             let vid = crate::value::with_reg(|r| r.alloc_vid());
             // Keep the scope chain ordered outermost -> innermost: name lookup
@@ -219,7 +262,7 @@ pub fn eval_expr(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr
         }
         ExprKind::Clone { e } => {
             let v = eval_expr(interp, frame, e)?;
-            Ok(v.deep_clone())
+            Ok(interp.deep_clone_value(&v))
         }
         ExprKind::Move { e } => {
             let label = label_of(e);
@@ -675,7 +718,7 @@ pub fn eval_take_single(
         }
         ExprKind::Clone { e } => {
             let v = eval_expr(interp, frame, e)?;
-            let c = v.deep_clone();
+            let c = interp.deep_clone_value(&v);
             rename_owner(&c, label, span);
             Ok(c)
         }

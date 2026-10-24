@@ -1,0 +1,36 @@
+-- Module 15 example: struct literals, nested deep clone/drop, and `match`.
+--   lusalang run examples/struct_match.lusa
+--   lusalang run examples/struct_match.lusa --vm
+--   lusalang run examples/struct_match.lusa --native
+--   lusalang build examples/struct_match.lusa
+
+struct Point { x: i32, y: i32 }
+
+struct Label
+    origin: Point,
+    text: string
+end
+
+local origin = Point{x: 2}
+local tag = Label{origin: origin, text: "corner"}
+print(tag.origin.x, tag.origin.y, tag.text)
+
+-- `clone` copies the nested scalar struct and deep-clones the string.
+local copy = clone tag
+copy.origin.y = 9
+copy.text = "copy"
+print(tag.origin.y, copy.origin.y, copy.text)
+
+function classify(n: i32): i32
+    match n with
+    | 0 => print("zero")
+    | 1 => print("one")
+    | other => print("many", other)
+    end
+    return 0
+end
+
+classify(0)
+classify(1)
+classify(7)
+return 0

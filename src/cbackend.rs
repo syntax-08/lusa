@@ -132,9 +132,11 @@ fn format_backend_error(err: LusaError) -> String {
     err.to_string()
 }
 
-/// Compiles Lusa source to a C11 translation unit.
-pub fn emit_c(source: &str) -> Result<String, String> {
-    let program = backend_program(source)?;
+/// Compiles Lusa source to a C11 translation unit, resolving imports relative
+/// to `base` (or the current directory when absent).
+pub fn emit_c_with_base(source: &str, base: Option<&Path>) -> Result<String, String> {
+    let expanded = crate::imports::expand_imports(source, base).map_err(format_backend_error)?;
+    let program = backend_program(&expanded)?;
     let output = crate::run_source(&program).map_err(format_backend_error)?;
     if output.is_empty() {
         return Err("C backend produced no output".to_string());
@@ -145,9 +147,24 @@ pub fn emit_c(source: &str) -> Result<String, String> {
     Ok(c)
 }
 
+/// Compiles Lusa source to a C11 translation unit.
+pub fn emit_c(source: &str) -> Result<String, String> {
+    emit_c_with_base(source, None)
+}
+
 /// Writes the generated C to `path`.
 pub fn emit_c_file(source: &str, path: &Path) -> Result<(), String> {
-    let c = emit_c(source)?;
+    emit_c_file_with_base(source, path, path.parent())
+}
+
+/// Writes the generated C to `path`, resolving imports relative to `base`
+/// instead of the output path.
+pub fn emit_c_file_with_base(
+    source: &str,
+    path: &Path,
+    base: Option<&Path>,
+) -> Result<(), String> {
+    let c = emit_c_with_base(source, base)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -536,7 +553,17 @@ fn nanos() -> u128 {
 
 /// Builds a native executable from Lusa source.
 pub fn build(source: &str, output: &Path, cc: Option<&str>) -> Result<CCompiler, String> {
-    let c = emit_c(source)?;
+    build_with_base(source, output, cc, None)
+}
+
+/// Builds a native executable, resolving imports relative to `base`.
+pub fn build_with_base(
+    source: &str,
+    output: &Path,
+    cc: Option<&str>,
+    base: Option<&Path>,
+) -> Result<CCompiler, String> {
+    let c = emit_c_with_base(source, base)?;
     build_c_source(&c, output, cc, None)
 }
 
@@ -544,14 +571,25 @@ pub fn build(source: &str, output: &Path, cc: Option<&str>) -> Result<CCompiler,
 pub fn build_file(input: &Path, output: &Path, cc: Option<&str>) -> Result<CCompiler, String> {
     let source = std::fs::read_to_string(input)
         .map_err(|e| format!("cannot read {}: {e}", input.display()))?;
-    build(&source, output, cc)
+    build_with_base(&source, output, cc, input.parent())
 }
 
 /// Runs Lusa source through the C backend and executes the resulting native
 /// program, inheriting the caller's stdin/stdout/stderr.  Returns the program's
 /// exit code.
 pub fn run_native(source: &str, cc: Option<&str>, args: &[String]) -> Result<i32, String> {
-    let c = emit_c(source)?;
+    run_native_with_base(source, cc, args, None)
+}
+
+/// Runs Lusa source through the C backend with imports resolved relative to
+/// `base`.
+pub fn run_native_with_base(
+    source: &str,
+    cc: Option<&str>,
+    args: &[String],
+    base: Option<&Path>,
+) -> Result<i32, String> {
+    let c = emit_c_with_base(source, base)?;
     let exe_name = if cfg!(windows) {
         "lusa-run.exe"
     } else {
@@ -572,6 +610,18 @@ pub fn run_native(source: &str, cc: Option<&str>, args: &[String]) -> Result<i32
     let _ = std::fs::remove_dir_all(&dir);
     let status = status?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Runs a source file through the C backend, resolving imports relative to the
+/// file that contains them.
+pub fn run_native_file(
+    input: &Path,
+    cc: Option<&str>,
+    args: &[String],
+) -> Result<i32, String> {
+    let source = std::fs::read_to_string(input)
+        .map_err(|e| format!("cannot read {}: {e}", input.display()))?;
+    run_native_with_base(&source, cc, args, input.parent())
 }
 
 #[cfg(test)]

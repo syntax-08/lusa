@@ -76,6 +76,11 @@ local Parser = {}
 local tokens = nil
 local pos = 1
 local total = 0
+-- Struct names declared before the current expression.  A struct literal
+-- `Point{...}` is only recognised once `Point` has been declared, matching the
+-- native backend's one-pass declaration order.
+local struct_names = {}
+local match_seq = 0
 
 local parse_program
 local parse_block
@@ -90,6 +95,9 @@ local parse_for
 local parse_do
 local parse_unsafe
 local parse_struct
+local parse_match
+local parse_match_pattern
+local parse_match_block
 local parse_return
 local parse_break
 local parse_assign_or_call
@@ -199,6 +207,18 @@ end
 local function expect_name()
     if peek_kind() ~= "name" then
         fail("expected a name, found " .. describe_token())
+    end
+    local name = peek_value()
+    advance()
+    return name
+end
+
+-- Member positions (`value.field`, `value:method()`) accept keywords so
+-- names such as `string.match` keep working after `match` became a statement.
+local function expect_member_name()
+    local kind = peek_kind()
+    if kind ~= "name" and kind ~= "keyword" then
+        fail("expected a member name, found " .. describe_token())
     end
     local name = peek_value()
     advance()
@@ -640,31 +660,220 @@ parse_struct = function()
     advance() -- struct
 
     local name = expect_name()
-    expect_value("{", "`{` to open the struct fields")
     local fields = {}
-    while not at_value("}") do
-        local field_line = peek_line()
-        local field_column = peek_column()
-        local field_name = expect_name()
-        expect_value(":", "`:` after the field name")
-        local field_type = parse_type()
-        fields[#fields + 1] = {
-            name = field_name,
-            type = field_type,
-            line = field_line,
-            column = field_column
-        }
-        if not at_value(",") and not at_value(";") then
-            break
-        end
+    if at_value("{") then
         advance()
+        while not at_value("}") do
+            local field_line = peek_line()
+            local field_column = peek_column()
+            local field_name = expect_name()
+            expect_value(":", "`:` after the field name")
+            local field_type = parse_type()
+            fields[#fields + 1] = {
+                name = field_name,
+                type = field_type,
+                line = field_line,
+                column = field_column
+            }
+            if not at_value(",") and not at_value(";") then
+                break
+            end
+            advance()
+        end
+        expect_value("}", "`}` to close the struct")
+    else
+        -- Bare form: `struct Point x: i32, y: i32 end`.
+        while not at_keyword("end") do
+            local field_line = peek_line()
+            local field_column = peek_column()
+            local field_name = expect_name()
+            expect_value(":", "`:` after the field name")
+            local field_type = parse_type()
+            fields[#fields + 1] = {
+                name = field_name,
+                type = field_type,
+                line = field_line,
+                column = field_column
+            }
+            if at_value(",") or at_value(";") then
+                advance()
+            end
+        end
+        expect_value("end", "`end` to close the struct")
     end
-    expect_value("}", "`}` to close the struct")
 
+    struct_names[name] = true
     return {
         tag = "Struct",
         name = name,
         fields = fields,
+        line = line,
+        column = column
+    }
+end
+
+-- `match value with | pattern => body | _ => default end`
+--
+-- Desugared to `do local __match_N = value; if ... end end`.  The existing
+-- checker scopes every branch independently, so ownership is verified per arm
+-- and the generated code has no runtime match dispatch.
+parse_match_pattern = function()
+    local line = peek_line()
+    local column = peek_column()
+    local kind = peek_kind()
+    local value = peek_value()
+
+    if kind == "name" then
+        advance()
+        if value == "_" then
+            return {tag = "Wildcard", line = line, column = column}
+        end
+        return {tag = "Binding", name = value, line = line, column = column}
+    end
+
+    local literal = nil
+    if kind == "number" or kind == "string" then
+        literal = parse_primary()
+    elseif kind == "keyword" and (value == "nil" or value == "true" or value == "false") then
+        literal = parse_primary()
+    elseif kind == "operator" and value == "-" then
+        advance()
+        local inner = parse_primary()
+        literal = {
+            tag = "Unary",
+            op = "-",
+            value = inner,
+            line = line,
+            column = column
+        }
+    end
+
+    if literal == nil then
+        fail_at(line, column,
+            "expected a literal, a binding name, or `_` in the match pattern")
+    end
+    return {tag = "Literal", expr = literal, line = line, column = column}
+end
+
+parse_match_block = function()
+    local list = {}
+    while true do
+        local kind = peek_kind()
+        if kind == "eof" or at_keyword("end") or at_value("|") then
+            break
+        end
+        if at_value(";") then
+            advance()
+        else
+            local st = parse_stmt()
+            local is_return = st.tag == "Return"
+            list[#list + 1] = st
+            if at_value(";") then
+                advance()
+            end
+            if is_return then
+                break
+            end
+        end
+    end
+    return transfer(list)
+end
+
+parse_match = function()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- match
+
+    local scrutinee = parse_expr()
+    expect_value("with", "`with` after the match value")
+
+    match_seq = match_seq + 1
+    local temp = "__match_" .. tostring(match_seq)
+    local branches = {}
+    local else_body = nil
+    local arms = 0
+
+    while not at_keyword("end") and peek_kind() ~= "eof" do
+        if at_value("|") then
+            advance()
+        end
+        arms = arms + 1
+        local pattern = parse_match_pattern()
+        expect_value("=>", "`=>` after the match pattern")
+        local body = parse_match_block()
+
+        if pattern.tag == "Wildcard" then
+            else_body = body
+            break
+        elseif pattern.tag == "Binding" then
+            local binding = {
+                tag = "Local",
+                names = {pattern.name},
+                types = {"auto"},
+                values = {{
+                    tag = "Move",
+                    value = {
+                        tag = "Name",
+                        name = temp,
+                        line = pattern.line,
+                        column = pattern.column
+                    },
+                    line = pattern.line,
+                    column = pattern.column
+                }},
+                line = pattern.line,
+                column = pattern.column
+            }
+            local wrapped = {binding}
+            local i = 1
+            while i <= #body do
+                wrapped[#wrapped + 1] = body[i]
+                i = i + 1
+            end
+            else_body = wrapped
+            break
+        else
+            local cond = {
+                tag = "Binary",
+                op = "==",
+                lhs = {
+                    tag = "Name",
+                    name = temp,
+                    line = pattern.line,
+                    column = pattern.column
+                },
+                rhs = pattern.expr,
+                line = pattern.line,
+                column = pattern.column
+            }
+            branches[#branches + 1] = {cond = cond, body = body}
+        end
+    end
+
+    if arms == 0 then
+        fail_at(line, column,
+            "`match` requires at least one arm")
+    end
+    expect_value("end", "`end` to close the `match`")
+
+    local local_stmt = {
+        tag = "Local",
+        names = {temp},
+        types = {"auto"},
+        values = {scrutinee},
+        line = line,
+        column = column
+    }
+    local if_stmt = {
+        tag = "If",
+        branches = branches,
+        else_body = else_body,
+        line = line,
+        column = column
+    }
+    return {
+        tag = "Do",
+        body = {local_stmt, if_stmt},
         line = line,
         column = column
     }
@@ -778,6 +987,10 @@ parse_stmt = function()
             return parse_for()
         elseif value == "struct" then
             return parse_struct()
+        elseif value == "match" then
+            return parse_match()
+        elseif value == "import" or value == "mod" then
+            fail("imports must be resolved before parsing (use `lusalang run`/`build` on a file)")
         end
     elseif kind == "name" then
         return parse_assign_or_call()
@@ -882,7 +1095,44 @@ end
 
 parse_suffixes = function(e)
     while true do
-        if at_value("(") then
+        if at_value("{") and e.tag == "Name" and struct_names[e.name] == true then
+            local line = e.line
+            local column = e.column
+            local kind = e.name
+            advance() -- {
+            local fields = {}
+            while not at_value("}") do
+                local field_line = peek_line()
+                local field_column = peek_column()
+                local field_name = expect_name()
+                if at_value(":") then
+                    advance()
+                else
+                    expect_value("=", "`:` or `=` after the struct field name")
+                end
+                local field_value = parse_expr()
+                fields[#fields + 1] = {
+                    name = field_name,
+                    value = field_value,
+                    line = field_line,
+                    column = field_column
+                }
+                if at_value(",") or at_value(";") then
+                    advance()
+                elseif not at_value("}") then
+                    fail("expected `,` or `}` in the struct literal, found "
+                        .. describe_token())
+                end
+            end
+            expect_value("}", "`}` to close the struct literal")
+            e = {
+                tag = "StructLit",
+                name = kind,
+                fields = fields,
+                line = line,
+                column = column
+            }
+        elseif at_value("(") then
             local line = e.line
             local column = e.column
             advance() -- (
@@ -909,7 +1159,7 @@ parse_suffixes = function(e)
             }
         elseif at_value(".") then
             advance()
-            local name = expect_name()
+            local name = expect_member_name()
             local line = e.line
             local column = e.column
             e = {
@@ -921,7 +1171,7 @@ parse_suffixes = function(e)
             }
         elseif at_value(":") then
             advance()
-            local name = expect_name()
+            local name = expect_member_name()
             expect_value("(", "`(` after the method name")
             local args = parse_args()
             local line = e.line
@@ -1151,6 +1401,8 @@ function Parser.parse(input)
     tokens = input
     pos = 1
     total = #tokens
+    struct_names = {}
+    match_seq = 0
     if total == 0 then
         error("parser: empty token stream")
     end

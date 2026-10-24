@@ -6,8 +6,33 @@ use crate::ast::*;
 use crate::error::{LResult, LusaError, Span, E_PARSE};
 use crate::lexer;
 use crate::tokens::{StrSeg, Token, TokenKind as TK};
+use std::collections::HashSet;
+use std::path::Path;
 
 pub fn parse(src: &str) -> LResult<Block> {
+    parse_with_base(src, None)
+}
+
+/// Parses source with imports resolved relative to `base`.
+pub fn parse_with_base(src: &str, base: Option<&Path>) -> LResult<Block> {
+    let expanded = crate::imports::expand_imports(src, base)?;
+    parse_expanded(&expanded)
+}
+
+/// Parses a file, resolving imports relative to that file.
+pub fn parse_file(path: &Path) -> LResult<Block> {
+    let src = std::fs::read_to_string(path).map_err(|e| {
+        LusaError::new(
+            E_PARSE,
+            None,
+            format!("cannot read {}: {e}", path.display()),
+        )
+    })?;
+    let expanded = crate::imports::expand_imports_file(&src, path)?;
+    parse_expanded(&expanded)
+}
+
+fn parse_expanded(src: &str) -> LResult<Block> {
     let toks = lexer::lex(src)?;
     Parser::new(toks).parse_file()
 }
@@ -26,6 +51,11 @@ const PREC_POW: u8 = 8;
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    /// Struct names declared before the current expression.  Struct literals
+    /// only become unambiguous once the name is known, exactly like the
+    /// native backend's one-pass declaration order.
+    structs: HashSet<String>,
+    match_seq: usize,
 }
 
 fn merge(a: Span, b: Span) -> Span {
@@ -43,9 +73,20 @@ fn expr_field(obj: Expr, name: String, span: Span) -> Expr {
     }
 }
 
+enum MatchPattern {
+    Literal(Expr),
+    Binding(String, Span),
+    Wildcard,
+}
+
 impl Parser {
     fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0 }
+        Parser {
+            toks,
+            pos: 0,
+            structs: HashSet::new(),
+            match_seq: 0,
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -102,6 +143,19 @@ impl Parser {
         }
     }
 
+    fn expect_member_name(&mut self) -> LResult<(String, Span)> {
+        let tk = self.peek().clone();
+        if let TK::Name(n) = tk.kind.clone() {
+            self.bump();
+            return Ok((n, tk.span));
+        }
+        if let Some(text) = tk.kind.keyword_text() {
+            self.bump();
+            return Ok((text.to_string(), tk.span));
+        }
+        Err(self.unexpected_here("a member name"))
+    }
+
     // ===== statements =====
 
     fn parse_file(&mut self) -> LResult<Block> {
@@ -109,9 +163,15 @@ impl Parser {
     }
 
     fn parse_block(&mut self) -> LResult<Block> {
+        self.parse_block_until(&[])
+    }
+
+    /// Parses statements until one of the normal block terminators or an
+    /// extra terminator (used by `match` arms, which end at `|`).
+    fn parse_block_until(&mut self, extra_ends: &[TK]) -> LResult<Block> {
         let mut block = Vec::new();
         loop {
-            if STMT_ENDS.contains(&self.peek().kind) {
+            if STMT_ENDS.contains(&self.peek().kind) || extra_ends.contains(&self.peek().kind) {
                 break;
             }
             if self.eat(TK::Semi) {
@@ -175,6 +235,15 @@ impl Parser {
                 St { kind: StKind::Unsafe { body }, span: tk.span }
             }
             TK::Struct => self.parse_struct_st()?,
+            TK::Match => self.parse_match()?,
+            TK::Import | TK::Mod => {
+                return Err(LusaError::new(
+                    E_PARSE,
+                    Some(tk.span),
+                    "unresolved import statement",
+                )
+                .help("imports are resolved before parsing; check the path and that the driver received a base directory"));
+            }
             TK::Function => self.parse_func_st()?,
             TK::Break => {
                 self.bump();
@@ -286,21 +355,187 @@ impl Parser {
     fn parse_struct_st(&mut self) -> LResult<St> {
         let kw = self.bump();
         let (name, name_span) = self.expect_name()?;
-        self.expect(TK::LBrace, "`{` to open the struct fields")?;
+        let mut fields = Vec::new();
+        if self.eat(TK::LBrace) {
+            while !self.at(TK::RBrace) {
+                let (fname, fspan) = self.expect_name()?;
+                self.expect(TK::Colon, "`:` after the field name")?;
+                let ty = self.parse_type_annotation()?;
+                fields.push(StructField { name: fname, ty, span: fspan });
+                if !self.eat(TK::Comma) {
+                    self.eat(TK::Semi);
+                    if !matches!(self.peek().kind, TK::Name(_)) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TK::RBrace, "`}` to close the struct")?;
+        } else {
+            // Bare form: `struct Point x: i32, y: i32 end`.
+            while !self.at(TK::End) {
+                let (fname, fspan) = self.expect_name()?;
+                self.expect(TK::Colon, "`:` after the field name")?;
+                let ty = self.parse_type_annotation()?;
+                fields.push(StructField { name: fname, ty, span: fspan });
+                self.eat(TK::Comma);
+                self.eat(TK::Semi);
+            }
+            self.expect(TK::End, "`end` to close the struct")?;
+        }
+        self.structs.insert(name.clone());
+        let span = merge(kw.span, name_span);
+        Ok(St { kind: StKind::Struct { name, fields }, span })
+    }
+
+    /// `Point{x: 1, y: 2}` — the current token is `{`.
+    fn parse_struct_lit(&mut self, name: String, start: Span) -> LResult<Expr> {
+        self.expect(TK::LBrace, "`{` to open the struct literal")?;
         let mut fields = Vec::new();
         while !self.at(TK::RBrace) {
             let (fname, fspan) = self.expect_name()?;
-            self.expect(TK::Colon, "`:` after the field name")?;
-            let ty = self.parse_type_annotation()?;
-            fields.push(StructField { name: fname, ty, span: fspan });
-            if !self.eat(TK::Comma) && !self.at(TK::Semi) {
+            if !self.eat(TK::Colon) {
+                self.expect(TK::Assign, "`:` or `=` after the struct field name")?;
+            }
+            let value = self.parse_expr()?;
+            fields.push(StructLitField { name: fname, value, span: fspan });
+            if !self.eat(TK::Comma) {
+                if self.at(TK::RBrace) {
+                    break;
+                }
+                let continues = matches!(self.peek().kind, TK::Name(_))
+                    && matches!(self.peek_at(1).kind, TK::Colon | TK::Assign);
+                if !continues {
+                    break;
+                }
+            }
+        }
+        let close = self.expect(TK::RBrace, "`}` to close the struct literal")?;
+        Ok(Expr {
+            kind: ExprKind::StructLit { name, fields },
+            span: merge(start, close.span),
+        })
+    }
+
+    /// `match expr with | pattern => body | _ => default end`
+    ///
+    /// Lowered to an ordinary `do` block plus a hidden local and `if`/`elseif`
+    /// chain.  Because the existing checker scopes each branch independently,
+    /// ownership errors inside an arm are caught statically with no runtime
+    /// match machinery.
+    fn parse_match(&mut self) -> LResult<St> {
+        let kw = self.bump();
+        let scrutinee = self.parse_expr()?;
+        self.expect(TK::With, "`with` after the match value")?;
+        self.match_seq += 1;
+        let temp = format!("__match_{}", self.match_seq);
+        let temp_span = kw.span;
+        let temp_var = || expr_var(temp.clone(), temp_span);
+        let mut branches: Vec<(Expr, Block)> = Vec::new();
+        let mut else_block: Option<Block> = None;
+        let mut saw_default = false;
+        let mut arm_count = 0usize;
+
+        while !self.at(TK::End) && !self.at(TK::Eof) {
+            self.eat(TK::Pipe);
+            arm_count += 1;
+            let pattern = self.parse_match_pattern()?;
+            let arrow = self.expect(TK::FatArrow, "`=>` after the match pattern")?;
+            let body = self.parse_block_until(&[TK::Pipe])?;
+            match pattern {
+                MatchPattern::Wildcard => {
+                    else_block = Some(body);
+                    saw_default = true;
+                }
+                MatchPattern::Binding(name, bspan) => {
+                    let bind = St {
+                        kind: StKind::Local {
+                            targets: vec![name],
+                            values: vec![Expr {
+                                kind: ExprKind::Move { e: Box::new(temp_var()) },
+                                span: bspan,
+                            }],
+                            annotations: vec![None],
+                        },
+                        span: bspan,
+                    };
+                    let mut wrapped = vec![bind];
+                    wrapped.extend(body);
+                    else_block = Some(wrapped);
+                    saw_default = true;
+                }
+                MatchPattern::Literal(lit) => {
+                    let cond = Expr {
+                        kind: ExprKind::Bin {
+                            op: BinOp::Eq,
+                            l: Box::new(temp_var()),
+                            r: Box::new(lit),
+                        },
+                        span: merge(arrow.span, temp_span),
+                    };
+                    branches.push((cond, body));
+                }
+            }
+            if saw_default {
                 break;
             }
-            self.eat(TK::Semi);
         }
-        self.expect(TK::RBrace, "`}` to close the struct")?;
-        let span = merge(kw.span, name_span);
-        Ok(St { kind: StKind::Struct { name, fields }, span })
+        if arm_count == 0 {
+            return Err(LusaError::new(
+                E_PARSE,
+                Some(kw.span),
+                "`match` requires at least one arm",
+            )
+            .help("write `match value with | pattern => body | _ => body end`"));
+        }
+        self.expect(TK::End, "`end` to close the `match`")?;
+        let local = St {
+            kind: StKind::Local {
+                targets: vec![temp],
+                values: vec![scrutinee],
+                annotations: vec![None],
+            },
+            span: kw.span,
+        };
+        let if_stmt = St {
+            kind: StKind::If { branches, else_block },
+            span: kw.span,
+        };
+        Ok(St {
+            kind: StKind::Do { body: vec![local, if_stmt] },
+            span: kw.span,
+        })
+    }
+
+    fn parse_match_pattern(&mut self) -> LResult<MatchPattern> {
+        let tk = self.peek().clone();
+        if let TK::Name(ref name) = tk.kind {
+            if name == "_" {
+                self.bump();
+                return Ok(MatchPattern::Wildcard);
+            }
+            self.bump();
+            return Ok(MatchPattern::Binding(name.clone(), tk.span));
+        }
+        let lit = match tk.kind {
+            TK::Str(_) | TK::Num(_) | TK::Int(_) | TK::Nil | TK::True | TK::False => {
+                self.parse_primary()?
+            }
+            TK::Minus => {
+                let minus = self.bump();
+                let inner = self.parse_primary()?;
+                let span = merge(minus.span, inner.span);
+                Expr {
+                    kind: ExprKind::Un { op: UnOp::Neg, e: Box::new(inner) },
+                    span,
+                }
+            }
+            _ => {
+                return Err(self.unexpected_here("a literal, a binding name, or `_`").help(
+                    "match patterns support numbers, strings, booleans, nil, `_`, and a single binding name",
+                ));
+            }
+        };
+        Ok(MatchPattern::Literal(lit))
     }
 
     fn parse_local_st(&mut self) -> LResult<St> {
@@ -424,12 +659,12 @@ impl Parser {
         loop {
             if self.at(TK::Colon) {
                 self.bump();
-                let (m, _) = self.expect_name()?;
+                let (m, _) = self.expect_member_name()?;
                 method_name = Some(m);
                 break;
             } else if self.at(TK::Dot) {
                 self.bump();
-                let (n, nsp) = self.expect_name()?;
+                let (n, nsp) = self.expect_member_name()?;
                 target = expr_field(target, n, merge(sp0, nsp));
             } else {
                 break;
@@ -603,7 +838,7 @@ impl Parser {
             match t.kind {
                 TK::Dot => {
                     self.bump();
-                    let (n, nsp) = self.expect_name()?;
+                    let (n, nsp) = self.expect_member_name()?;
                     let span = merge(e.span, nsp);
                     e = expr_field(e, n, span);
                 }
@@ -619,7 +854,7 @@ impl Parser {
                 }
                 TK::Colon => {
                     self.bump();
-                    let (m, msp) = self.expect_name()?;
+                    let (m, msp) = self.expect_member_name()?;
                     self.expect(TK::LParen, "`(` to call the method")?;
                     let args = self.parse_args()?;
                     let span = merge(e.span, msp);
@@ -638,6 +873,14 @@ impl Parser {
                     };
                 }
                 TK::LBrace => {
+                    if let ExprKind::Var(name) = &e.kind {
+                        if self.structs.contains(name.as_str()) {
+                            let name = (**name).clone();
+                            let span = e.span;
+                            e = self.parse_struct_lit(name, span)?;
+                            continue;
+                        }
+                    }
                     let arg = self.parse_primary()?; // table literal
                     let span = merge(e.span, arg.span);
                     e = Expr {

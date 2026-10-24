@@ -274,6 +274,65 @@ registry.
 - Dynamic code that mutates tables through aliases may be rejected by static
   rules; keep `unsafe` and clear migration notes.
 
+## Module 15 - Struct literals, match, and compile-time modules (shipped in v1.1.0)
+
+### 15.1 Struct literals and deep RAII
+
+- Both `struct Point { x: i32, y: i32 }` and
+  `struct Point x: i32, y: i32 end` declare the same layout.
+- `Point{x: 10}` fills omitted scalar fields with zero/`false` and omitted
+  `string`/table fields with `nil`. Unknown and duplicate fields report
+  `E0309`/`E0302`.
+- Fields may be scalars, `string`, `table`/`table<T>`, raw pointers, or
+  previously declared structs. Native builds emit a C typedef in declaration
+  order; nested structs are embedded by value.
+- Each declaration emits `lusa_drop_<Name>` and `lusa_clone_<Name>` helpers
+  that recurse through nested struct, string, and table fields.
+- Scalar-only structs are Copy in the interpreter and VM; structs that own heap
+  fields move. Clones preserve struct identity tags on nested field tables.
+
+### 15.2 Zero-overhead `match`
+
+- `match value with | literal => ... | name => ... | _ => ... end` evaluates
+  the scrutinee once.
+- Literal arms become `==` branches; a binding arm moves the value into a new
+  local; `_` becomes the `else` body. A binding or wildcard arm must be last.
+- Both parsers emit a hidden local and an ordinary `if`/`elseif` chain. No
+  bytecode instruction, runtime dispatcher, or C arm metadata is generated.
+- Ownership is checked independently per arm, so moves cannot leak across
+  branches.
+
+### 15.3 Compile-time imports
+
+- `import "file.lusa"` resolves relative to the importing file; `mod a.b`
+  resolves `a/b.lusa`, `a/b/mod.lusa`, or `a/b/main.lusa`.
+- Expansion is recursive and deduplicated by canonical path, so shared modules
+  contribute their definitions once.
+- Imports are expanded before parsing by `src/imports.rs`; all files share one
+  symbol table. There are no namespaces or export filters.
+
+### 15.4 Inline assembly
+
+- `unsafe_asm("text")` lowers to `LUSA_ASM("text")`, defined as
+  `({ __asm__ volatile (text : : ); })` on GCC/Clang and as a no-op elsewhere.
+- The text must be a plain string literal without quotes, backslashes, or
+  newlines.
+
+**Acceptance criteria**
+
+- `tests/module15.rs` covers both struct forms, literals/defaults, nested deep
+  clone/drop, scalar-only copy semantics, match arms and per-arm `E1001`,
+  recursive imports/modules with deduplication, and inline assembly.
+- Interpreter, VM, and native builds produce identical output for the shared
+  example programs.
+
+**Risks**
+
+- Imports are flat textual includes; large projects may want namespaces,
+  selective exports, and explicit module manifests in a future release.
+- Forward struct references remain unsupported because the native checker is
+  single-pass.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -298,6 +357,7 @@ registry.
 | v0.8.0 | Native `pcall`, coroutines (shipped) | three-OS CI, native unwind/leak suite, parity tests |
 | v0.9.0 | Pattern matching and string utilities (shipped) | shared matcher, native/VM/interpreter parity, RAII lifetime tests |
 | v1.0.0 | Static borrow checker, explicit `move`, stabilization (shipped) | golden diagnostics, native/VM/interpreter parity, frozen semantics |
+| v1.1.0 | Struct literals, `match`, compile-time modules, inline asm (shipped) | deep struct RAII, per-arm ownership, import deduplication, three-engine parity |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

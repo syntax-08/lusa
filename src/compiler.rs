@@ -12,6 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -120,6 +121,9 @@ pub enum Instr {
     TakeField(u16, u16, u16), // (key const, source-label const, dest-label const)
     TakeIndex(u16, u16),      // (source-label const, dest-label const)
     NewTable,
+    /// Tags the table on top of the stack as an instance of the named struct.
+    /// The tag drives value-copy semantics for scalar-only structs.
+    MarkStruct(u16),
     GetField(u16), // TOS = obj
     GetIndex,      // TOS = key, under = obj
     SetGlob(u16),  // TOS = value
@@ -782,6 +786,7 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
             compile_method(c, obj, name, args, e.span, *span_args_end)?;
         }
         ExprKind::Table(entries) => compile_table(c, entries)?,
+        ExprKind::StructLit { name, fields } => compile_struct_lit(c, name, fields, e.span)?,
         ExprKind::Func(lit) => {
             compile_nested_fn(c, lit, "anonymous")?;
         }
@@ -1150,6 +1155,114 @@ fn compile_table(c: &mut Compiler, entries: &[TableEntry]) -> LResult<()> {
     Ok(())
 }
 
+/// Compiles a static struct literal into a table with the struct's declared
+/// fields initialized in declaration order, then the supplied fields in source
+/// order.  The dynamic engines use the same shape, so programs produce the
+/// same field layout in both backends.
+fn compile_struct_lit(
+    c: &mut Compiler,
+    name: &str,
+    fields: &[StructLitField],
+    span: Span,
+) -> LResult<()> {
+    let def = match c.struct_defs.get(name) {
+        Some(def) => def.clone(),
+        None => {
+            return Err(LusaError::new(
+                crate::error::E_PARSE,
+                Some(span),
+                format!("unknown struct `{name}`"),
+            )
+            .help("declare it with `struct Name ... end` before using a struct literal"));
+        }
+    };
+    let mut seen: Vec<&str> = Vec::new();
+    for field in fields {
+        if !def.iter().any(|(fname, _)| fname == &field.name) {
+            return Err(LusaError::new(
+                crate::error::E_PARSE,
+                Some(field.span),
+                format!("struct `{name}` has no field `{}`", field.name),
+            ));
+        }
+        if seen.contains(&field.name.as_str()) {
+            return Err(LusaError::new(
+                crate::error::E_PARSE,
+                Some(field.span),
+                format!("duplicate field `{}` in struct literal", field.name),
+            ));
+        }
+        seen.push(field.name.as_str());
+    }
+
+    emit_struct_defaults(c, &def, 0, span, name)?;
+    for field in fields {
+        c.set_line(field.span);
+        let key = c.konst_str(&field.name);
+        c.em(Instr::LoadConst(key));
+        let dest = format!("field `{}` of `{name}`", field.name);
+        let _ = compile_take_value(c, &field.value, &dest, false)?;
+        truncate_if_expansion(c, &field.value);
+        c.set_line(field.span);
+        c.em(Instr::SetIndex);
+    }
+    Ok(())
+}
+
+/// Emits `NewTable` followed by keyed defaults for every declared field.
+fn emit_struct_defaults(
+    c: &mut Compiler,
+    fields: &[(String, String)],
+    depth: usize,
+    span: Span,
+    name: &str,
+) -> LResult<()> {
+    c.set_line(span);
+    c.em(Instr::NewTable);
+    for (fname, ty) in fields {
+        c.set_line(span);
+        let key = c.konst_str(fname);
+        c.em(Instr::LoadConst(key));
+        emit_struct_default_value(c, ty, depth, span)?;
+        c.set_line(span);
+        c.em(Instr::SetIndex);
+    }
+    let tag = c.konst_str(name);
+    c.em(Instr::MarkStruct(tag));
+    Ok(())
+}
+
+fn emit_struct_default_value(
+    c: &mut Compiler,
+    ty: &str,
+    depth: usize,
+    span: Span,
+) -> LResult<()> {
+    c.set_line(span);
+    if ty == "bool" {
+        let k = c.konst(&ConstKey::of(&Value::Bool(false)));
+        c.em(Instr::LoadConst(k));
+        return Ok(());
+    }
+    if ty == "string"
+        || ty == "table"
+        || ty.starts_with("table<")
+        || ty.starts_with('*')
+        || ty == "nil"
+    {
+        c.em(Instr::LoadNil);
+        return Ok(());
+    }
+    if depth < 8 {
+        if let Some(fields) = c.struct_defs.get(ty).cloned() {
+            return emit_struct_defaults(c, &fields, depth + 1, span, ty);
+        }
+    }
+    let k = c.konst(&ConstKey::of(&Value::Number(0.0)));
+    c.em(Instr::LoadConst(k));
+    Ok(())
+}
+
 /// Compiles a nested function literal as a prototype + MakeClosure.
 fn compile_nested_fn(c: &mut Compiler, lit: &FuncLit, name: &str) -> LResult<()> {
     let parent = c.top();
@@ -1340,6 +1453,8 @@ fn compile_local(
                     c.em(Instr::LoadConst(zero_k));
                     c.em(Instr::SetIndex);
                 }
+                let tag = c.konst_str(ann);
+                c.em(Instr::MarkStruct(tag));
             }
             _ => {
                 let _ = c.em(Instr::LoadNil);
@@ -1706,8 +1821,13 @@ fn compile_return(c: &mut Compiler, values: &[Expr], span: Span) -> LResult<()> 
 /// Compiles a whole source program into a runnable main chunk.
 /// Top-level statements compile as the body of a chunk named "main".
 pub fn compile_program(src: &str) -> LResult<Rc<Compiled>> {
+    compile_program_with_base(src, None)
+}
+
+/// Compiles a source program, resolving imports relative to `base`.
+pub fn compile_program_with_base(src: &str, base: Option<&Path>) -> LResult<Rc<Compiled>> {
     let source = Arc::new(SourceMap::new(src));
-    let ast = crate::parser::parse(src)?;
+    let ast = crate::parser::parse_with_base(src, base)?;
     let c = &mut Compiler {
         frames: vec![Frame::new("main", None)],
         source,

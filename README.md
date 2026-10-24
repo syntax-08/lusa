@@ -17,7 +17,9 @@ backend: `find`, `match`, `gmatch`, and `gsub` with bounded matching, static
 pattern diagnostics, and RAII-tracked temporary strings. Module 14 completes
 the v1.0.0 language with a compile-time borrow checker, explicit `move`
 expressions, stronger aliasing diagnostics, and borrow support in the bytecode
-VM.
+VM. Module 15 turns structs into literals with defaults and deep RAII, adds
+zero-overhead `match`, compile-time `import`/`mod` composition, and GNU-style
+inline assembly.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -104,6 +106,7 @@ See [`examples/`](examples/):
 | `error_recovery.lusa`     | `pcall`, error strings, and native cleanup            |
 | `coroutines.lusa`         | create/resume/yield/status/close lifecycle            |
 | `string_patterns.lusa`    | `find`/`match`/`gmatch`/`gsub` with captures and anchors |
+| `struct_match.lusa`       | struct literals, nested deep clone, and `match` arms |
 | `photocraft.lusa`         | mini photo-lab: 2D image in tables → filters → ASCII-art |
 
 Also in the root: `bench.lusa` — reference workload for measuring speed
@@ -161,6 +164,7 @@ src/
   pattern_runtime.c       # C11 matcher appended to every native translation unit
   error.rs    main.rs     # LusaError + cargo-style render; CLI/REPL
   cbackend.rs             # embedded self-hosted C11 backend + host compiler discovery
+  imports.rs              # compile-time `import`/`mod` expansion and deduplication
   lib.rs                  # public API (used by tests/integration.rs)
 lexer.lusa                # self-hosted lexer written in Lusa
 parser.lusa               # self-hosted recursive-descent parser (typed subset)
@@ -525,6 +529,83 @@ lusalang run examples/borrow_checker.lusa --vm
 lusalang run examples/borrow_checker.lusa --native
 ```
 
+### Struct literals, match, and modules (Module 15)
+
+Structs support both brace and bare declaration forms, literals with defaults,
+nested struct and heap fields, and deep RAII:
+
+```lusa
+struct Point { x: i32, y: i32 }
+struct Label
+    origin: Point,
+    text: string
+end
+
+local p = Point{x: 10}           -- y defaults to 0
+local tag = Label{origin: p, text: "corner"}
+tag.origin.x = 4
+local copy = clone tag           -- Point is copied; string is deep-cloned
+print(tag.origin.x, copy.text)   -- 4	corner
+```
+
+Each declaration emits a native C typedef with fields in declaration order.
+In the dynamic engines, structs made only of scalar fields are Copy; structs
+that own `string`/`table` fields move like tables. The native checker applies
+the same ownership model. Generated `lusa_drop_<Name>` and
+`lusa_clone_<Name>` helpers deep-release and deep-copy nested struct, string,
+and table fields, so RAII stays exact.
+
+`match` evaluates its value once and lowers to ordinary `if`/`elseif` code:
+
+```lusa
+match kind with
+| 0 => print("zero")
+| 1 => print("one")
+| other => print("many", other)
+end
+```
+
+Literal arms compare with `==`; a single name binds the value (moving it) and
+`_` is the wildcard. The checker validates ownership separately in each arm,
+and generated C contains no dispatcher or runtime arm table.
+
+Imports are resolved before parsing and merged into one symbol table:
+
+```lusa
+import "geo/point.lusa"   -- relative to the importing file
+mod counter               -- counter.lusa, counter/mod.lusa, or counter/main.lusa
+
+local p = Point{x: 1, y: 2}
+local c = bump(Counter{count: 4})
+```
+
+Expansion is recursive, relative to the importing file, and deduplicated by
+canonical path, so a module included twice contributes its definitions once.
+The same expansion runs for the interpreter, bytecode VM, native build, and
+`--emit-c`.
+
+`unsafe_asm("...")` lowers to the GNU volatile statement form behind a portable
+macro:
+
+```c
+#define LUSA_ASM(text) ({ __asm__ volatile (text : : ); })
+```
+
+```lusa
+unsafe do
+    unsafe_asm("wfe")
+end
+```
+
+GCC and Clang emit the instruction; toolchains without inline assembly use a
+no-op definition.
+
+```sh
+lusalang run examples/struct_match.lusa
+lusalang run examples/struct_match.lusa --vm
+lusalang run examples/struct_match.lusa --native
+```
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -541,8 +622,10 @@ illustrative MMIO address before native execution).
 Cargo-style diagnostics, unsafe volatile emission, and a native build/run test
 that skips when no compiler is installed. `tests/module12.rs` adds native
 `pcall` recovery, allocation marks, uncaught-error exits, coroutine lifecycle,
-nested yields, and dynamic parity. See
-[`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
+nested yields, and dynamic parity. `tests/module15.rs` adds both struct
+declaration forms, literals/defaults/nested deep clone, `match` arms and
+per-arm ownership, recursive import/module deduplication, and inline assembly.
+See [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
 [`docs/LANGUAGE.md`](docs/LANGUAGE.md) section 9 for details.
 
 ## Bytecode VM: registers and source lines
@@ -595,6 +678,9 @@ Near-term milestones:
 - **v1.0.0 (shipped):** compile-time borrow checking, explicit `move`,
   `clone` deep copies, VM `borrow` support, golden diagnostics, and language
   stabilization.
+- **v1.1.0 (shipped):** struct literals with defaults and deep RAII,
+  zero-overhead `match`, compile-time `import`/`mod` modules, and GNU-style
+  inline assembly.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of
