@@ -418,9 +418,9 @@ Codes `E{category}{n}`, like rustc:
 | E0308  | static   | C11 backend: mismatched types (assignment, return, call, condition) |
 | E0309  | static   | C11 backend: struct/table has no such field |
 | E0311  | static   | C11 backend: wrong argument/initializer count |
-| E0312  | static   | C11 backend: unsupported construct (struct field type, whole-array value, invalid `&` place, or array-by-value call) |
+| E0312  | static   | C11 backend: unsupported construct (struct field type, whole-array value, invalid `&` place, array-by-value call, or non-scalar volatile element) |
 | E0313  | static   | C11 backend: zero or one return value only; void/value return mismatch |
-| E0316  | unsafe   | C11 backend: raw pointer intrinsic used outside `unsafe` |
+| E0316  | unsafe   | C11 backend: raw pointer or volatile intrinsic used outside `unsafe` |
 | E0317  | static   | C11 backend: `pcall`, `coroutine.resume`, or `string.gmatch` used outside its required local/loop form |
 | E0318  | static   | C11 backend: missing method or invalid method receiver |
 | E0319  | static   | C11 backend: unsupported generic `for` iterator; invalid native coroutine entry function, handle, operation, or string method |
@@ -543,9 +543,12 @@ uint32_t read = (uint32_t)((*(volatile uint32_t *)(uintptr_t)(v)));
 ```
 
 Both reads and writes use the same `volatile uint32_t` lvalue form, which is
-valid C11 for GCC, Clang, TCC, and MSVC. `unsafe_ptr_cast(address) -> i128` (a
-`uintptr_t` in C), `unsafe_read_mem(address) -> u32`, and
-`unsafe_write_mem(address, value)` are rejected outside an `unsafe` block with
+valid C11 for GCC, Clang, TCC, and MSVC. For typed access, prefer
+`volatile_read`/`volatile_write` or the `read_volatile`/`write_volatile` method
+sugar described in section 9.10. `unsafe_ptr_cast(address) -> i128` (a
+`uintptr_t` in C), `unsafe_read_mem(address) -> u32`,
+`unsafe_write_mem(address, value)`, `volatile_read(ptr)`, and
+`volatile_write(ptr, value)` are rejected outside an `unsafe` block with
 `E0316` in the C backend. Use these only with addresses that are valid on the
 target board/process; the native backend intentionally does not add bounds
 checks or a memory sandbox.
@@ -988,7 +991,88 @@ outside `unsafe` reports `E0321`, pointer arithmetic outside it reports
 `&place` allocates a simulated cell and dereferences read/write that cell; they
 never touch host memory, and writes do not alias the originating local.
 
-### 9.10 Native subset limits
+### 9.10 Volatile MMIO and struct representation (Module 17)
+
+Hardware polling needs loads that the optimizer cannot remove, and register
+blocks need layouts that match the datasheet. Volatile access has three
+equivalent spellings; all of them require `unsafe`:
+
+```lusa
+unsafe do
+    local status: *mut u32 = unsafe_alloc(16)
+
+    status.write_volatile(0)        -- dot method
+    status:write_volatile(0)        -- colon method
+    volatile_write(status, 0)       -- builtin
+
+    local a: u32 = status.read_volatile()
+    local b: u32 = volatile_read(status)
+    print(a, b)
+end
+```
+
+- `read_volatile`/`write_volatile` are lowered by both parsers into
+  `volatile_read(ptr)`/`volatile_write(ptr, value)`, so the interpreter, VM,
+  and C11 backend share one call shape.
+- The element type is taken from the pointer: `*mut u32`, `*mut i32`,
+  `*mut i128`, `*mut f32`, or `*mut bool`. A bare integer address defaults to
+  `u32`. Non-scalar elements are rejected with `E0312` so a volatile access
+  cannot bypass heap RAII.
+- `write_volatile` checks the value against the element type (`E0308`) and the
+  intrinsic arity is checked with `E0311`.
+- Native code emits a typed volatile lvalue load or store:
+
+  ```c
+  uint32_t value = (*(volatile uint32_t *)(uintptr_t)(ptr));
+  (*(volatile uint32_t *)(uintptr_t)(ptr)) = (uint32_t)(value);
+  ```
+
+- The interpreter and `--vm` route both builtins through the same simulated
+  address map as `unsafe_read_mem`/`unsafe_write_mem`; booleans are stored as
+  `1`/`0`. Outside `unsafe` the dynamic engines report `E0321`; the native
+  checker reports `E0316`.
+
+Struct declarations accept representation attributes:
+
+```lusa
+#[packed]
+struct GpioConfig {
+    mode: u32,
+    pull: u32,
+    speed: u32,
+}
+
+#[repr(align(16))]
+struct DmaDescriptor {
+    source: u32,
+    destination: u32,
+    control: u32,
+}
+```
+
+- `#[packed]` removes inter-field padding. The C11 backend wraps the typedef in
+  `LUSA_PACK_BEGIN`/`LUSA_PACK_END` and marks it `LUSA_PACKED`.
+- `#[repr(align(N))]` raises the struct's alignment; `N` must be a power of two
+  from `1` to `4096`. The emitter places `LUSA_ALIGNAS(N)` on the first member,
+  which is valid C11 and also raises the enclosing struct's alignment.
+- The preamble defines the macros once for MSVC (`__pragma(pack(...))`,
+  `__declspec(align(n))`), GCC/Clang (`__attribute__((packed))`,
+  `__attribute__((aligned(n)))`), and other C11 compilers (`_Alignas(n)`).
+- Duplicate attributes, unsupported attributes, and invalid alignments are
+  rejected by both parsers before code generation with `E0101`.
+- The dynamic engines accept and ignore the layout attributes; they keep their
+  fixed-field struct simulation, so programs remain portable across engines.
+
+`examples/baremetal_gpio.lusa` exercises a packed configuration, an aligned DMA
+descriptor, and a volatile polling loop against a simulated peripheral block:
+
+```sh
+lusalang run examples/baremetal_gpio.lusa
+lusalang run examples/baremetal_gpio.lusa --vm
+lusalang run examples/baremetal_gpio.lusa --native
+```
+
+### 9.11 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 table literals, fixed-size `[T; N]` arrays and array literals, nested keyed
@@ -997,12 +1081,14 @@ colon methods, `pairs`/`ipairs` generic `for` over tables, `#` on strings,
 tables, and arrays, `if`, `while`, `repeat`, `do`, `return`, `break`,
 assignments, globals, `print`, `clone`, `borrow`, `move`, the compile-time
 borrow checker, `unsafe` blocks, static `struct` declarations in brace and bare
-form, struct literals with defaults (scalar, `string`, `table`, pointer, and
-previously declared struct fields), `match`, compile-time `import`/`mod`,
-address-of (`&place`), raw pointer types (`*mut T`, `*const T`), pointer
-arithmetic and dereferences inside `unsafe`, the raw intrinsics above
-(`unsafe_ptr_cast`, `unsafe_read_mem`, `unsafe_write_mem`, `unsafe_alloc`,
-`unsafe_nop`, `unsafe_asm`), native `pcall`, the string-pattern surface in
+form, `#[packed]`/`#[repr(align(N))]` representation attributes, struct
+literals with defaults (scalar, `string`, `table`, pointer, and previously
+declared struct fields), `match`, compile-time `import`/`mod`, address-of
+(`&place`), raw pointer types (`*mut T`, `*const T`), pointer arithmetic and
+dereferences inside `unsafe`, the raw intrinsics above (`unsafe_ptr_cast`,
+`unsafe_read_mem`, `unsafe_write_mem`, `unsafe_alloc`, `volatile_read`,
+`volatile_write`, `unsafe_nop`, `unsafe_asm`), native `pcall`, the
+string-pattern surface in
 section 9.7, and the restricted
 `coroutine.create/resume/yield/status/close/isyieldable` surface described in
 section 9.6.

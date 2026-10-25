@@ -1359,7 +1359,7 @@ fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
         StKind::Local { targets, values, annotations } => {
             compile_local(c, targets, values, annotations, st.span)?
         }
-        StKind::Struct { name, fields } => {
+        StKind::Struct { name, fields, .. } => {
             let list = fields
                 .iter()
                 .map(|f| (f.name.clone(), f.ty.clone()))

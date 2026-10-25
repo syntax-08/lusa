@@ -164,6 +164,45 @@ fn b_unsafe_read_mem(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Ve
     one(Value::Number(value))
 }
 
+/// Accepts the scalar spellings supported by volatile hardware access.  The
+/// sandbox stores plain numbers, so `bool` is represented as 1/0.
+fn volatile_value(v: &Value, what: &str, span: Span) -> LResult<f64> {
+    match v.base_value() {
+        Value::Number(n) => Ok(*n),
+        Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+        other => Err(LusaError::new(
+            E_NUM,
+            Some(span),
+            format!(
+                "expected a scalar for `{what}`, got {} ({})",
+                other.type_name(),
+                other.fmt_value()
+            ),
+        )),
+    }
+}
+
+/// `volatile_read(ptr)`: a typed, volatile load from the simulated address
+/// space.  The native backend lowers the call to `*(volatile T *)(ptr)`, so
+/// polling loops cannot be optimized away by the C compiler.
+fn b_volatile_read(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    require_unsafe(i, "volatile memory access", span)?;
+    let addr = mem_addr(&args, span)?;
+    let value = i.unsafe_mem.get(&addr).copied().unwrap_or(0.0);
+    one(Value::Number(value))
+}
+
+/// `volatile_write(ptr, value)`: the write half of `volatile_read`.  The
+/// native backend emits a volatile lvalue store using the pointer element
+/// type inferred by the C backend.
+fn b_volatile_write(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    require_unsafe(i, "volatile memory access", span)?;
+    let addr = mem_addr(&args, span)?;
+    let value = volatile_value(get(&args, 1, "value", span)?, "value", span)?;
+    i.unsafe_mem.insert(addr, value);
+    Ok(Vec::new())
+}
+
 /// `unsafe_alloc(bytes)`: reserves a fresh region of the simulated address
 /// space and returns its base address.  The native backend allocates a real
 /// zeroed buffer; the sandbox hands out cell-aligned virtual addresses.
@@ -608,6 +647,8 @@ pub fn all() -> Vec<(&'static str, BF)> {
         ("unsafe_write_mem", Box::new(b_unsafe_write_mem)),
         ("unsafe_read_mem", Box::new(b_unsafe_read_mem)),
         ("unsafe_alloc", Box::new(b_unsafe_alloc)),
+        ("volatile_read", Box::new(b_volatile_read)),
+        ("volatile_write", Box::new(b_volatile_write)),
         ("unsafe_nop", Box::new(b_unsafe_nop)),
         ("unsafe_asm", Box::new(b_unsafe_asm)),
         ("io_read_file", Box::new(b_io_read_file)),

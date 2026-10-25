@@ -35,7 +35,16 @@ pub enum StKind {
     /// `struct Name { field: type, ... }` declaration.  The native backend
     /// lowers it to a C struct; the dynamic engines simulate it as a
     /// fixed-field buffer.
-    Struct { name: String, fields: Vec<StructField> },
+    ///
+    /// `packed` and `align` carry `#[packed]` / `#[repr(align(N))]`
+    /// representation attributes.  The dynamic engines ignore the physical
+    /// layout; only the C11 backend needs it.
+    Struct {
+        name: String,
+        fields: Vec<StructField>,
+        packed: bool,
+        align: Option<u32>,
+    },
     /// `unsafe do ... end` block (raw pointers and intrinsics only).
     Unsafe { body: Block },
     /// expression statement (usually a call)

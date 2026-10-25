@@ -21,7 +21,9 @@ VM. Module 15 turns structs into literals with defaults and deep RAII, adds
 zero-overhead `match`, compile-time `import`/`mod` composition, and GNU-style
 inline assembly. Module 16 adds fixed-size `[T; N]` arrays, zero-based
 indexing, address-of (`&place`), and raw-pointer arithmetic for buffering and
-AST work.
+AST work. Module 17 adds volatile MMIO access (`read_volatile`/
+`write_volatile`), packed structs (`#[packed]`), and explicit alignment
+(`#[repr(align(N))]`).
 
 ```
 lusa> local t = {1, 2, 3}
@@ -653,6 +655,68 @@ lusalang run examples/arrays_pointers.lusa --vm
 lusalang run examples/arrays_pointers.lusa --native
 ```
 
+### Volatile MMIO and struct layout (Module 17)
+
+Polling loops need loads that the optimizer cannot remove, and register blocks
+need layouts that match the datasheet. `ptr.read_volatile()` and
+`ptr.write_volatile(value)` (also `ptr:read_volatile()`, or the
+`volatile_read(ptr)`/`volatile_write(ptr, value)` builtins) emit typed
+`*(volatile T *)` accesses in C11. They are only available inside `unsafe`:
+
+```lusa
+unsafe do
+    local status: *mut u32 = unsafe_alloc(16)
+    status.write_volatile(0)
+    while status.read_volatile() == 0 do
+        -- device polling; volatile keeps the load in the loop
+    end
+end
+```
+
+The element type comes from the pointer (`*mut u32`, `*mut i32`, `*mut i128`,
+`*mut f32`, or `*mut bool`). Heap elements such as `string`, tables, and
+structs are rejected, so a volatile access can never bypass RAII. The
+interpreter and VM keep simulating addresses safely; native code performs real
+volatile loads and stores.
+
+Struct declarations accept representation attributes:
+
+```lusa
+#[packed]
+struct GpioConfig {
+    mode: u32,
+    pull: u32,
+    speed: u32,
+}
+
+#[repr(align(16))]
+struct DmaDescriptor {
+    source: u32,
+    destination: u32,
+    control: u32,
+}
+```
+
+`#[packed]` removes inter-field padding, and `#[repr(align(N))]` raises the
+struct's alignment, where `N` is a power of two from 1 to 4096. The C11 backend
+emits portable `LUSA_PACKED`, `LUSA_PACK_BEGIN`/`LUSA_PACK_END`, and
+`LUSA_ALIGNAS(n)` macros covering GCC/Clang attributes, MSVC
+`__declspec`/`#pragma pack`, and the C11 `_Alignas` fallback. Duplicate or
+unsupported attributes and invalid alignments are rejected before code
+generation.
+
+Run the bare-metal example in every engine:
+
+```sh
+lusalang run examples/baremetal_gpio.lusa
+lusalang run examples/baremetal_gpio.lusa --vm
+lusalang run examples/baremetal_gpio.lusa --native
+lusalang build examples/baremetal_gpio.lusa --emit-c
+```
+
+`#[packed]` and `#[repr(align(N))]` change native layout only; the dynamic
+engines accept the same source and keep their fixed-field simulation.
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -661,7 +725,9 @@ use `-std=c11 -O2`; MSVC uses `/nologo /TC /O2 /std:c11`. If no compiler is
 found, the interpreter and bytecode VM still work; only `build`/`run --native`
 require a C toolchain.
 
-Runnable examples: `examples/typed_native.lusa` (build/run) and
+Runnable examples: `examples/typed_native.lusa` (build/run),
+`examples/baremetal_gpio.lusa` (volatile polling with packed/aligned register
+layouts; uses `unsafe_alloc` so it runs on a desktop), and
 `examples/unsafe_hardware.lusa` (simulated memory in `run`/`--vm`; replace the
 illustrative MMIO address before native execution).
 
@@ -674,7 +740,11 @@ declaration forms, literals/defaults/nested deep clone, `match` arms and
 per-arm ownership, recursive import/module deduplication, and inline assembly.
 `tests/module16.rs` adds fixed-array indexing, C declarators, array drop loops,
 address-of/pointer arithmetic lowering, `unsafe` gating, and a native
-build-and-run check. See [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
+build-and-run check. `tests/module17.rs` adds typed volatile lowering for every
+method spelling, scalar-element restrictions, value type checking,
+packed/aligned C layout macros, attribute validation, dynamic parity, and a
+native volatile/packed/aligned build-and-run. See
+[`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
 [`docs/LANGUAGE.md`](docs/LANGUAGE.md) section 9 for details.
 
 ## Bytecode VM: registers and source lines
@@ -732,6 +802,9 @@ Near-term milestones:
   inline assembly.
 - **v1.2.0 (shipped):** fixed-size `[T; N]` arrays with zero-based indexing,
   address-of (`&place`), and raw-pointer arithmetic for direct buffer work.
+- **v1.3.0 (shipped):** typed volatile MMIO loads/stores (`read_volatile`/
+  `write_volatile`), packed structs (`#[packed]`), and explicit alignment
+  (`#[repr(align(N))]`) for hardware register layouts.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

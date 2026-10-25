@@ -73,6 +73,17 @@ fn expr_field(obj: Expr, name: String, span: Span) -> Expr {
     }
 }
 
+/// Maps the Rust-style pointer method sugar (`ptr.read_volatile()`) to the
+/// shared intrinsic name.  Both parsers desugar here so the interpreter, VM,
+/// and C backend see exactly one call shape.
+fn volatile_builtin(name: &str) -> Option<&'static str> {
+    match name {
+        "read_volatile" => Some("volatile_read"),
+        "write_volatile" => Some("volatile_write"),
+        _ => None,
+    }
+}
+
 enum MatchPattern {
     Literal(Expr),
     Binding(String, Span),
@@ -234,7 +245,19 @@ impl Parser {
                 self.expect(TK::End, "`end` to close the `unsafe` block")?;
                 St { kind: StKind::Unsafe { body }, span: tk.span }
             }
-            TK::Struct => self.parse_struct_st()?,
+            TK::Struct => self.parse_struct_st(false, None)?,
+            TK::Len if self.peek_at(1).kind == TK::LBracket => {
+                let (packed, align) = self.parse_attributes()?;
+                if !self.at(TK::Struct) {
+                    return Err(LusaError::new(
+                        E_PARSE,
+                        Some(self.peek().span),
+                        "attributes are only supported on `struct` declarations",
+                    )
+                    .help("write `#[packed]`, `#[repr(align(N))]`, or both directly before a `struct`"));
+                }
+                self.parse_struct_st(packed, align)?
+            }
             TK::Match => self.parse_match()?,
             TK::Import | TK::Mod => {
                 return Err(LusaError::new(
@@ -386,7 +409,108 @@ impl Parser {
         Ok(size)
     }
 
-    fn parse_struct_st(&mut self) -> LResult<St> {
+    /// Parses zero or more `#[...]` representation attributes.
+    ///
+    /// Supported attributes are `#[packed]` and `#[repr(align(N))]`.  The
+    /// alignment is validated here, before the AST reaches either backend, so
+    /// the dynamic engines and the C emitter agree on what is legal.
+    fn parse_attributes(&mut self) -> LResult<(bool, Option<u32>)> {
+        const MAX_ALIGN: u32 = 4096;
+        let mut packed = false;
+        let mut align: Option<u32> = None;
+        while self.at(TK::Len) && self.peek_at(1).kind == TK::LBracket {
+            self.bump(); // #
+            self.bump(); // [
+            let (attr, attr_span) = self.expect_name()?;
+            match attr.as_str() {
+                "packed" => {
+                    if packed {
+                        return Err(LusaError::new(
+                            E_PARSE,
+                            Some(attr_span),
+                            "duplicate `#[packed]` attribute",
+                        ));
+                    }
+                    packed = true;
+                }
+                "repr" => {
+                    self.expect(TK::LParen, "`(` after `repr`")?;
+                    let (inner, inner_span) = self.expect_name()?;
+                    if inner != "align" {
+                        return Err(LusaError::new(
+                            E_PARSE,
+                            Some(inner_span),
+                            format!("unsupported representation attribute `repr({inner})`"),
+                        )
+                        .help("only `#[repr(align(N))]` is supported"));
+                    }
+                    self.expect(TK::LParen, "`(` after `repr(align`")?;
+                    let tk = self.peek().clone();
+                    let value: u64 = match &tk.kind {
+                        TK::Int(text) => text.parse().unwrap_or(u64::MAX),
+                        TK::Num(n)
+                            if n.is_finite()
+                                && *n >= 0.0
+                                && n.fract() == 0.0
+                                && *n <= u32::MAX as f64 =>
+                        {
+                            *n as u64
+                        }
+                        _ => {
+                            return Err(LusaError::new(
+                                E_PARSE,
+                                Some(tk.span),
+                                format!(
+                                    "expected an alignment integer, found {}",
+                                    tk.desc()
+                                ),
+                            )
+                            .help("use a power of two such as `#[repr(align(8))]`"));
+                        }
+                    };
+                    self.bump();
+                    self.expect(TK::RParen, "`)` to close `repr(align(`")?;
+                    self.expect(TK::RParen, "`)` to close `repr(`")?;
+                    if value == 0 || value > MAX_ALIGN as u64 {
+                        return Err(LusaError::new(
+                            E_PARSE,
+                            Some(tk.span),
+                            format!("alignment {value} must be between 1 and 4096"),
+                        )
+                        .help("alignment must be a power of two between 1 and 4096"));
+                    }
+                    if !(value as u32).is_power_of_two() {
+                        return Err(LusaError::new(
+                            E_PARSE,
+                            Some(tk.span),
+                            format!("alignment {value} is not a power of two"),
+                        )
+                        .help("alignment must be a power of two between 1 and 4096"));
+                    }
+                    if align.is_some() {
+                        return Err(LusaError::new(
+                            E_PARSE,
+                            Some(attr_span),
+                            "duplicate `#[repr(align(N))]` attribute",
+                        ));
+                    }
+                    align = Some(value as u32);
+                }
+                other => {
+                    return Err(LusaError::new(
+                        E_PARSE,
+                        Some(attr_span),
+                        format!("unsupported attribute `#{other}`"),
+                    )
+                    .help("supported attributes are `#[packed]` and `#[repr(align(N))]`"));
+                }
+            }
+            self.expect(TK::RBracket, "`]` to close the attribute")?;
+        }
+        Ok((packed, align))
+    }
+
+    fn parse_struct_st(&mut self, packed: bool, align: Option<u32>) -> LResult<St> {
         let kw = self.bump();
         let (name, name_span) = self.expect_name()?;
         let mut fields = Vec::new();
@@ -418,7 +542,7 @@ impl Parser {
         }
         self.structs.insert(name.clone());
         let span = merge(kw.span, name_span);
-        Ok(St { kind: StKind::Struct { name, fields }, span })
+        Ok(St { kind: StKind::Struct { name, fields, packed, align }, span })
     }
 
     /// `Point{x: 1, y: 2}` — the current token is `{`.
@@ -894,19 +1018,55 @@ impl Parser {
                     self.expect(TK::LParen, "`(` to call the method")?;
                     let args = self.parse_args()?;
                     let span = merge(e.span, msp);
-                    e = Expr {
-                        kind: ExprKind::Method { obj: Box::new(e), name: Box::new(m), args, span_args_end: span },
-                        span,
-                    };
+                    if let Some(builtin) = volatile_builtin(&m) {
+                        let mut call_args = Vec::with_capacity(args.len() + 1);
+                        call_args.push(e);
+                        call_args.extend(args);
+                        e = Expr {
+                            kind: ExprKind::Call {
+                                callee: Box::new(expr_var(builtin.to_string(), span)),
+                                args: call_args,
+                                span_args_end: span,
+                            },
+                            span,
+                        };
+                    } else {
+                        e = Expr {
+                            kind: ExprKind::Method { obj: Box::new(e), name: Box::new(m), args, span_args_end: span },
+                            span,
+                        };
+                    }
                 }
                 TK::LParen => {
                     self.bump();
                     let args = self.parse_args()?;
                     let span = merge(e.span, self.toks[self.pos - 1].span);
-                    e = Expr {
-                        kind: ExprKind::Call { callee: Box::new(e), args, span_args_end: span },
-                        span,
+                    let builtin = match &e.kind {
+                        ExprKind::Field { name, .. } => volatile_builtin(name),
+                        _ => None,
                     };
+                    if let Some(builtin) = builtin {
+                        let obj = match e.kind {
+                            ExprKind::Field { obj, .. } => obj,
+                            _ => unreachable!("checked above"),
+                        };
+                        let mut call_args = Vec::with_capacity(args.len() + 1);
+                        call_args.push(*obj);
+                        call_args.extend(args);
+                        e = Expr {
+                            kind: ExprKind::Call {
+                                callee: Box::new(expr_var(builtin.to_string(), span)),
+                                args: call_args,
+                                span_args_end: span,
+                            },
+                            span,
+                        };
+                    } else {
+                        e = Expr {
+                            kind: ExprKind::Call { callee: Box::new(e), args, span_args_end: span },
+                            span,
+                        };
+                    }
                 }
                 TK::LBrace => {
                     if let ExprKind::Var(name) = &e.kind {

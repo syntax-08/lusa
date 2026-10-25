@@ -667,7 +667,77 @@ parse_unsafe = function()
     }
 end
 
-parse_struct = function()
+-- Parses `#[packed]` and `#[repr(align(N))]` prefixes.
+-- Returns `packed, align`; align is nil when the attribute is absent.
+local function parse_attributes()
+    local packed = false
+    local align = nil
+    while at_value("#") and peek_value_at(1) == "[" do
+        advance() -- #
+        advance() -- [
+        local attr_line = peek_line()
+        local attr_column = peek_column()
+        local attr = expect_name()
+        if attr == "packed" then
+            if packed then
+                fail_at(attr_line, attr_column, "duplicate `#[packed]` attribute")
+            end
+            packed = true
+        elseif attr == "repr" then
+            expect_value("(", "`(` after `repr`")
+            local inner_line = peek_line()
+            local inner_column = peek_column()
+            local inner = expect_name()
+            if inner ~= "align" then
+                fail_at(inner_line, inner_column,
+                    "unsupported representation attribute `repr(" .. inner
+                    .. ")`; only `repr(align(N))` is supported")
+            end
+            expect_value("(", "`(` after `repr(align`")
+            local value_line = peek_line()
+            local value_column = peek_column()
+            if peek_kind() ~= "number" then
+                fail_at(value_line, value_column,
+                    "expected an alignment integer, found " .. describe_token())
+            end
+            local value = tonumber(peek_value())
+            advance()
+            if value == nil or math.floor(value) ~= value then
+                fail_at(value_line, value_column,
+                    "alignment must be an integer")
+            end
+            if value < 1 or value > 4096 then
+                fail_at(value_line, value_column,
+                    "alignment " .. tostring(value)
+                    .. " must be between 1 and 4096")
+            end
+            local probe = value
+            while probe > 1 do
+                if math.floor(probe / 2) * 2 ~= probe then
+                    fail_at(value_line, value_column,
+                        "alignment " .. tostring(value)
+                        .. " is not a power of two")
+                end
+                probe = math.floor(probe / 2)
+            end
+            expect_value(")", "`)` to close `repr(align(`")
+            expect_value(")", "`)` to close `repr(`")
+            if align ~= nil then
+                fail_at(attr_line, attr_column,
+                    "duplicate `#[repr(align(N))]` attribute")
+            end
+            align = value
+        else
+            fail_at(attr_line, attr_column,
+                "unsupported attribute `#" .. attr
+                .. "`; supported attributes are `#[packed]` and `#[repr(align(N))]`")
+        end
+        expect_value("]", "`]` to close the attribute")
+    end
+    return packed, align
+end
+
+parse_struct = function(packed, align)
     local line = peek_line()
     local column = peek_column()
     advance() -- struct
@@ -720,6 +790,8 @@ parse_struct = function()
         tag = "Struct",
         name = name,
         fields = fields,
+        packed = packed,
+        align = align,
         line = line,
         column = column
     }
@@ -977,6 +1049,14 @@ parse_stmt = function()
     local kind = peek_kind()
     local value = peek_value()
 
+    if kind == "operator" and value == "#" and peek_value_at(1) == "[" then
+        local packed, align = parse_attributes()
+        if not at_keyword("struct") then
+            fail("attributes are only supported on `struct` declarations")
+        end
+        return parse_struct(packed, align)
+    end
+
     if kind == "keyword" then
         if value == "local" then
             return parse_local()
@@ -1150,13 +1230,43 @@ parse_suffixes = function(e)
             local column = e.column
             advance() -- (
             local args = parse_args()
-            e = {
-                tag = "Call",
-                callee = e,
-                args = args,
-                line = line,
-                column = column
-            }
+            local target = transfer(e)
+            local volatile_name = nil
+            if target.tag == "Field" then
+                if target.field_name == "read_volatile" then
+                    volatile_name = "volatile_read"
+                elseif target.field_name == "write_volatile" then
+                    volatile_name = "volatile_write"
+                end
+            end
+            if volatile_name ~= nil then
+                local call_args = { target.table }
+                local i = 1
+                while i <= #args do
+                    call_args[#call_args + 1] = args[i]
+                    i = i + 1
+                end
+                e = {
+                    tag = "Call",
+                    callee = {
+                        tag = "Name",
+                        name = volatile_name,
+                        line = line,
+                        column = column
+                    },
+                    args = call_args,
+                    line = line,
+                    column = column
+                }
+            else
+                e = {
+                    tag = "Call",
+                    callee = target,
+                    args = args,
+                    line = line,
+                    column = column
+                }
+            end
         elseif at_value("[") then
             local line = e.line
             local column = e.column
@@ -1189,14 +1299,42 @@ parse_suffixes = function(e)
             local args = parse_args()
             local line = e.line
             local column = e.column
-            e = {
-                tag = "MethodCall",
-                obj = transfer(e),
-                name = name,
-                args = args,
-                line = line,
-                column = column
-            }
+            local target = transfer(e)
+            local volatile_name = nil
+            if name == "read_volatile" then
+                volatile_name = "volatile_read"
+            elseif name == "write_volatile" then
+                volatile_name = "volatile_write"
+            end
+            if volatile_name ~= nil then
+                local call_args = { target }
+                local i = 1
+                while i <= #args do
+                    call_args[#call_args + 1] = args[i]
+                    i = i + 1
+                end
+                e = {
+                    tag = "Call",
+                    callee = {
+                        tag = "Name",
+                        name = volatile_name,
+                        line = line,
+                        column = column
+                    },
+                    args = call_args,
+                    line = line,
+                    column = column
+                }
+            else
+                e = {
+                    tag = "MethodCall",
+                    obj = target,
+                    name = name,
+                    args = args,
+                    line = line,
+                    column = column
+                }
+            end
         else
             return e
         end

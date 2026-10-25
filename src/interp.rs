@@ -457,7 +457,7 @@ impl Interp {
                 self.exec_local(frame, targets, values, annotations, st.span)
             }
             StKind::Assign { targets, values } => self.exec_assign(frame, targets, values),
-            StKind::Struct { name, fields } => {
+            StKind::Struct { name, fields, .. } => {
                 let def = StructDef {
                     name: name.clone(),
                     fields: fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),

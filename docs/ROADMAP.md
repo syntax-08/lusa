@@ -390,6 +390,63 @@ registry.
 - Fixed-size arrays are intentionally not iterable with `pairs`/`ipairs`;
   index them with a numeric loop.
 
+## Module 17 - Volatile MMIO and struct representation (shipped in v1.3.0)
+
+### 17.1 Typed volatile access
+
+- `ptr.read_volatile()` and `ptr.write_volatile(value)` add Rust-style typed
+  volatile access; `ptr:read_volatile()`/`ptr:write_volatile(value)` are
+  accepted for symmetry with colon methods.
+- Both parsers desugar the method forms into `volatile_read(ptr)` and
+  `volatile_write(ptr, value)`, so the interpreter, VM, and native backend see
+  one call shape and share argument checking.
+- The element type comes from the pointer (`*mut u32`, `*mut i32`, `*mut i128`,
+  `*mut f32`, `*mut bool`); a bare integer address defaults to `u32`. Heap
+  elements (`string`, tables, structs) are rejected with `E0312` so volatile
+  access cannot bypass RAII.
+- Native lowering is a typed lvalue access,
+  `(*(volatile T *)(uintptr_t)(ptr))`, which guarantees that polling loops and
+  MMIO stores remain observable at `-O2`.
+- The intrinsic is `unsafe`-gated: the C backend reports `E0316`, while the
+  interpreter and VM report `E0321`. The dynamic engines continue to use the
+  process-local simulated address map.
+
+### 17.2 Packed and aligned structs
+
+- `#[packed]` is accepted before a `struct` declaration and removes inter-field
+  padding. `#[repr(align(N))]` raises the struct's alignment, with `N` a power
+  of two in `1..=4096`.
+- The AST records `packed: bool` and `align: Option<u32>` on struct nodes. Both
+  parsers validate duplicate attributes, unsupported attributes, and invalid
+  alignments before either backend runs.
+- The C11 preamble defines `LUSA_PACKED`, `LUSA_PACK_BEGIN`/`LUSA_PACK_END`,
+  and `LUSA_ALIGNAS(n)` for MSVC, GCC/Clang, and other C11 compilers.
+  Alignment is attached to the first member, which raises the enclosing
+  struct's alignment without relying on a non-portable type-attribute position.
+- Dynamic engines accept the attributes but keep their fixed-field simulation;
+  only native layout changes.
+
+**Acceptance criteria**
+
+- `tests/module17.rs` covers dot/colon/builtin volatile spellings, typed C
+  loads and stores, scalar-only elements, value type checking, `unsafe` gating
+  in all three engines, packed/aligned emission, attribute and alignment
+  diagnostics, dynamic parity, and a native build-and-run.
+- `examples/baremetal_gpio.lusa` prints identical output in `run`, `--vm`, and
+  `--native`, using `unsafe_alloc` as a simulated peripheral block.
+
+**Risks**
+
+- Native volatile access is only as safe as the address supplied; the backend
+  deliberately performs no bounds or validity checking inside `unsafe`.
+- `#[packed]` fields may be unaligned, and taking their address is target-
+  dependent. Keep packed structs for on-wire/register layouts and copy values
+  out before doing aligned work.
+- Layout attributes are advisory in the dynamic engines; parity tests compare
+  values, not `sizeof` or field offsets.
+- The C emitter remains a typed subset; volatile access is limited to scalar
+  elements and does not yet support volatile struct copies or array bulk access.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -416,6 +473,7 @@ registry.
 | v1.0.0 | Static borrow checker, explicit `move`, stabilization (shipped) | golden diagnostics, native/VM/interpreter parity, frozen semantics |
 | v1.1.0 | Struct literals, `match`, compile-time modules, inline asm (shipped) | deep struct RAII, per-arm ownership, import deduplication, three-engine parity |
 | v1.2.0 | Fixed arrays, address-of, pointer arithmetic (shipped) | zero-based C11 arrays, heap-element drop loops, `unsafe` dereference gate, three-engine parity |
+| v1.3.0 | Volatile MMIO and struct representation (shipped) | typed volatile lowering, scalar-element gate, packed/align portability macros, three-engine parity |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

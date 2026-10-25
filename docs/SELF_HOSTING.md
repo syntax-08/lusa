@@ -427,6 +427,10 @@ nested deep clone/drop, `match` arms and per-arm ownership, recursive
 `tests/module16.rs` covers fixed arrays, zero-based indexing, C declarators and
 array drop loops, struct array fields, address-of, `unsafe` dereference gating,
 pointer arithmetic lowering, dynamic-engine parity, and a native build/run.
+`tests/module17.rs` covers typed volatile lowering for dot/colon/builtin
+spellings, scalar-element and value-type diagnostics, `unsafe` gating in all
+engines, packed/aligned C macros and diagnostics, dynamic parity, and a native
+volatile/packed/aligned build/run.
 
 ### Current limits
 
@@ -444,12 +448,16 @@ functions rather than table fields, so `pairs` does not enumerate method names;
 use a separate data table when enumerating. The dynamic interpreter and
 bytecode VM remain the complete-language engines; they accept typed/`unsafe`
 source but use f64 arithmetic and simulated memory, so exact 128-bit arithmetic
-and aliasing through `&local` are C11-backend features.
+and aliasing through `&local` are C11-backend features. Volatile access is
+limited to scalar pointer elements; volatile struct copies and bulk array
+access are not part of the native subset. `#[packed]` and
+`#[repr(align(N))]` change native layout only; the dynamic engines accept the
+same declarations and keep their fixed-field simulation.
 
 ## Extension points
 
 The next steps are dynamic key construction, assignment through dynamic
 indices, closures/upvalues, numeric `for`, varargs, and interpolated strings in
 the C emitter. The runtime already has keyed tables, deep clone/drop, methods,
-generic iterators, and volatile raw-memory support; those features mainly need
-AST and lowering extensions.
+generic iterators, typed volatile raw-memory access, and packed/aligned struct
+layout; those features mainly need AST and lowering extensions.

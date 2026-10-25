@@ -1,0 +1,76 @@
+-- Module 17 example: volatile memory-mapped I/O and packed register layouts.
+--
+--   lusalang run examples/baremetal_gpio.lusa
+--   lusalang run examples/baremetal_gpio.lusa --vm
+--   lusalang run examples/baremetal_gpio.lusa --native
+--   lusalang build examples/baremetal_gpio.lusa --emit-c
+--
+-- `unsafe_alloc` reserves a simulated peripheral block so every engine can run
+-- this file on a desktop. On real hardware, replace it with the register base
+-- address, for example `local gpio: *mut u32 = 0x40020000`, and keep every
+-- access inside `unsafe`. Volatile loads and stores lower to
+-- `*(volatile T *)(ptr)` in C11, so a polling loop cannot be optimized away.
+
+-- A packed register write sequence: no padding between fields.
+#[packed]
+struct GpioConfig {
+    mode: u32,
+    pull: u32,
+    speed: u32,
+}
+
+-- A descriptor that must start on a 16-byte boundary for DMA.
+#[repr(align(16))]
+struct DmaDescriptor {
+    source: u32,
+    destination: u32,
+    control: u32,
+}
+
+local config: GpioConfig
+config.mode = 1
+config.pull = 2
+config.speed = 3
+
+local dma: DmaDescriptor
+dma.source = 0x1000
+dma.destination = 0x2000
+dma.control = 1
+
+unsafe do
+    local gpio: *mut u32 = unsafe_alloc(64)
+    local pull: *mut u32 = gpio + 1
+    local speed: *mut u32 = gpio + 2
+
+    -- Push the packed configuration into the first three registers.
+    gpio.write_volatile(config.mode)
+    pull:write_volatile(config.pull)
+    speed.write_volatile(config.speed)
+
+    -- Poll the status register until the "device" raises READY. Each read is
+    -- volatile, so the loop has an observable side effect in native code.
+    local status: *mut u32 = gpio + 3
+    local READY: u32 = 1
+    status.write_volatile(0)
+    local polls: u32 = 0
+    while status.read_volatile() ~= READY do
+        polls = polls + 1
+        if polls == 3 then
+            status.write_volatile(READY)
+        end
+    end
+
+    -- Program the aligned DMA descriptor through the same register window.
+    local desc: *mut u32 = gpio + 8
+    local destination: *mut u32 = desc + 1
+    local control: *mut u32 = desc + 2
+    desc.write_volatile(dma.source)
+    destination.write_volatile(dma.destination)
+    control.write_volatile(dma.control)
+
+    print("gpio", gpio.read_volatile(), pull.read_volatile(), speed.read_volatile())
+    print("ready after", polls, "polls; status", status.read_volatile())
+    print("dma", desc.read_volatile(), destination.read_volatile(), control.read_volatile())
+end
+
+return 0

@@ -1656,11 +1656,60 @@ local function check_call(expr)
     if name == "unsafe_ptr_cast" or name == "unsafe_read_mem"
         or name == "unsafe_write_mem"
         or name == "unsafe_alloc"
+        or name == "volatile_read" or name == "volatile_write"
         or name == "unsafe_nop" or name == "unsafe_asm" then
         if check_unsafe_depth == 0 then
             type_fail("E0316", expr.line, expr.column,
                 "raw pointer intrinsic `" .. name
                 .. "` is only allowed inside an `unsafe` block")
+        end
+        if name == "volatile_read" or name == "volatile_write" then
+            local wanted = 1
+            if name == "volatile_write" then
+                wanted = 2
+            end
+            if #args ~= wanted then
+                type_fail("E0311", expr.line, expr.column,
+                    "`" .. name .. "` takes " .. tostring(wanted)
+                    .. " argument(s), found " .. tostring(#args))
+            end
+            local checked_addr, addr_type = check_expr(args[1])
+            local addr_line = checked_addr.line
+            local addr_column = checked_addr.column
+            args[1] = checked_addr
+            local element = pointer_element(addr_type)
+            if element == nil then
+                if not is_integer_type(addr_type) then
+                    check_mismatch(addr_line, addr_column,
+                        "volatile address", "integer or raw pointer", addr_type)
+                end
+                -- A bare integer address has no element type; default to the
+                -- register width used by the other raw-memory intrinsics.
+                element = "u32"
+            end
+            if element ~= "u32" and element ~= "i32" and element ~= "i128"
+                and element ~= "f32" and element ~= "bool" then
+                type_fail("E0312", addr_line, addr_column,
+                    "volatile access supports scalar elements only, found `"
+                    .. tostring(element) .. "`")
+            end
+            if name == "volatile_write" then
+                local checked_value, value_type = check_expr(args[2])
+                if not assignable(element, value_type, clone checked_value) then
+                    check_mismatch(checked_value.line, checked_value.column,
+                        "volatile value", element, value_type)
+                end
+                checked_value = coerce_literal(checked_value, element)
+                args[2] = checked_value
+                expr.ctype = "void"
+            else
+                expr.ctype = element
+            end
+            expr.builtin = name
+            expr.elem_type = element
+            expr.args = args
+            local result_type = expr.ctype
+            return expr, result_type
         end
         if name == "unsafe_nop" then
             if #args ~= 0 then
@@ -3141,6 +3190,25 @@ local function check_struct_decl(stmt)
         type_fail("E0302", line, column,
             "duplicate definition of struct `" .. stmt.name .. "`")
     end
+    local packed = stmt.packed == true
+    local align = stmt.align
+    if align ~= nil then
+        if type(align) ~= "number" or align < 1 or align > 4096
+            or math.floor(align) ~= align then
+            type_fail("E0312", line, column,
+                "invalid alignment for struct `" .. stmt.name
+                .. "`; use a power of two between 1 and 4096")
+        end
+        local probe = align
+        while probe > 1 do
+            if probe % 2 ~= 0 then
+                type_fail("E0312", line, column,
+                    "alignment " .. tostring(align) .. " for struct `"
+                    .. stmt.name .. "` must be a power of two")
+            end
+            probe = probe / 2
+        end
+    end
     local layout = {}
     local order = {}
     local i = 1
@@ -3167,7 +3235,12 @@ local function check_struct_decl(stmt)
         stmt.fields[i] = field
         i = i + 1
     end
-    check_structs[stmt.name] = { fields = layout, order = order }
+    check_structs[stmt.name] = {
+        fields = layout,
+        order = order,
+        packed = packed,
+        align = align
+    }
     check_struct_order[#check_struct_order + 1] = stmt.name
     stmt.struct_checked = true
     return stmt
@@ -4128,6 +4201,26 @@ local RUNTIME = {
     "#else",
     "#define LUSA_NOP() ((void)0)",
     "#define LUSA_ASM(text) ((void)0)",
+    "#endif",
+    "",
+    "/* Struct representation attributes.  GCC/Clang use type attributes,",
+    "   MSVC uses __declspec plus #pragma pack, and other C11 compilers fall",
+    "   back to _Alignas for the alignment half. */",
+    "#if defined(_MSC_VER)",
+    "#define LUSA_PACK_BEGIN __pragma(pack(push, 1))",
+    "#define LUSA_PACK_END __pragma(pack(pop))",
+    "#define LUSA_PACKED",
+    "#define LUSA_ALIGNAS(n) __declspec(align(n))",
+    "#elif defined(__GNUC__) || defined(__clang__)",
+    "#define LUSA_PACK_BEGIN",
+    "#define LUSA_PACK_END",
+    "#define LUSA_PACKED __attribute__((packed))",
+    "#define LUSA_ALIGNAS(n) __attribute__((aligned(n)))",
+    "#else",
+    "#define LUSA_PACK_BEGIN",
+    "#define LUSA_PACK_END",
+    "#define LUSA_PACKED",
+    "#define LUSA_ALIGNAS(n) _Alignas(n)",
     "#endif",
     "",
     "static void lusa_panic(const char *message);",
@@ -5383,7 +5476,11 @@ local function emit_comparison(expr, lhs, rhs)
         if op == "==" then return "((" .. lhs .. ") == (" .. rhs .. "))" end
         if op == "~=" then return "((" .. lhs .. ") != (" .. rhs .. "))" end
     end
-    return "((" .. lhs .. ") " .. op .. " (" .. rhs .. "))"
+    local c_op = op
+    if c_op == "~=" then
+        c_op = "!="
+    end
+    return "((" .. lhs .. ") " .. c_op .. " (" .. rhs .. "))"
 end
 
 local function emit_arithmetic(expr, lhs, rhs)
@@ -5574,6 +5671,20 @@ emit_expr = function(expr)
             local value = emit_expr(expr.args[2])
             return "((*(volatile uint32_t *)(uintptr_t)(" .. address
                 .. ")) = (uint32_t)(" .. value .. "))"
+        end
+        if expr.builtin == "volatile_read" then
+            local element = expr.elem_type or "u32"
+            local base = c_type(element)
+            return "(*(volatile " .. base .. " *)(uintptr_t)("
+                .. emit_expr(expr.args[1]) .. "))"
+        end
+        if expr.builtin == "volatile_write" then
+            local element = expr.elem_type or "u32"
+            local base = c_type(element)
+            local address = emit_expr(expr.args[1])
+            local value = emit_expr(expr.args[2])
+            return "((*(volatile " .. base .. " *)(uintptr_t)(" .. address
+                .. ")) = (" .. base .. ")(" .. value .. "))"
         end
         if expr.builtin == "unsafe_nop" then
             return "LUSA_NOP()"
@@ -6703,17 +6814,34 @@ local function emit_struct_declarations(ast)
     while i <= #names do
         local name = clone names[i]
         local layout = borrow ast.structs[name]
-        line("typedef struct {")
+        local packed = layout.packed == true
+        local align = layout.align
+        if packed then
+            line("LUSA_PACK_BEGIN")
+            line("typedef struct LUSA_PACKED {")
+        else
+            line("typedef struct {")
+        end
         emit_indent = emit_indent + 1
         local j = 1
         while j <= #layout.order do
             local field_name = clone layout.order[j]
             local field_type = clone (borrow layout.fields[field_name]).type
-            line(c_decl(field_type, field_name) .. ";")
+            local declaration = c_decl(field_type, field_name) .. ";"
+            if j == 1 and align ~= nil then
+                -- Member alignment raises the enclosing struct's alignment
+                -- and remains valid C11 on every supported toolchain.
+                declaration = "LUSA_ALIGNAS(" .. tostring(align) .. ") "
+                    .. declaration
+            end
+            line(declaration)
             j = j + 1
         end
         emit_indent = emit_indent - 1
         line("} " .. name .. ";")
+        if packed then
+            line("LUSA_PACK_END")
+        end
         line("")
         i = i + 1
     end
