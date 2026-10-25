@@ -79,6 +79,8 @@ pub enum TokenKind {
     FatArrow,
     /// `|` separating match arms.
     Pipe,
+    /// `!` - macro-style invocation, currently used by `asm!("...")`.
+    Bang,
     LParen,
     RParen,
     LBrace,
@@ -193,6 +195,7 @@ impl Token {
             TokenKind::Assign => "`=`".into(),
             TokenKind::FatArrow => "`=>`".into(),
             TokenKind::Pipe => "`|`".into(),
+            TokenKind::Bang => "`!`".into(),
             TokenKind::LParen => "`(`".into(),
             TokenKind::RParen => "`)`".into(),
             TokenKind::LBrace => "`{`".into(),

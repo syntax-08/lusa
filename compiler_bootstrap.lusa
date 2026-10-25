@@ -1657,10 +1657,15 @@ local function check_call(expr)
         or name == "unsafe_write_mem"
         or name == "unsafe_alloc"
         or name == "volatile_read" or name == "volatile_write"
-        or name == "unsafe_nop" or name == "unsafe_asm" then
+        or name == "unsafe_nop" or name == "unsafe_asm"
+        or name == "asm" then
         if check_unsafe_depth == 0 then
+            local intrinsic_kind = "raw pointer intrinsic"
+            if name == "asm" then
+                intrinsic_kind = "inline assembly"
+            end
             type_fail("E0316", expr.line, expr.column,
-                "raw pointer intrinsic `" .. name
+                intrinsic_kind .. " `" .. name
                 .. "` is only allowed inside an `unsafe` block")
         end
         if name == "volatile_read" or name == "volatile_write" then
@@ -1722,27 +1727,36 @@ local function check_call(expr)
             expr.args = args
             return expr, "void"
         end
-        if name == "unsafe_asm" then
+        if name == "unsafe_asm" or name == "asm" then
+            local label = "`unsafe_asm`"
+            if name == "asm" then
+                label = "`asm!`"
+            end
             if #args ~= 1 then
                 type_fail("E0311", expr.line, expr.column,
-                    "`unsafe_asm` takes one string argument, found "
+                    label .. " takes one string argument, found "
                     .. tostring(#args))
             end
             local checked_text, text_type = check_expr(args[1])
             if text_type ~= "string" then
                 check_mismatch(checked_text.line, checked_text.column,
-                    "`unsafe_asm` text", "string", text_type)
+                    label .. " text", "string", text_type)
             end
             if checked_text.tag ~= "String" then
                 type_fail("E0312", checked_text.line, checked_text.column,
-                    "`unsafe_asm` requires a string literal")
+                    label .. " requires a string literal")
             end
             local asm_text = checked_text.value or ""
+            if asm_text == "" then
+                type_fail("E0312", checked_text.line, checked_text.column,
+                    label .. " text must not be empty")
+            end
             if string.find(asm_text, '"', 1, true) ~= nil
                 or string.find(asm_text, "\\", 1, true) ~= nil
-                or string.find(asm_text, "\n", 1, true) ~= nil then
+                or string.find(asm_text, "\n", 1, true) ~= nil
+                or string.find(asm_text, "\r", 1, true) ~= nil then
                 type_fail("E0312", checked_text.line, checked_text.column,
-                    "`unsafe_asm` text must not contain quotes, backslashes, or newlines")
+                    label .. " text must not contain quotes, backslashes, or newlines")
             end
             args[1] = checked_text
             expr.ctype = "void"
@@ -4187,9 +4201,9 @@ local RUNTIME = {
     "#include <inttypes.h>",
     "#include <math.h>",
     "",
-    "/* Inline assembly hooks for `unsafe_asm`/`unsafe_nop`.  GCC and Clang",
-    "   receive the raw text as a volatile asm statement; MSVC and other",
-    "   toolchains keep the program buildable with a compiler barrier. */",
+    "/* Inline assembly hooks for `asm!`/`unsafe_asm` and `unsafe_nop`.",
+    "   GCC and Clang receive the raw text as a volatile asm statement;",
+    "   MSVC and other toolchains keep the program buildable with a no-op. */",
     "#if defined(_MSC_VER)",
     "#include <intrin.h>",
     "#define LUSA_NOP() __nop()",
@@ -4197,7 +4211,7 @@ local RUNTIME = {
     "#elif defined(__GNUC__) || defined(__clang__)",
     -- Statement expressions keep the hooks usable in expression position.
     '#define LUSA_NOP() ({ __asm__ __volatile__("nop"); })',
-    "#define LUSA_ASM(text) ({ __asm__ volatile (text : : ); })",
+    "#define LUSA_ASM(text) ({ __asm__ __volatile__ (text : : ); })",
     "#else",
     "#define LUSA_NOP() ((void)0)",
     "#define LUSA_ASM(text) ((void)0)",
@@ -5689,7 +5703,7 @@ emit_expr = function(expr)
         if expr.builtin == "unsafe_nop" then
             return "LUSA_NOP()"
         end
-        if expr.builtin == "unsafe_asm" then
+        if expr.builtin == "unsafe_asm" or expr.builtin == "asm" then
             return 'LUSA_ASM("' .. expr.asm_text .. '")'
         end
         if expr.builtin == "coroutine_create" then
@@ -7093,7 +7107,7 @@ function Compiler.memory_layout()
         ["match"] = "`match value with | literal => ... | name => ... | _ => ... end` lowers to a hidden local plus an ordinary if/elseif chain; ownership is checked per arm at compile time with no runtime dispatch",
         imports = "`import 'file.lusa'` and `mod name` are expanded at compile time relative to the importing file; the merged source shares one symbol table and each module is included once",
         pointers = "*mut u32/*const u32 and *mut i32/*const i32 lower to volatile C pointers; pointer arithmetic scales by the element size and dereferences are volatile reads/writes",
-        intrinsics = "unsafe_nop/unsafe_asm lower to LUSA_NOP()/LUSA_ASM(text) - `__asm__ volatile (text : : );` on GCC/Clang, no-ops elsewhere",
+        intrinsics = "asm!/unsafe_asm/unsafe_nop lower to LUSA_ASM(text)/LUSA_NOP() - `__asm__ __volatile__ (text : : );` on GCC/Clang, no-ops elsewhere",
         table_kinds = {
             unknown = 0, i32 = 1, u32 = 2, i128 = 3,
             f32 = 4, bool = 5, string = 6, table = 7

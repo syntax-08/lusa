@@ -1,0 +1,40 @@
+-- Module 18 example: inline assembly for hardware sequencing.
+--
+--   lusalang run examples/baremetal_asm.lusa
+--   lusalang run examples/baremetal_asm.lusa --vm
+--   lusalang run examples/baremetal_asm.lusa --native
+--   lusalang build examples/baremetal_asm.lusa --emit-c
+--
+-- `asm!("...")` is only available inside `unsafe`. GCC and Clang receive the
+-- text as `__asm__ __volatile__ (text : : );`; MSVC and other toolchains keep
+-- the program buildable with a no-op. Privileged instructions such as
+-- `asm!("cli")` and `asm!("sei")` parse and emit the same way, but only run at
+-- ring 0, so this desktop example uses `nop` between volatile register
+-- accesses.
+
+unsafe do
+    local regs: *mut u32 = unsafe_alloc(16)
+    local status: *mut u32 = regs + 1
+
+    -- A short assembly fence between volatile stores keeps the sequence
+    -- explicit and visible in the generated C.
+    regs.write_volatile(0x01)
+    asm!("nop")
+    status.write_volatile(0x02)
+    asm!("nop; nop")
+
+    local mode: u32 = regs.read_volatile()
+    local ready: u32 = status.read_volatile()
+
+    -- Deliberate no-op loop: useful as a board-level delay or a placeholder
+    -- for an architecture-specific fence.
+    local polls: u32 = 0
+    while polls ~= 2 do
+        asm!("nop")
+        polls = polls + 1
+    end
+
+    print("mode", mode, "status", ready, "polls", polls)
+end
+
+return 0

@@ -418,14 +418,14 @@ Codes `E{category}{n}`, like rustc:
 | E0308  | static   | C11 backend: mismatched types (assignment, return, call, condition) |
 | E0309  | static   | C11 backend: struct/table has no such field |
 | E0311  | static   | C11 backend: wrong argument/initializer count |
-| E0312  | static   | C11 backend: unsupported construct (struct field type, whole-array value, invalid `&` place, array-by-value call, or non-scalar volatile element) |
+| E0312  | static   | C11 backend: unsupported construct (struct field type, whole-array value, invalid `&` place, array-by-value call, non-scalar volatile element, or invalid inline-assembly text) |
 | E0313  | static   | C11 backend: zero or one return value only; void/value return mismatch |
-| E0316  | unsafe   | C11 backend: raw pointer or volatile intrinsic used outside `unsafe` |
+| E0316  | unsafe   | C11 backend: raw pointer, volatile, or inline-assembly intrinsic used outside `unsafe` |
 | E0317  | static   | C11 backend: `pcall`, `coroutine.resume`, or `string.gmatch` used outside its required local/loop form |
 | E0318  | static   | C11 backend: missing method or invalid method receiver |
 | E0319  | static   | C11 backend: unsupported generic `for` iterator; invalid native coroutine entry function, handle, operation, or string method |
 | E0320  | unsafe   | raw pointer arithmetic outside an `unsafe` block |
-| E0321  | unsafe   | raw pointer dereference outside an `unsafe` block |
+| E0321  | unsafe   | raw pointer dereference or inline assembly outside an `unsafe` block |
 | E0322  | unsafe   | write through a `*const` pointer |
 | E0323  | static   | C11 backend: statically evaluable malformed string pattern or replacement |
 | E0324  | static   | C11 backend: replacement capture or `gmatch` binding exceeds the pattern's captures |
@@ -715,23 +715,26 @@ end
 Writes through a `*const` pointer are rejected with `E0322`. `unsafe_alloc(n)`
 returns a zeroed `n`-byte buffer tracked by the generated runtime and freed
 before the program exits. The kernel-level intrinsics lower to compiler
-hooks: `unsafe_nop()` becomes `nop`/`__nop()`, and `unsafe_asm("text")` becomes
-`LUSA_ASM("text")`, which expands to `({ __asm__ volatile (text : : ); })` on
-GCC/Clang (a no-op on toolchains without inline assembly). The assembly text
-must be a plain string literal without quotes, backslashes, or newlines:
+hooks: `unsafe_nop()` becomes `nop`/`__nop()`, and inline assembly becomes
+`LUSA_ASM("text")`, which expands to
+`({ __asm__ __volatile__ (text : : ); })` on GCC/Clang (a no-op on toolchains
+without inline assembly). The assembly text must be a plain string literal
+without quotes, backslashes, or newlines:
 
 ```lusa
 unsafe do
     unsafe_nop()
-    unsafe_asm("wfe")
+    asm!("wfe")          -- preferred spelling since v1.4.0
+    unsafe_asm("wfe")    -- backward-compatible alias
 end
 ```
 
 The interpreter and `--vm` emulate the same source safely: structs become
 fixed-field buffers, raw pointers are indices into a simulated address space,
-and `unsafe_alloc` hands out virtual regions. `unsafe_nop`/`unsafe_asm` are
-sandboxed no-ops, and dereferencing outside `unsafe` still reports `E0321`,
-so bare-metal logic can be debugged before native compilation.
+and `unsafe_alloc` hands out virtual regions. `unsafe_nop` and inline assembly
+are sandboxed no-ops, and dereferencing outside `unsafe` still reports
+`E0321`, so bare-metal logic can be debugged before native compilation. See
+section 9.11 for the complete `asm!("...")` surface.
 
 ### 9.6 Native error recovery and coroutines (Module 12)
 
@@ -1072,7 +1075,55 @@ lusalang run examples/baremetal_gpio.lusa --vm
 lusalang run examples/baremetal_gpio.lusa --native
 ```
 
-### 9.11 Native subset limits
+### 9.11 Inline assembly and hardware controls (Module 18)
+
+`asm!("...")` emits a raw assembly statement. It is available only inside
+`unsafe` and accepts one plain string literal:
+
+```lusa
+unsafe do
+    asm!("cli")           -- disable maskable interrupts (ring 0)
+    asm!("nop; nop")      -- several instructions per string
+    asm!("sei")           -- enable maskable interrupts
+end
+```
+
+The macro syntax is parsed by both front ends and desugars to an ordinary
+`asm("...")` call, so the interpreter, bytecode VM, and C11 backend share one
+argument check and one safety gate. Native output is:
+
+```c
+(void)(LUSA_ASM("nop; nop"));
+```
+
+`LUSA_ASM` is defined once in the generated preamble:
+
+```c
+#if defined(__GNUC__) || defined(__clang__)
+#define LUSA_ASM(text) ({ __asm__ __volatile__ (text : : ); })
+#else
+#define LUSA_ASM(text) ((void)0)
+#endif
+```
+
+- GCC and Clang emit the raw instruction sequence as a volatile statement.
+  MSVC and other compilers use the no-op definition, so the same program still
+  builds; it simply does not execute the instructions.
+- The interpreter and `--vm` treat `asm!` as a safe no-op. Loops, branches,
+  and simulated register values keep working, which makes hardware sequencing
+  testable without privilege.
+- Used outside `unsafe`, the C backend reports `E0316` and the dynamic engines
+  report `E0321`.
+- The argument must be a non-empty string literal. Interpolation and non-string
+  arguments are parse errors (`E0101`); the native checker also rejects empty
+  or unsafe text with `E0312`. Quotes, backslashes, `\n`, `\r`, and NUL are
+  rejected because the text is embedded in a C string literal.
+- `unsafe_asm("...")` remains supported as a backward-compatible alias and
+  lowers through the same emitter.
+- `asm!` is statement-like and returns no value. Use `unsafe_nop()` for a
+  portable single no-op and `asm!` for target-specific instruction sequences.
+
+### 9.12 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 table literals, fixed-size `[T; N]` arrays and array literals, nested keyed
@@ -1087,7 +1138,8 @@ declared struct fields), `match`, compile-time `import`/`mod`, address-of
 (`&place`), raw pointer types (`*mut T`, `*const T`), pointer arithmetic and
 dereferences inside `unsafe`, the raw intrinsics above (`unsafe_ptr_cast`,
 `unsafe_read_mem`, `unsafe_write_mem`, `unsafe_alloc`, `volatile_read`,
-`volatile_write`, `unsafe_nop`, `unsafe_asm`), native `pcall`, the
+`volatile_write`, `unsafe_nop`, `unsafe_asm`, `asm!("...")`), native `pcall`,
+the
 string-pattern surface in
 section 9.7, and the restricted
 `coroutine.create/resume/yield/status/close/isyieldable` surface described in

@@ -233,6 +233,30 @@ fn b_unsafe_asm(i: &mut Interp, _args: Vec<Value>, span: Span) -> LResult<Vec<Va
     Ok(Vec::new())
 }
 
+/// `asm!("text")` - macro-style inline assembly.
+///
+/// Both front ends desugar the syntax to an `asm("text")` call, so the
+/// interpreter and VM share this one unsafe gate.  Instructions are ignored by
+/// the dynamic engines; the C11 backend emits `LUSA_ASM("text")`.
+fn b_asm(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    require_unsafe(i, "inline assembly (`asm!`)", span)?;
+    if args.len() != 1 {
+        return Err(LusaError::new(
+            crate::error::E_INDEX,
+            Some(span),
+            format!("`asm!` takes one string argument, found {}", args.len()),
+        ));
+    }
+    match args[0].base_value() {
+        Value::Str(_) => Ok(Vec::new()),
+        other => Err(LusaError::new(
+            crate::error::E_INDEX,
+            Some(span),
+            format!("`asm!` expects a string, got {}", other.type_name()),
+        )),
+    }
+}
+
 /// `io_read_file(path)`: reads a UTF-8 text file and returns its contents.
 ///
 /// This is the native I/O primitive used by the self-hosted compiler pipeline.
@@ -651,6 +675,7 @@ pub fn all() -> Vec<(&'static str, BF)> {
         ("volatile_write", Box::new(b_volatile_write)),
         ("unsafe_nop", Box::new(b_unsafe_nop)),
         ("unsafe_asm", Box::new(b_unsafe_asm)),
+        ("asm", Box::new(b_asm)),
         ("io_read_file", Box::new(b_io_read_file)),
         ("io_write_binary", Box::new(b_io_write_binary)),
         ("io_read_binary", Box::new(b_io_read_binary)),

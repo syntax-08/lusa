@@ -231,11 +231,13 @@ use the same `volatile uint32_t` lvalue, valid C11 for GCC, Clang, TCC, and
 MSVC. They perform no bounds checks or memory sandboxing: the caller is
 responsible for using valid hardware or process addresses.
 
-`unsafe_nop()` emits `LUSA_NOP()` and `unsafe_asm("wfe")` emits
+`unsafe_nop()` emits `LUSA_NOP()`, and `asm!("wfe")`/`unsafe_asm("wfe")` emit
 `LUSA_ASM("wfe")`. GCC/Clang define `LUSA_ASM(text)` as
-`({ __asm__ volatile (text : : ); })`; toolchains without inline assembly use a
-no-op definition. The text must be a plain string literal without quotes,
-backslashes, or newlines.
+`({ __asm__ __volatile__ (text : : ); })`; toolchains without inline assembly
+use a no-op definition. The text must be a plain string literal without quotes,
+backslashes, or newlines. `asm!` is available only inside `unsafe`; the
+self-hosted parser desugars it to an `asm("...")` call before the compiler
+checks the argument and safety gate.
 
 The interpreter and bytecode VM implement the same names as safe builtins over
 a process-local `HashMap<u64, f64>`. `lusalang run` and `lusalang run --vm`
@@ -430,7 +432,10 @@ pointer arithmetic lowering, dynamic-engine parity, and a native build/run.
 `tests/module17.rs` covers typed volatile lowering for dot/colon/builtin
 spellings, scalar-element and value-type diagnostics, `unsafe` gating in all
 engines, packed/aligned C macros and diagnostics, dynamic parity, and a native
-volatile/packed/aligned build/run.
+volatile/packed/aligned build/run. `tests/module18.rs` covers `asm!("...")`
+emission, multiple instructions, `unsafe` gating in all three engines,
+malformed input and arity, shared lowering with `unsafe_asm`, dynamic control
+flow, and a native build/run.
 
 ### Current limits
 
@@ -452,7 +457,10 @@ and aliasing through `&local` are C11-backend features. Volatile access is
 limited to scalar pointer elements; volatile struct copies and bulk array
 access are not part of the native subset. `#[packed]` and
 `#[repr(align(N))]` change native layout only; the dynamic engines accept the
-same declarations and keep their fixed-field simulation.
+same declarations and keep their fixed-field simulation. `asm!("...")` lowers
+raw instruction text without operand constraints or clobber modeling;
+privileged instructions such as `cli`/`sei` require ring 0 and are exercised by
+emission tests rather than native runs.
 
 ## Extension points
 

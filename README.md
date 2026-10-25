@@ -23,7 +23,9 @@ inline assembly. Module 16 adds fixed-size `[T; N]` arrays, zero-based
 indexing, address-of (`&place`), and raw-pointer arithmetic for buffering and
 AST work. Module 17 adds volatile MMIO access (`read_volatile`/
 `write_volatile`), packed structs (`#[packed]`), and explicit alignment
-(`#[repr(align(N))]`).
+(`#[repr(align(N))]`). Module 18 adds macro-style inline assembly
+(`asm!("...")`) for privileged instructions, fences, and architecture-specific
+hardware controls.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -588,21 +590,23 @@ canonical path, so a module included twice contributes its definitions once.
 The same expansion runs for the interpreter, bytecode VM, native build, and
 `--emit-c`.
 
-`unsafe_asm("...")` lowers to the GNU volatile statement form behind a portable
-macro:
+Inline assembly is available through `asm!("...")` (and the
+backward-compatible `unsafe_asm("...")` spelling) behind a portable macro:
 
 ```c
-#define LUSA_ASM(text) ({ __asm__ volatile (text : : ); })
+#define LUSA_ASM(text) ({ __asm__ __volatile__ (text : : ); })
 ```
 
 ```lusa
 unsafe do
-    unsafe_asm("wfe")
+    asm!("wfe")
 end
 ```
 
 GCC and Clang emit the instruction; toolchains without inline assembly use a
-no-op definition.
+no-op definition. See
+[Inline assembly and hardware controls (Module 18)](#inline-assembly-and-hardware-controls-module-18)
+for the full surface.
 
 ```sh
 lusalang run examples/struct_match.lusa
@@ -717,6 +721,54 @@ lusalang build examples/baremetal_gpio.lusa --emit-c
 `#[packed]` and `#[repr(align(N))]` change native layout only; the dynamic
 engines accept the same source and keep their fixed-field simulation.
 
+### Inline assembly and hardware controls (Module 18)
+
+`asm!("...")` emits a raw assembly statement and is only available inside
+`unsafe`:
+
+```lusa
+unsafe do
+    asm!("cli")            -- disable interrupts (ring 0)
+    local status: u32 = 1
+    asm!("nop; nop")       -- keep the sequence explicit
+    asm!("sei")            -- enable interrupts
+    print(status)
+end
+```
+
+Both parsers desugar the macro syntax into an `asm("...")` call, so the
+interpreter, bytecode VM, and C11 backend share one argument check and one
+`unsafe` gate. Native builds lower the call to `LUSA_ASM("...")`:
+
+```c
+#define LUSA_ASM(text) ({ __asm__ __volatile__ (text : : ); })
+```
+
+- GCC and Clang receive the text as a volatile inline-assembly statement.
+  MSVC and other toolchains keep the program buildable with a no-op definition.
+- The interpreter and `--vm` treat assembly as a sandboxed no-op, so control
+  flow and register simulation can be tested without executing instructions.
+- Outside `unsafe`, the C backend reports `E0316` and the dynamic engines
+  report `E0321`.
+- The text must be a plain, non-empty string literal. Quotes, backslashes,
+  and newlines are rejected with `E0101` before code generation.
+- `unsafe_asm("...")` keeps working as an alias with the same lowering.
+
+Privileged instructions such as `cli`/`sei` only execute at ring 0. The example
+uses `nop` so it runs safely on a desktop:
+
+```sh
+lusalang run examples/baremetal_asm.lusa
+lusalang run examples/baremetal_asm.lusa --vm
+lusalang run examples/baremetal_asm.lusa --native
+lusalang build examples/baremetal_asm.lusa --emit-c
+```
+
+`tests/module18.rs` covers the GNU volatile macro, multiple instructions,
+`unsafe` gating in all three engines, malformed strings and arity, shared
+lowering with `unsafe_asm`, control-flow execution in the dynamic engines, and
+a native build-and-run.
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -727,9 +779,10 @@ require a C toolchain.
 
 Runnable examples: `examples/typed_native.lusa` (build/run),
 `examples/baremetal_gpio.lusa` (volatile polling with packed/aligned register
-layouts; uses `unsafe_alloc` so it runs on a desktop), and
-`examples/unsafe_hardware.lusa` (simulated memory in `run`/`--vm`; replace the
-illustrative MMIO address before native execution).
+layouts; uses `unsafe_alloc` so it runs on a desktop),
+`examples/baremetal_asm.lusa` (inline assembly fences and a `nop` polling
+loop), and `examples/unsafe_hardware.lusa` (simulated memory in `run`/`--vm`;
+replace the illustrative MMIO address before native execution).
 
 `tests/c_backend.rs` covers typed mapping, functions/tables, moves/clone/drops,
 Cargo-style diagnostics, unsafe volatile emission, and a native build/run test
@@ -743,7 +796,10 @@ address-of/pointer arithmetic lowering, `unsafe` gating, and a native
 build-and-run check. `tests/module17.rs` adds typed volatile lowering for every
 method spelling, scalar-element restrictions, value type checking,
 packed/aligned C layout macros, attribute validation, dynamic parity, and a
-native volatile/packed/aligned build-and-run. See
+native volatile/packed/aligned build-and-run. `tests/module18.rs` adds
+`asm!("...")` emission, multiple instructions, `unsafe` gating, malformed
+input diagnostics, shared lowering with `unsafe_asm`, dynamic control-flow
+parity, and a native build-and-run. See
 [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
 [`docs/LANGUAGE.md`](docs/LANGUAGE.md) section 9 for details.
 
@@ -805,6 +861,9 @@ Near-term milestones:
 - **v1.3.0 (shipped):** typed volatile MMIO loads/stores (`read_volatile`/
   `write_volatile`), packed structs (`#[packed]`), and explicit alignment
   (`#[repr(align(N))]`) for hardware register layouts.
+- **v1.4.0 (shipped):** `asm!("...")` inline assembly inside `unsafe`, lowered
+  to GCC/Clang volatile statements, with a shared no-op path in the
+  interpreter and bytecode VM.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

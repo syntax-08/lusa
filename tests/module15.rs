@@ -361,6 +361,6 @@ fn imports_and_modules_merge_symbols_relative_to_the_source() {
 #[test]
 fn unsafe_asm_uses_the_gnu_volatile_form() {
     let c = emit("unsafe do\n    unsafe_asm(\"nop\")\nend\nreturn 0\n");
-    assert!(c.contains("__asm__ volatile (text : : );"));
+    assert!(c.contains("__asm__ __volatile__ (text : : );"));
     assert!(c.contains("LUSA_ASM(\"nop\")"));
 }

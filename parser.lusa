@@ -357,6 +357,23 @@ local function decode_string(text, line, column)
     return table.concat(out)
 end
 
+-- Validates the raw text accepted by `asm!("...")`.  The C emitter places the
+-- text inside a C string literal, so quotes, backslashes, and line breaks are
+-- rejected before either backend sees the program.
+local function validate_asm_text(text, line, column)
+    if text == nil or text == "" then
+        fail_at(line, column, "`asm!` requires a non-empty assembly string")
+    end
+    if string.find(text, '"', 1, true) ~= nil
+        or string.find(text, "\\", 1, true) ~= nil
+        or string.find(text, "\n", 1, true) ~= nil
+        or string.find(text, "\r", 1, true) ~= nil
+        or string.find(text, "\0", 1, true) ~= nil then
+        fail_at(line, column,
+            "`asm!` text must not contain quotes, backslashes, or newlines")
+    end
+end
+
 -- ===== statements =====
 
 parse_block = function()
@@ -1385,6 +1402,59 @@ parse_prefix = function()
     return parse_suffixes(parse_primary())
 end
 
+-- `asm!("...")` is macro-style syntax that desugars to `asm("...")`.
+-- Keeping one call shape means the interpreter, VM, and C11 backend share the
+-- same argument check and `unsafe` gate.
+local function parse_asm()
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- asm
+    expect_value("!", "`!` after `asm`")
+    expect_value("(", "`(` after `asm!`")
+
+    if peek_kind() == "string" then
+        local text_line = peek_line()
+        local text_column = peek_column()
+        local text = tokens[pos].text
+        local interpolated = tokens[pos].interpolated
+        advance()
+        if interpolated then
+            fail_at(text_line, text_column,
+                "`asm!` requires a plain string literal (no interpolation)")
+        end
+        local decoded = decode_string(text or "", text_line, text_column)
+        validate_asm_text(decoded, text_line, text_column)
+        expect_value(")", "`)` to close `asm!`")
+        return {
+            tag = "Call",
+            callee = {
+                tag = "Name",
+                name = "asm",
+                line = line,
+                column = column
+            },
+            args = {
+                {
+                    tag = "String",
+                    value = decoded,
+                    raw = text,
+                    interpolated = false,
+                    line = text_line,
+                    column = text_column
+                }
+            },
+            line = line,
+            column = column
+        }
+    end
+
+    if at_value(")") then
+        fail("`asm!` requires an assembly string")
+    end
+
+    fail("`asm!` expects a string literal, found " .. describe_token())
+end
+
 parse_primary = function()
     local kind = peek_kind()
     local value = peek_value()
@@ -1433,6 +1503,10 @@ parse_primary = function()
             line = line,
             column = column
         }
+    end
+
+    if kind == "name" and value == "asm" and peek_value_at(1) == "!" then
+        return parse_asm()
     end
 
     if kind == "name" then

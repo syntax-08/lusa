@@ -73,6 +73,31 @@ fn expr_field(obj: Expr, name: String, span: Span) -> Expr {
     }
 }
 
+/// Validates the raw text accepted by `asm!("...")`.  The C emitter places the
+/// text inside a C string literal, so quotes, backslashes, and line breaks are
+/// rejected before either backend sees the program.
+fn validate_asm_text(text: &str, span: Span) -> LResult<()> {
+    if text.trim().is_empty() {
+        return Err(LusaError::new(
+            E_PARSE,
+            Some(span),
+            "`asm!` requires a non-empty assembly string",
+        )
+        .help("use `asm!(\"nop\")` or a semicolon-separated instruction string"));
+    }
+    if text
+        .chars()
+        .any(|c| matches!(c, '"' | '\\' | '\n' | '\r' | '\0'))
+    {
+        return Err(LusaError::new(
+            E_PARSE,
+            Some(span),
+            "`asm!` text must not contain quotes, backslashes, or newlines",
+        ));
+    }
+    Ok(())
+}
+
 /// Maps the Rust-style pointer method sugar (`ptr.read_volatile()`) to the
 /// shared intrinsic name.  Both parsers desugar here so the interpreter, VM,
 /// and C backend see exactly one call shape.
@@ -1090,6 +1115,67 @@ impl Parser {
         Ok(e)
     }
 
+    /// Parses `asm!("...")` after the `asm` name has been consumed.
+    ///
+    /// The macro syntax desugars to `asm("...")`, so the interpreter, VM, and
+    /// C11 backend share one call shape, one argument check, and one `unsafe`
+    /// gate.  The C emitter turns the call into `LUSA_ASM("...")`.
+    fn parse_asm(&mut self, name_span: Span) -> LResult<Expr> {
+        self.expect(TK::Bang, "`!` after `asm`")?;
+        self.expect(TK::LParen, "`(` after `asm!`")?;
+
+        let (text, text_span) = match self.peek().kind.clone() {
+            TK::Str(segs) => {
+                let span = self.peek().span;
+                self.bump();
+                let mut text = String::new();
+                for seg in segs {
+                    match seg {
+                        StrSeg::Lit(lit) => text.push_str(&lit),
+                        StrSeg::Expr(_) => {
+                            return Err(LusaError::new(
+                                E_PARSE,
+                                Some(span),
+                                "`asm!` requires a plain string literal (no interpolation)",
+                            ));
+                        }
+                    }
+                }
+                (text, span)
+            }
+            TK::RParen => {
+                return Err(LusaError::new(
+                    E_PARSE,
+                    Some(self.peek().span),
+                    "`asm!` requires an assembly string",
+                )
+                .help("write `asm!(\"nop\")` for a no-op instruction"));
+            }
+            _ => {
+                let t = self.peek().clone();
+                return Err(LusaError::new(
+                    E_PARSE,
+                    Some(t.span),
+                    format!("`asm!` expects a string literal, found {}", t.desc()),
+                ));
+            }
+        };
+        validate_asm_text(&text, text_span)?;
+
+        let close_span = self.peek().span;
+        self.expect(TK::RParen, "`)` to close `asm!`")?;
+        let span = merge(name_span, close_span);
+        let arg = Expr { kind: ExprKind::Str(vec![StrAstSeg::Lit(text)]), span: text_span };
+        Ok(Expr {
+            kind: ExprKind::Call {
+                callee: Box::new(expr_var("asm".to_string(), name_span)),
+                args: vec![arg],
+                span_args_end: span,
+            },
+            span,
+        })
+    }
+
     /// parse primary expression (literals, names, parens, tables, functions)
     fn parse_primary(&mut self) -> LResult<Expr> {
         let tk = self.bump();
@@ -1101,7 +1187,12 @@ impl Parser {
             TK::Int(s) => ExprKind::Int(s),
             TK::Str(segs) => self.parse_str_segs(segs, tk.span)?,
             TK::DotDotDot => ExprKind::Vararg,
-            TK::Name(n) => ExprKind::Var(Box::new(n)),
+            TK::Name(n) => {
+                if n == "asm" && self.at(TK::Bang) {
+                    return self.parse_asm(tk.span);
+                }
+                ExprKind::Var(Box::new(n))
+            }
             TK::LParen => {
                 let e = self.parse_expr()?;
                 self.expect(TK::RParen, "`)`")?;

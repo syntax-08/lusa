@@ -314,7 +314,8 @@ registry.
 ### 15.4 Inline assembly
 
 - `unsafe_asm("text")` lowers to `LUSA_ASM("text")`, defined as
-  `({ __asm__ volatile (text : : ); })` on GCC/Clang and as a no-op elsewhere.
+  `({ __asm__ __volatile__ (text : : ); })` on GCC/Clang and as a no-op
+  elsewhere. Module 18 adds the preferred `asm!("text")` spelling.
 - The text must be a plain string literal without quotes, backslashes, or
   newlines.
 
@@ -447,6 +448,45 @@ registry.
 - The C emitter remains a typed subset; volatile access is limited to scalar
   elements and does not yet support volatile struct copies or array bulk access.
 
+## Module 18 - Inline assembly and hardware controls (shipped in v1.4.0)
+
+### 18.1 `asm!("...")`
+
+- `asm!("text")` is accepted as a statement/expression only inside `unsafe`.
+  Both parsers consume the macro syntax and desugar it to `asm("text")`, so
+  the interpreter, VM, and C11 backend share one argument check and one gate.
+- The C11 emitter lowers the call to `LUSA_ASM("text")`. GCC/Clang define the
+  macro as `({ __asm__ __volatile__ (text : : ); })`; MSVC and other
+  toolchains keep a no-op definition so the same program still builds.
+- The dynamic engines treat assembly as a sandboxed no-op, preserving control
+  flow and simulated register state.
+- Text validation rejects empty strings, interpolation, quotes, backslashes,
+  `\n`, `\r`, and NUL. Parse diagnostics are `E0101`; the native intrinsic
+  check uses `E0312`; the unsafe gates are `E0316` (native) and `E0321`
+  (dynamic).
+- `unsafe_asm("...")` is retained as a backward-compatible alias with
+  identical lowering.
+
+**Acceptance criteria**
+
+- `tests/module18.rs` covers macro emission, multiple instructions, `unsafe`
+  gating in all engines, malformed input and arity, shared lowering with
+  `unsafe_asm`, dynamic control flow, and a native build/run.
+- `examples/baremetal_asm.lusa` prints identical output in `run`, `--vm`, and
+  `--native`.
+
+**Risks**
+
+- Privileged instructions (`cli`, `sei`, `hlt`) fault or trap outside ring 0.
+  They are covered by emission tests; runnable examples use `nop`.
+- The text is passed through verbatim to the host compiler. Lusa validates
+  string safety, not assembly syntax or target support; the host assembler
+  reports those errors.
+- MSVC and toolchains without GNU-style inline assembly compile the call as a
+  no-op, so behavior differs from GCC/Clang by design.
+- Operand constraints and clobbers are not modeled yet; the current surface is
+  raw instruction text without input/output operands.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -474,6 +514,7 @@ registry.
 | v1.1.0 | Struct literals, `match`, compile-time modules, inline asm (shipped) | deep struct RAII, per-arm ownership, import deduplication, three-engine parity |
 | v1.2.0 | Fixed arrays, address-of, pointer arithmetic (shipped) | zero-based C11 arrays, heap-element drop loops, `unsafe` dereference gate, three-engine parity |
 | v1.3.0 | Volatile MMIO and struct representation (shipped) | typed volatile lowering, scalar-element gate, packed/align portability macros, three-engine parity |
+| v1.4.0 | Inline assembly and hardware controls (shipped) | `asm!` parsing in both front ends, GNU volatile lowering, strict `unsafe` gate, three-engine parity |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,
