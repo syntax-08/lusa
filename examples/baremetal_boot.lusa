@@ -1,0 +1,61 @@
+-- Module 19 example: bare-metal startup with custom entry and sections.
+--
+--   lusalang run examples/baremetal_boot.lusa
+--   lusalang run examples/baremetal_boot.lusa --vm
+--   lusalang build examples/baremetal_boot.lusa --emit-c
+--
+-- `#[no_std]` drops the hosted C runtime: no `main`, no coroutine runtime, no
+-- allocator, and no pattern matcher. `#[entry]` exports `_start` as the symbol
+-- a reset vector or linker script expects, and `#[link_section]` places code
+-- and data where that script can find them.
+--
+-- The dynamic engines accept the same attributes, run `_start` as an ordinary
+-- function, and emulate the MMIO writes. `--emit-c` shows the native lowering:
+-- `.text.boot`/`.data.boot` become linker sections and the entry wrapper calls
+-- the program body before `_start`.
+--
+-- On a real board, replace the example address with the peripheral base and
+-- provide `_start` from the reset vector. The generated C needs a freestanding
+-- C compiler and a linker script; it does not use libc.
+
+#[no_std]
+
+struct BootState {
+    magic: u32,
+    ticks: u32,
+}
+
+-- Uninitialized data promoted to file scope and placed in `.data.boot`.
+#[link_section = ".data.boot"]
+local state: BootState
+
+-- Top-level implicit globals keep their inferred type and section placement.
+#[link_section = ".data.boot"]
+boot_count = 0
+
+-- Helpers can share the sectioned code and global state.
+#[link_section = ".text.boot"]
+function tick() : void
+    state.ticks = state.ticks + 1
+    boot_count = boot_count + 1
+end
+
+-- `#[entry]` only changes the exported symbol; the function itself is still a
+-- normal Lusa function with a `void` return type and no parameters.
+#[link_section = ".text.boot"]
+#[entry]
+function _start() : void
+    state.magic = 0x4C555341 -- "LUSA"
+    state.ticks = 0
+    boot_count = 0
+
+    unsafe do
+        local gpio: *mut u32 = 0x40000000
+        gpio.write_volatile(1)
+        asm!("nop")
+        state.magic = state.magic + gpio.read_volatile()
+    end
+
+    tick()
+    tick()
+end

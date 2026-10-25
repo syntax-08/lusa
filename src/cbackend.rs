@@ -142,8 +142,12 @@ pub fn emit_c_with_base(source: &str, base: Option<&Path>) -> Result<String, Str
         return Err("C backend produced no output".to_string());
     }
     let mut c = output.concat();
-    c.push_str("\n\n/* ===== Module 13 string pattern runtime ===== */\n");
-    c.push_str(PATTERN_RUNTIME);
+    // `#[no_std]` translation units never use the Module 13 pattern runtime,
+    // and its hosted helpers would drag libc into a freestanding build.
+    if !c.starts_with("/* lusa:no_std */") {
+        c.push_str("\n\n/* ===== Module 13 string pattern runtime ===== */\n");
+        c.push_str(PATTERN_RUNTIME);
+    }
     Ok(c)
 }
 

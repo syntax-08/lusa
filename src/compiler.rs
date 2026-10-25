@@ -1356,7 +1356,7 @@ fn compile_block(c: &mut Compiler, block: &Block) -> LResult<()> {
 fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
     c.set_line(st.span);
     match &st.kind {
-        StKind::Local { targets, values, annotations } => {
+        StKind::Local { targets, values, annotations, .. } => {
             compile_local(c, targets, values, annotations, st.span)?
         }
         StKind::Struct { name, fields, .. } => {
@@ -1376,7 +1376,7 @@ fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
             c.set_line(st.span);
             c.em(Instr::UnsafeLeave);
         }
-        StKind::Assign { targets, values } => compile_assign(c, targets, values, st.span)?,
+        StKind::Assign { targets, values, .. } => compile_assign(c, targets, values, st.span)?,
         StKind::ExprSt(e) => {
             compile_expr(c, e)?;
             c.set_line(st.span);
@@ -1399,7 +1399,10 @@ fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
         StKind::ForIter { vars, values, body } => {
             compile_for_iter(c, vars, values, body, st.span)?
         }
-        StKind::FuncSt { target, func } => compile_func_st(c, target, func)?,
+        StKind::FuncSt { target, func, .. } => compile_func_st(c, target, func)?,
+        // `#[no_std]` only changes the C backend's runtime selection; the
+        // bytecode VM has no hosted runtime to disable.
+        StKind::NoStd => {}
         StKind::Do { body } => compile_block(c, body)?,
         StKind::Return { values, span } => compile_return(c, values, *span)?,
         StKind::Break => {

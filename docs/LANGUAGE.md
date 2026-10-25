@@ -429,6 +429,7 @@ Codes `E{category}{n}`, like rustc:
 | E0322  | unsafe   | write through a `*const` pointer |
 | E0323  | static   | C11 backend: statically evaluable malformed string pattern or replacement |
 | E0324  | static   | C11 backend: replacement capture or `gmatch` binding exceeds the pattern's captures |
+| E0325  | static   | C11 backend: invalid `#[no_std]`/`#[entry]`/`#[link_section]` placement, duplicate entry or `#[no_std]`, sectioned existing global, or incomplete promoted-local initialization |
 | E9000  | runtime  | `error(msg)` |
 | E9100  | runtime  | `assert(false, msg)` |
 | E9999  | runtime  | internal error (umbrella; includes stack overflow for calls > 200 — catchable with `pcall`) |
@@ -1123,7 +1124,90 @@ argument check and one safety gate. Native output is:
 - `asm!` is statement-like and returns no value. Use `unsafe_nop()` for a
   portable single no-op and `asm!` for target-specific instruction sequences.
 
-### 9.12 Native subset limits
+### 9.12 Bare-metal entry points and linker sections (Module 19)
+
+`#[no_std]` is a standalone file-level statement and must be the first
+statement in the file. It selects a freestanding C11 translation unit with no
+hosted runtime, no `int main`, no coroutine runtime, no pattern matcher, and no
+allocator. The preamble keeps only `<stdint.h>`, `<stdbool.h>`, `<stddef.h>`,
+the assembly/packing/section macros, checked integer helpers, and a minimal
+error flag. Duplicate or non-leading `#[no_std]` and nested use are `E0325`.
+
+In `#[no_std]` mode every top-level `local` is promoted to a file-scope global,
+so helpers and the entry function can share it. Promotion rewrites the
+declaration into an assignment and zero-initializes typed globals that have no
+initializer. If a promoted declaration initializes only some of its names, the
+backend reports `E0325`.
+
+`#[entry]` marks one top-level, parameterless function as the exported startup
+symbol:
+
+```lusa
+#[no_std]
+
+#[link_section = ".data.boot"]
+local state: u32 = 0
+
+#[link_section = ".text.boot"]
+#[entry]
+function _start() : void
+    state = state + 1
+    unsafe do
+        asm!("nop")
+    end
+end
+```
+
+The wrapper exports the function's own name (`_start` here) and returns
+`void`. Top-level statements run in `static int lusa_program_body(void)` before
+the entry call; in hosted programs the wrapper then drops globals and calls
+`lusa_free_allocs()`. Duplicate `#[entry]` markers, entry functions with
+parameters, and `#[entry]` on a method are `E0325`. An entry may be used with or
+without `#[no_std]`; when present, no `int main` is emitted.
+
+`#[link_section = "..."]` is accepted on top-level functions, top-level
+`local` declarations, and top-level implicit globals:
+
+```lusa
+#[link_section = ".text.boot"]
+function boot() : void
+end
+
+#[link_section = ".data.state"]
+local counter: u32 = 7
+
+#[link_section = ".bss.ready"]
+ready = false
+```
+
+- Section names are 1–255 ASCII bytes from `[A-Za-z0-9_.$-]`; empty names,
+  invalid characters, and oversized names are parser errors (`E0101`).
+- A sectioned top-level `local` is promoted to a file-scope global. The
+  attribute may only annotate a newly declared plain global; placing it on an
+  existing global is `E0325`.
+- Nested locals and assignments, struct declarations, and other statements
+  cannot carry `#[link_section]` (`E0325` or `E0101` depending on placement).
+- The emitter writes a comment showing the GNU lowering and calls a portable
+  macro:
+
+  ```c
+  /* #[link_section = ".text.boot"] -> __attribute__((section(".text.boot"))) */
+  LUSA_LINK_SECTION(".text.boot")
+  static void f1(LusaCoro *lusa_co) { ... }
+  ```
+
+  GCC/Clang define `LUSA_LINK_SECTION(name)` as
+  `__attribute__((section(name)))`; MSVC expands it to nothing because it has
+  no GNU code-section attribute.
+
+The dynamic engines accept `#[no_std]`, `#[entry]`, and `#[link_section]` and
+ignore their native effects. `#[no_std]` runs `#[entry]` as an ordinary
+function, so programs remain testable with `run` and `--vm`. The freestanding
+subset supports scalars, structs, raw pointers, `asm!`, and control flow;
+strings, tables, `print`, coroutine APIs, and `unsafe_alloc` still require the
+hosted runtime.
+
+### 9.13 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 table literals, fixed-size `[T; N]` arrays and array literals, nested keyed
@@ -1132,7 +1216,8 @@ colon methods, `pairs`/`ipairs` generic `for` over tables, `#` on strings,
 tables, and arrays, `if`, `while`, `repeat`, `do`, `return`, `break`,
 assignments, globals, `print`, `clone`, `borrow`, `move`, the compile-time
 borrow checker, `unsafe` blocks, static `struct` declarations in brace and bare
-form, `#[packed]`/`#[repr(align(N))]` representation attributes, struct
+form, `#[packed]`/`#[repr(align(N))]` representation attributes,
+`#[no_std]`/`#[entry]`/`#[link_section = "..."]` (section 9.12), struct
 literals with defaults (scalar, `string`, `table`, pointer, and previously
 declared struct fields), `match`, compile-time `import`/`mod`, address-of
 (`&place`), raw pointer types (`*mut T`, `*const T`), pointer arithmetic and

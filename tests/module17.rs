@@ -228,7 +228,7 @@ fn representation_attributes_are_validated_before_codegen() {
         ),
         (
             "#[packed]\nlocal x: u32 = 1\nreturn 0\n",
-            "attributes are only supported on `struct` declarations",
+            "cannot annotate a local",
         ),
     ];
     for (source, needle) in cases {

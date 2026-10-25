@@ -39,6 +39,50 @@ fn parse_expanded(src: &str) -> LResult<Block> {
 
 const STMT_ENDS: &[TK] = &[TK::End, TK::Else, TK::Elseif, TK::Until, TK::Eof];
 
+/// Attributes collected before a declaration or statement.
+#[derive(Default)]
+struct Attributes {
+    packed: bool,
+    align: Option<u32>,
+    no_std: bool,
+    entry: bool,
+    link_section: Option<String>,
+}
+
+/// Linker section names are emitted inside a C string literal and passed to a
+/// compiler attribute.  Keep the accepted set deliberately small so user text
+/// can never break out of the literal or add another attribute.
+fn validate_section_name(name: &str, span: Span) -> LResult<()> {
+    if name.is_empty() {
+        return Err(LusaError::new(
+            E_PARSE,
+            Some(span),
+            "`link_section` cannot be empty",
+        )
+        .help("use a section such as `.text.boot` or `.data.boot`"));
+    }
+    if name.len() > 255 {
+        return Err(LusaError::new(
+            E_PARSE,
+            Some(span),
+            "section name is too long (maximum 255 bytes)",
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'$'))
+    {
+        return Err(LusaError::new(
+            E_PARSE,
+            Some(span),
+            "invalid character in `link_section` name",
+        )
+        .help("section names may contain ASCII letters, digits, `_`, `.`, `-`, and `$`"));
+    }
+    Ok(())
+}
+
+
 const PREC_OR: u8 = 1;
 const PREC_AND: u8 = 2;
 const PREC_CMP: u8 = 3;
@@ -249,7 +293,7 @@ impl Parser {
     fn parse_stmt(&mut self) -> LResult<St> {
         let tk = self.peek().clone();
         let st = match tk.kind {
-            TK::Local => self.parse_local_st()?,
+            TK::Local => self.parse_local_st(None)?,
             TK::If => self.parse_if()?,
             TK::While => self.parse_while()?,
             TK::Repeat => self.parse_repeat()?,
@@ -271,18 +315,7 @@ impl Parser {
                 St { kind: StKind::Unsafe { body }, span: tk.span }
             }
             TK::Struct => self.parse_struct_st(false, None)?,
-            TK::Len if self.peek_at(1).kind == TK::LBracket => {
-                let (packed, align) = self.parse_attributes()?;
-                if !self.at(TK::Struct) {
-                    return Err(LusaError::new(
-                        E_PARSE,
-                        Some(self.peek().span),
-                        "attributes are only supported on `struct` declarations",
-                    )
-                    .help("write `#[packed]`, `#[repr(align(N))]`, or both directly before a `struct`"));
-                }
-                self.parse_struct_st(packed, align)?
-            }
+            TK::Len if self.peek_at(1).kind == TK::LBracket => self.parse_attributed_stmt()?,
             TK::Match => self.parse_match()?,
             TK::Import | TK::Mod => {
                 return Err(LusaError::new(
@@ -352,7 +385,10 @@ impl Parser {
                     }
                 }
             }
-            return Ok(St { kind: StKind::Assign { targets, values }, span: merge(start, end) });
+            return Ok(St {
+                kind: StKind::Assign { targets, values, link_section: None },
+                span: merge(start, end),
+            });
         }
         // otherwise it must be a call/method expression statement
         match &first.kind {
@@ -434,29 +470,96 @@ impl Parser {
         Ok(size)
     }
 
-    /// Parses zero or more `#[...]` representation attributes.
+    /// Parses zero or more `#[...]` attributes.
     ///
-    /// Supported attributes are `#[packed]` and `#[repr(align(N))]`.  The
-    /// alignment is validated here, before the AST reaches either backend, so
-    /// the dynamic engines and the C emitter agree on what is legal.
-    fn parse_attributes(&mut self) -> LResult<(bool, Option<u32>)> {
+    /// Supported attributes are `#[packed]`, `#[repr(align(N))]`,
+    /// `#[no_std]`, `#[entry]`, and `#[link_section = "..."]`.  The values
+    /// are validated here, before the AST reaches either backend, so the
+    /// dynamic engines and the C emitter agree on what is legal.
+    fn parse_attributes(&mut self) -> LResult<Attributes> {
         const MAX_ALIGN: u32 = 4096;
-        let mut packed = false;
-        let mut align: Option<u32> = None;
+        let mut attrs = Attributes::default();
+        let mut stop_after = false;
         while self.at(TK::Len) && self.peek_at(1).kind == TK::LBracket {
             self.bump(); // #
             self.bump(); // [
             let (attr, attr_span) = self.expect_name()?;
             match attr.as_str() {
                 "packed" => {
-                    if packed {
+                    if attrs.packed {
                         return Err(LusaError::new(
                             E_PARSE,
                             Some(attr_span),
                             "duplicate `#[packed]` attribute",
                         ));
                     }
-                    packed = true;
+                    attrs.packed = true;
+                }
+                "no_std" => {
+                    if attrs.no_std {
+                        return Err(LusaError::new(
+                            E_PARSE,
+                            Some(attr_span),
+                            "duplicate `#[no_std]` attribute",
+                        ));
+                    }
+                    attrs.no_std = true;
+                    // `#[no_std]` is a standalone file-level statement; do not
+                    // absorb attributes that belong to the next declaration.
+                    stop_after = true;
+                }
+                "entry" => {
+                    if attrs.entry {
+                        return Err(LusaError::new(
+                            E_PARSE,
+                            Some(attr_span),
+                            "duplicate `#[entry]` attribute",
+                        ));
+                    }
+                    attrs.entry = true;
+                }
+                "link_section" => {
+                    if attrs.link_section.is_some() {
+                        return Err(LusaError::new(
+                            E_PARSE,
+                            Some(attr_span),
+                            "duplicate `#[link_section = \"...\"]` attribute",
+                        ));
+                    }
+                    self.expect(TK::Assign, "`=` after `link_section`")?;
+                    let tk = self.peek().clone();
+                    let name = match &tk.kind {
+                        TK::Str(segs) => {
+                            let mut text = String::new();
+                            for seg in segs {
+                                match seg {
+                                    StrSeg::Lit(lit) => text.push_str(lit),
+                                    StrSeg::Expr(_) => {
+                                        return Err(LusaError::new(
+                                            E_PARSE,
+                                            Some(tk.span),
+                                            "`link_section` requires a plain string literal",
+                                        ));
+                                    }
+                                }
+                            }
+                            self.bump();
+                            text
+                        }
+                        _ => {
+                            return Err(LusaError::new(
+                                E_PARSE,
+                                Some(tk.span),
+                                format!(
+                                    "expected a section name string, found {}",
+                                    tk.desc()
+                                ),
+                            )
+                            .help("write `#[link_section = \".text.boot\"]`"));
+                        }
+                    };
+                    validate_section_name(&name, tk.span)?;
+                    attrs.link_section = Some(name);
                 }
                 "repr" => {
                     self.expect(TK::LParen, "`(` after `repr`")?;
@@ -512,14 +615,14 @@ impl Parser {
                         )
                         .help("alignment must be a power of two between 1 and 4096"));
                     }
-                    if align.is_some() {
+                    if attrs.align.is_some() {
                         return Err(LusaError::new(
                             E_PARSE,
                             Some(attr_span),
                             "duplicate `#[repr(align(N))]` attribute",
                         ));
                     }
-                    align = Some(value as u32);
+                    attrs.align = Some(value as u32);
                 }
                 other => {
                     return Err(LusaError::new(
@@ -527,12 +630,114 @@ impl Parser {
                         Some(attr_span),
                         format!("unsupported attribute `#{other}`"),
                     )
-                    .help("supported attributes are `#[packed]` and `#[repr(align(N))]`"));
+                    .help(
+                        "supported attributes are `#[packed]`, `#[repr(align(N))]`, \
+                         `#[no_std]`, `#[entry]`, and `#[link_section = \"...\"]`",
+                    ));
                 }
             }
             self.expect(TK::RBracket, "`]` to close the attribute")?;
+            if stop_after {
+                break;
+            }
         }
-        Ok((packed, align))
+        Ok(attrs)
+    }
+
+    /// Handles `#[...]` prefixes and dispatches to the declaration they
+    /// annotate.  Misplaced attributes are rejected here with a parser
+    /// diagnostic; the C backend repeats placement checks for anything the
+    /// dynamic engines accept.
+    fn parse_attributed_stmt(&mut self) -> LResult<St> {
+        let start = self.peek().span;
+        let attrs = self.parse_attributes()?;
+
+        if attrs.no_std {
+            if attrs.packed
+                || attrs.align.is_some()
+                || attrs.entry
+                || attrs.link_section.is_some()
+            {
+                return Err(LusaError::new(
+                    E_PARSE,
+                    Some(start),
+                    "`#[no_std]` must be written on its own",
+                )
+                .help("place `#[no_std]` before the rest of the program and use a separate attribute for declarations"));
+            }
+            return Ok(St { kind: StKind::NoStd, span: start });
+        }
+
+        if self.at(TK::Struct) {
+            if attrs.entry || attrs.link_section.is_some() {
+                return Err(LusaError::new(
+                    E_PARSE,
+                    Some(start),
+                    "`#[entry]` and `#[link_section]` are only supported on functions or globals",
+                ));
+            }
+            return self.parse_struct_st(attrs.packed, attrs.align);
+        }
+
+        if self.at(TK::Function) {
+            if attrs.packed || attrs.align.is_some() {
+                return Err(LusaError::new(
+                    E_PARSE,
+                    Some(start),
+                    "`#[packed]` and `#[repr(align(N))]` are only supported on structs",
+                ));
+            }
+            let mut st = self.parse_func_st()?;
+            if let StKind::FuncSt { entry, link_section, .. } = &mut st.kind {
+                *entry = attrs.entry;
+                *link_section = attrs.link_section;
+            }
+            return Ok(st);
+        }
+
+        if self.at(TK::Local) {
+            if attrs.packed || attrs.align.is_some() || attrs.entry {
+                return Err(LusaError::new(
+                    E_PARSE,
+                    Some(start),
+                    "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate a local",
+                ));
+            }
+            return self.parse_local_st(attrs.link_section);
+        }
+
+        if matches!(self.peek().kind, TK::Name(_) | TK::Star | TK::StarLine) {
+            if attrs.packed || attrs.align.is_some() || attrs.entry {
+                return Err(LusaError::new(
+                    E_PARSE,
+                    Some(start),
+                    "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate an assignment",
+                ));
+            }
+            let mut st = self.parse_assign_or_expr()?;
+            match &mut st.kind {
+                StKind::Assign { link_section, .. } => *link_section = attrs.link_section,
+                _ => {
+                    if attrs.link_section.is_some() {
+                        return Err(LusaError::new(
+                            E_PARSE,
+                            Some(start),
+                            "`#[link_section]` is only supported on functions and global variables",
+                        ));
+                    }
+                }
+            }
+            return Ok(st);
+        }
+
+        Err(LusaError::new(
+            E_PARSE,
+            Some(self.peek().span),
+            "this statement cannot carry attributes",
+        )
+        .help(
+            "attributes are supported on `struct`, `function`, top-level `local`, and global assignments",
+        ))
     }
 
     fn parse_struct_st(&mut self, packed: bool, align: Option<u32>) -> LResult<St> {
@@ -638,6 +843,7 @@ impl Parser {
                                 span: bspan,
                             }],
                             annotations: vec![None],
+                            link_section: None,
                         },
                         span: bspan,
                     };
@@ -676,6 +882,7 @@ impl Parser {
                 targets: vec![temp],
                 values: vec![scrutinee],
                 annotations: vec![None],
+                link_section: None,
             },
             span: kw.span,
         };
@@ -721,7 +928,7 @@ impl Parser {
         Ok(MatchPattern::Literal(lit))
     }
 
-    fn parse_local_st(&mut self) -> LResult<St> {
+    fn parse_local_st(&mut self, link_section: Option<String>) -> LResult<St> {
         let kw = self.bump();
         if self.at(TK::Function) {
             self.bump();
@@ -733,6 +940,7 @@ impl Parser {
                     targets: vec![name],
                     values: vec![fexpr],
                     annotations: vec![None],
+                    link_section,
                 },
                 span: kw.span,
             });
@@ -757,7 +965,10 @@ impl Parser {
         if self.eat(TK::Assign) {
             values = self.parse_exprlist()?;
         }
-        Ok(St { kind: StKind::Local { targets, values, annotations }, span: kw.span })
+        Ok(St {
+            kind: StKind::Local { targets, values, annotations, link_section },
+            span: kw.span,
+        })
     }
 
     fn parse_if(&mut self) -> LResult<St> {
@@ -862,7 +1073,10 @@ impl Parser {
             target = expr_field(target, m, sp0);
         }
         func.span_body = merge(kw.span, func.span_body);
-        Ok(St { kind: StKind::FuncSt { target, func }, span: kw.span })
+        Ok(St {
+            kind: StKind::FuncSt { target, func, entry: false, link_section: None },
+            span: kw.span,
+        })
     }
 
     /// parses `(params) body end` â€” the `function` keyword and optional name were consumed.

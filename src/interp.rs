@@ -453,10 +453,10 @@ impl Interp {
 
     fn exec_st(&mut self, frame: &mut Frame, st: &St) -> LResult<bool> {
         match &st.kind {
-            StKind::Local { targets, values, annotations } => {
+            StKind::Local { targets, values, annotations, .. } => {
                 self.exec_local(frame, targets, values, annotations, st.span)
             }
-            StKind::Assign { targets, values } => self.exec_assign(frame, targets, values),
+            StKind::Assign { targets, values, .. } => self.exec_assign(frame, targets, values),
             StKind::Struct { name, fields, .. } => {
                 let def = StructDef {
                     name: name.clone(),
@@ -539,7 +539,7 @@ impl Interp {
             }
             StKind::ForIter { vars, values, body } => self.exec_for_iter(frame, vars, values, body),
             StKind::Do { body } => self.exec_block(frame, body),
-            StKind::FuncSt { target, func } => {
+            StKind::FuncSt { target, func, .. } => {
                 let fexpr = Expr {
                     kind: ExprKind::Func(func.clone()),
                     span: st.span,
@@ -547,6 +547,9 @@ impl Interp {
                 self.exec_assign(frame, &[target.clone()], &[fexpr])?;
                 Ok(true)
             }
+            // `#[no_std]` only changes the C backend's runtime selection; the
+            // interpreter has no hosted runtime to disable.
+            StKind::NoStd => Ok(true),
             StKind::Return { values, span } => {
                 let n = values.len();
                 for (i, e) in values.iter().enumerate() {

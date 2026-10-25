@@ -309,7 +309,8 @@ opt_stmt = function(stmt)
         end
         return {
             tag = "Local", names = stmt.names, types = stmt.types,
-            values = out, line = line, column = column
+            values = out, link_section = stmt.link_section,
+            line = line, column = column
         }
     end
 
@@ -323,6 +324,7 @@ opt_stmt = function(stmt)
         end
         return {
             tag = "Assign", targets = stmt.targets, values = out,
+            link_section = stmt.link_section,
             line = line, column = column
         }
     end
@@ -341,6 +343,8 @@ opt_stmt = function(stmt)
             params = params,
             return_type = stmt.return_type,
             body = opt_block(stmt.body),
+            entry = stmt.entry,
+            link_section = stmt.link_section,
             line = line, column = column
         }
     end
@@ -850,6 +854,35 @@ local check_unsafe_depth = 0
 local check_return_type = "i32"
 local check_in_function = false
 local check_current_function = nil
+local check_no_std = false
+local check_entry_key = nil
+local check_entry_name = nil
+
+-- Section names are validated by both parsers before they reach the emitter;
+-- repeat the check here so `Compiler.emit_c` also rejects hand-built ASTs.
+local function validate_link_section(name, line, column)
+    if type(name) ~= "string" or #name == 0 then
+        type_fail("E0325", line, column,
+            "`link_section` requires a non-empty section name")
+    end
+    if #name > 255 then
+        type_fail("E0325", line, column,
+            "section name is too long (maximum 255 bytes)")
+    end
+    local i = 1
+    while i <= #name do
+        local code = string.byte(name, i)
+        local ok = (code >= 48 and code <= 57)
+            or (code >= 65 and code <= 90)
+            or (code >= 97 and code <= 122)
+            or code == 95 or code == 46 or code == 45 or code == 36
+        if not ok then
+            type_fail("E0325", line, column,
+                "invalid character in `link_section` name")
+        end
+        i = i + 1
+    end
+end
 
 local function scope_enter()
     check_scope_count = check_scope_count + 1
@@ -956,7 +989,7 @@ local function value_lookup(name)
     return nil
 end
 
-local function declare_global(name, type_name, line, column, schema, elem_type)
+local function declare_global(name, type_name, line, column, schema, elem_type, link_section, promoted)
     if type_name == "void" or type_name == "auto" then
         type_fail("E0301", line, column,
             "global `" .. name .. "` cannot have type `" .. tostring(type_name) .. "`")
@@ -970,6 +1003,8 @@ local function declare_global(name, type_name, line, column, schema, elem_type)
         global = true,
         schema = schema,
         elem_type = elem_type,
+        link_section = link_section,
+        promoted = promoted == true,
         moved = false,
         id = new_check_state()
     }
@@ -2989,6 +3024,23 @@ local function check_assign(stmt)
     local targets = stmt.targets
     local values = stmt.values
     local target_count = #targets
+    if stmt.link_section ~= nil then
+        validate_link_section(stmt.link_section, stmt.line, stmt.column)
+        local k = 1
+        while k <= target_count do
+            if targets[k].tag ~= "Name" then
+                type_fail("E0325", stmt.line, stmt.column,
+                    "`#[link_section]` is only supported on a plain global name")
+            end
+            local existing = value_lookup(targets[k].name)
+            if existing ~= nil and existing.promoted ~= true then
+                type_fail("E0325", stmt.line, stmt.column,
+                    "`#[link_section]` can only annotate a new global `"
+                    .. tostring(targets[k].name) .. "`")
+            end
+            k = k + 1
+        end
+    end
     if #values > target_count then
         type_fail("E0311", stmt.line, stmt.column,
             "more values than assignment targets are not supported")
@@ -3010,10 +3062,10 @@ local function check_assign(stmt)
                     local checked_value, actual = check_expr(clone values[i])
                     entry = declare_global(target.name, actual,
                         target.line, target.column, checked_value.schema,
-                        checked_value.elem_type)
+                        checked_value.elem_type, stmt.link_section)
                 else
                     entry = declare_global(target.name, "nil",
-                        target.line, target.column)
+                        target.line, target.column, nil, nil, stmt.link_section)
                 end
             end
             if entry.borrowed and check_unsafe_depth == 0 then
@@ -3349,12 +3401,35 @@ local function scan_functions(body)
                 type_fail("E0312", fline, fcolumn,
                     "fixed arrays cannot be returned by value; use a raw pointer")
             end
+            local link_section = stmt.link_section
+            if link_section ~= nil then
+                validate_link_section(link_section, fline, fcolumn)
+            end
+            if stmt.entry == true then
+                if receiver ~= nil then
+                    type_fail("E0325", fline, fcolumn,
+                        "`#[entry]` cannot annotate a method")
+                end
+                if #stmt.params ~= 0 then
+                    type_fail("E0325", fline, fcolumn,
+                        "`#[entry]` functions cannot take parameters")
+                end
+                if check_entry_key ~= nil then
+                    type_fail("E0325", fline, fcolumn,
+                        "duplicate `#[entry]` function (already defined by `"
+                        .. tostring(check_entry_name) .. "`)")
+                end
+                check_entry_key = key
+                check_entry_name = fname
+            end
             local signature = {
                 name = fname,
                 receiver = receiver,
                 key = key,
                 params = params,
                 ret = ret,
+                entry = stmt.entry == true,
+                link_section = link_section,
                 node = stmt
             }
             check_functions[key] = signature
@@ -3369,6 +3444,14 @@ check_stmt = function(stmt, top_level)
     local line = stmt.line
     local column = stmt.column
 
+    if tag == "NoStd" then
+        if not top_level then
+            type_fail("E0325", line, column,
+                "`#[no_std]` is only allowed at the top level")
+        end
+        return stmt
+    end
+
     if tag == "Struct" then
         if not top_level then
             type_fail("E0312", line, column,
@@ -3381,10 +3464,18 @@ check_stmt = function(stmt, top_level)
     end
 
     if tag == "Local" then
+        if stmt.link_section ~= nil then
+            type_fail("E0325", line, column,
+                "`#[link_section]` is only supported on top-level locals and globals")
+        end
         return check_local(stmt)
     end
 
     if tag == "Assign" then
+        if stmt.link_section ~= nil and not top_level then
+            type_fail("E0325", line, column,
+                "`#[link_section]` is only supported on top-level globals")
+        end
         return check_assign(stmt)
     end
 
@@ -3632,6 +3723,90 @@ check_block = function(body, top_level)
     return body
 end
 
+local function program_no_std(body)
+    local found = false
+    local seen_other = false
+    local i = 1
+    while i <= #body do
+        local stmt = body[i]
+        if stmt.tag == "NoStd" then
+            if found then
+                type_fail("E0325", stmt.line, stmt.column,
+                    "duplicate `#[no_std]` attribute")
+            end
+            if seen_other then
+                type_fail("E0325", stmt.line, stmt.column,
+                    "`#[no_std]` must be the first statement in the file")
+            end
+            found = true
+        else
+            seen_other = true
+        end
+        i = i + 1
+    end
+    return found
+end
+
+-- A top-level `local` is normally a local of the generated `main`.  In
+-- `#[no_std]` programs, and when the user asks for section placement, it
+-- becomes a file-scope global so the entry function and other functions can
+-- reach it.  The declaration is rewritten as an assignment; the checker then
+-- infers or validates the global's type through the usual path.
+local function promote_top_level_locals(body, no_std)
+    local out = {}
+    local i = 1
+    while i <= #body do
+        local stmt = body[i]
+        if stmt.tag == "Local" and (no_std or stmt.link_section ~= nil) then
+            if stmt.link_section ~= nil then
+                validate_link_section(stmt.link_section, stmt.line, stmt.column)
+            end
+            if #stmt.values > 0 and #stmt.values < #stmt.names then
+                type_fail("E0325", stmt.line, stmt.column,
+                    "a promoted top-level local must initialize every name explicitly")
+            end
+            local targets = {}
+            local j = 1
+            while j <= #stmt.names do
+                local name = stmt.names[j]
+                if check_globals[name] ~= nil then
+                    type_fail("E0325", stmt.line, stmt.column,
+                        "global `" .. tostring(name) .. "` is already declared")
+                end
+                local declared = "auto"
+                if stmt.types ~= nil and stmt.types[j] ~= nil then
+                    declared = stmt.types[j]
+                end
+                if declared ~= "auto" then
+                    local canonical = canonical_type(declared,
+                        stmt.line, stmt.column)
+                    declare_global(name, canonical, stmt.line, stmt.column,
+                        nil, nil, stmt.link_section, true)
+                end
+                targets[#targets + 1] = {
+                    tag = "Name", name = name,
+                    line = stmt.line, column = stmt.column
+                }
+                j = j + 1
+            end
+            if #stmt.values > 0 then
+                out[#out + 1] = {
+                    tag = "Assign",
+                    targets = targets,
+                    values = stmt.values,
+                    link_section = stmt.link_section,
+                    line = stmt.line,
+                    column = stmt.column
+                }
+            end
+        else
+            out[#out + 1] = stmt
+        end
+        i = i + 1
+    end
+    return out
+end
+
 local function check_program(ast)
     check_scopes = {}
     check_scope_count = 0
@@ -3648,9 +3823,14 @@ local function check_program(ast)
     check_return_type = "i32"
     check_in_function = false
     check_current_function = nil
+    check_no_std = false
+    check_entry_key = nil
+    check_entry_name = nil
 
     ast.body = scan_structs(ast.body)
+    check_no_std = program_no_std(clone ast.body)
     scan_functions(clone ast.body)
+    ast.body = promote_top_level_locals(ast.body, check_no_std)
 
     -- Check the top-level body first so its implicit globals are available to
     -- function bodies (the generated C declarations cover all of them).
@@ -3693,6 +3873,10 @@ local function check_program(ast)
     -- hand it a copy instead of moving the registry out.
     ast.structs = clone check_structs
     ast.globals = check_global_order
+    ast.no_std = check_no_std
+    ast.entry_key = check_entry_key
+    ast.entry_name = check_entry_name
+    ast.has_entry = check_entry_key ~= nil
     return ast
 end
 
@@ -3735,6 +3919,7 @@ local emit_int_ids = {}
 local emit_loop_stack = {}
 local emit_is_main = false
 local emit_return_type = "i32"
+local emit_no_std = false
 
 local function reset_emitter()
     emit_out = {}
@@ -3753,6 +3938,7 @@ local function reset_emitter()
     emit_loop_stack = {}
     emit_is_main = false
     emit_return_type = "i32"
+    emit_no_std = false
 end
 
 local function put(text)
@@ -3841,6 +4027,16 @@ local function default_c(type_name)
         return "(" .. type_name .. "){0}"
     end
     return ""
+end
+
+-- File-scope initializers must be constant expressions.  A compound literal
+-- such as `(BootState){0}` is rejected by MSVC at file scope, but `{0}` is a
+-- valid static aggregate initializer on every supported compiler.
+local function global_default_c(type_name)
+    if is_struct_type(type_name) or is_array_type(type_name) then
+        return "{0}"
+    end
+    return default_c(type_name)
 end
 
 local function elem_kind(type_name)
@@ -4235,6 +4431,16 @@ local RUNTIME = {
     "#define LUSA_PACK_END",
     "#define LUSA_PACKED",
     "#define LUSA_ALIGNAS(n) _Alignas(n)",
+    "#endif",
+    "",
+    '/* Linker section placement for `#[link_section = "..."]`.  GNU and',
+    "   Clang lower it to __attribute__((section(name))); MSVC has no",
+    "   equivalent code-section attribute, so the macro is empty and the",
+    "   generated comment documents the intended GNU lowering. */",
+    "#if defined(__GNUC__) || defined(__clang__)",
+    "#define LUSA_LINK_SECTION(name) __attribute__((section(name)))",
+    "#else",
+    "#define LUSA_LINK_SECTION(name)",
     "#endif",
     "",
     "static void lusa_panic(const char *message);",
@@ -4901,6 +5107,162 @@ local RUNTIME = {
     ""
 }
 
+-- ---- freestanding runtime ------------------------------------------------
+
+-- `#[no_std]` programs skip the hosted runtime above entirely.  This preamble
+-- only uses freestanding C headers and never calls malloc/stdio/string
+-- functions.  Strings, tables, coroutines, `print`, and `unsafe_alloc` need
+-- the hosted runtime and are intentionally unavailable in this mode.
+local NO_STD_RUNTIME = {
+    "#include <stdint.h>",
+    "#include <stdbool.h>",
+    "#include <stddef.h>",
+    "",
+    "/* Inline assembly hooks.  GCC/Clang receive the raw text; MSVC keeps",
+    "   the program buildable with a no-op. */",
+    "#if defined(_MSC_VER)",
+    "#include <intrin.h>",
+    "#define LUSA_NOP() __nop()",
+    "#define LUSA_ASM(text) ((void)0)",
+    "#elif defined(__GNUC__) || defined(__clang__)",
+    '#define LUSA_NOP() ({ __asm__ __volatile__("nop"); })',
+    "#define LUSA_ASM(text) ({ __asm__ __volatile__ (text : : ); })",
+    "#else",
+    "#define LUSA_NOP() ((void)0)",
+    "#define LUSA_ASM(text) ((void)0)",
+    "#endif",
+    "",
+    "/* Struct representation attributes. */",
+    "#if defined(_MSC_VER)",
+    "#define LUSA_PACK_BEGIN __pragma(pack(push, 1))",
+    "#define LUSA_PACK_END __pragma(pack(pop))",
+    "#define LUSA_PACKED",
+    "#define LUSA_ALIGNAS(n) __declspec(align(n))",
+    "#elif defined(__GNUC__) || defined(__clang__)",
+    "#define LUSA_PACK_BEGIN",
+    "#define LUSA_PACK_END",
+    "#define LUSA_PACKED __attribute__((packed))",
+    "#define LUSA_ALIGNAS(n) __attribute__((aligned(n)))",
+    "#else",
+    "#define LUSA_PACK_BEGIN",
+    "#define LUSA_PACK_END",
+    "#define LUSA_PACKED",
+    "#define LUSA_ALIGNAS(n) _Alignas(n)",
+    "#endif",
+    "",
+    "/* Linker section placement.  MSVC has no equivalent code-section",
+    "   attribute; the generated comment shows the GNU lowering. */",
+    "#if defined(__GNUC__) || defined(__clang__)",
+    "#define LUSA_LINK_SECTION(name) __attribute__((section(name)))",
+    "#else",
+    "#define LUSA_LINK_SECTION(name)",
+    "#endif",
+    "",
+    "typedef struct LusaCoro LusaCoro;",
+    "static bool lusa_coro_closing(LusaCoro *co) { (void)co; return false; }",
+    "",
+    "#if defined(__SIZEOF_INT128__) && !defined(_MSC_VER)",
+    "typedef __int128 lusa_i128;",
+    "#define LUSA_HAS_INT128 1",
+    "#else",
+    "typedef long long lusa_i128;",
+    "#define LUSA_HAS_INT128 0",
+    "#endif",
+    "",
+    "static lusa_i128 lusa_i128_parse(const char *text) {",
+    "    const char *p = text;",
+    "    lusa_i128 value = 0;",
+    "    int base = 10;",
+    "    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; p += 2; }",
+    "    while (*p != 0) {",
+    "        int digit;",
+    "        if (*p >= '0' && *p <= '9') digit = (int)(*p - '0');",
+    "        else if (*p >= 'a' && *p <= 'f') digit = (int)(*p - 'a') + 10;",
+    "        else if (*p >= 'A' && *p <= 'F') digit = (int)(*p - 'A') + 10;",
+    "        else break;",
+    "        value = value * (lusa_i128)base + (lusa_i128)digit;",
+    "        p++;",
+    "    }",
+    "    return value;",
+    "}",
+    "",
+    "/* Checked error propagation without libc.  Runtime errors set the flag;",
+    "   generated functions return through their normal cleanup paths. */",
+    "static bool lusa_error_pending = false;",
+    "static void lusa_throw(const char *code, const char *message) {",
+    "    (void)code; (void)message;",
+    "    lusa_error_pending = true;",
+    "}",
+    "static int lusa_error_report(void) { return 1; }",
+    'static void lusa_panic(const char *message) { lusa_throw("E9999", message); }',
+    "",
+    "static int32_t lusa_div_i32(int32_t a, int32_t b) {",
+    '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
+    "    return a / b;",
+    "}",
+    "static uint32_t lusa_div_u32(uint32_t a, uint32_t b) {",
+    '    if (b == 0u) { lusa_throw("E2001", "division by zero"); return 0u; }',
+    "    return a / b;",
+    "}",
+    "static lusa_i128 lusa_div_i128(lusa_i128 a, lusa_i128 b) {",
+    '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
+    "    return a / b;",
+    "}",
+    "static int32_t lusa_floor_div_i32(int32_t a, int32_t b) {",
+    "    int32_t q;",
+    "    int32_t r;",
+    '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
+    "    q = a / b; r = a % b;",
+    "    if (r != 0 && ((r < 0) != (b < 0))) q -= 1;",
+    "    return q;",
+    "}",
+    "static int32_t lusa_mod_i32(int32_t a, int32_t b) {",
+    '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
+    "    return a - lusa_floor_div_i32(a, b) * b;",
+    "}",
+    "static uint32_t lusa_floor_div_u32(uint32_t a, uint32_t b) {",
+    '    if (b == 0u) { lusa_throw("E2001", "division by zero"); return 0u; }',
+    "    return a / b;",
+    "}",
+    "static uint32_t lusa_mod_u32(uint32_t a, uint32_t b) {",
+    '    if (b == 0u) { lusa_throw("E2001", "division by zero"); return 0u; }',
+    "    return a % b;",
+    "}",
+    "static lusa_i128 lusa_floor_div_i128(lusa_i128 a, lusa_i128 b) {",
+    "    lusa_i128 q;",
+    "    lusa_i128 r;",
+    '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
+    "    q = a / b; r = a % b;",
+    "    if (r != 0 && ((r < 0) != (b < 0))) q -= 1;",
+    "    return q;",
+    "}",
+    "static lusa_i128 lusa_mod_i128(lusa_i128 a, lusa_i128 b) {",
+    '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
+    "    return a - lusa_floor_div_i128(a, b) * b;",
+    "}",
+    "static int32_t lusa_pow_i32(int32_t base, int32_t exponent) {",
+    "    int32_t result = 1;",
+    "    if (exponent < 0) return 0;",
+    "    while (exponent > 0) {",
+    "        if ((exponent & 1) != 0) result *= base;",
+    "        base *= base;",
+    "        exponent >>= 1;",
+    "    }",
+    "    return result;",
+    "}",
+    "static lusa_i128 lusa_pow_i128(lusa_i128 base, lusa_i128 exponent) {",
+    "    lusa_i128 result = 1;",
+    "    if (exponent < 0) return 0;",
+    "    while (exponent > 0) {",
+    "        if ((exponent & 1) != 0) result *= base;",
+    "        base *= base;",
+    "        exponent >>= 1;",
+    "    }",
+    "    return result;",
+    "}",
+    ""
+}
+
 -- ---- coroutine runtime ---------------------------------------------------
 
 -- Native coroutines use platform-supported stacks: Windows fibers and
@@ -5194,6 +5556,10 @@ collect_strings_expr = function(expr)
     end
     if tag == "Call" then
         collect_strings_expr(expr.callee)
+        -- `asm!` text is emitted verbatim through LUSA_ASM, not as a LusaString.
+        if expr.builtin == "asm" or expr.builtin == "unsafe_asm" then
+            return
+        end
         local i = 1
         while i <= #expr.args do
             collect_strings_expr(expr.args[i])
@@ -5202,7 +5568,10 @@ collect_strings_expr = function(expr)
         return
     end
     if tag == "Field" then
-        add_string(expr.field_name)
+        -- Struct fields lower to C member access and never need a table key.
+        if expr.struct_access ~= true then
+            add_string(expr.field_name)
+        end
         collect_strings_expr(expr.table)
         return
     end
@@ -5257,7 +5626,9 @@ collect_strings_block = function(body)
             while j <= #stmt.targets do
                 local target = stmt.targets[j]
                 if target.tag == "Field" then
-                    add_string(target.field_name)
+                    if target.struct_access ~= true then
+                        add_string(target.field_name)
+                    end
                     collect_strings_expr(target.table)
                 elseif target.tag == "Index" then
                     collect_strings_expr(target.table)
@@ -5305,8 +5676,6 @@ collect_strings_block = function(body)
                 collect_strings_expr(stmt.values[j])
                 j = j + 1
             end
-        elseif tag == "Function" then
-            collect_strings_block(stmt.body)
         end
         i = i + 1
     end
@@ -5754,7 +6123,7 @@ emit_expr = function(expr)
         if cname == nil then
             fail(expr.line, expr.column, "internal: call has no function name")
         end
-        local args = { "lusa_current_coro" }
+        local args = { emit_no_std and "NULL" or "lusa_current_coro" }
         local i = 1
         while i <= #expr.args do
             args[#args + 1] = emit_expr(expr.args[i])
@@ -5948,7 +6317,8 @@ emit_expr = function(expr)
         if cname == nil then
             fail(expr.line, expr.column, "internal: method has no function name")
         end
-        local args = { "lusa_current_coro", emit_expr(expr.obj) }
+        local args = { emit_no_std and "NULL" or "lusa_current_coro",
+            emit_expr(expr.obj) }
         local i = 1
         while i <= #expr.args do
             args[#args + 1] = emit_expr(expr.args[i])
@@ -6763,6 +7133,10 @@ emit_stmt = function(stmt)
         -- produces no runtime code.
         return
     end
+    if tag == "NoStd" then
+        -- File-level mode marker; the preamble was selected by check_program.
+        return
+    end
     fail(stmt.line, stmt.column,
         "internal: unsupported statement node `" .. tostring(tag) .. "`")
 end
@@ -6778,7 +7152,7 @@ emit_block_statements = function(body)
         local tag = stmt.tag
         emit_stmt(stmt)
         if tag ~= "Return" and tag ~= "Break"
-            and tag ~= "Function" and tag ~= "Struct" then
+            and tag ~= "Function" and tag ~= "Struct" and tag ~= "NoStd" then
             emit_error_check()
             emit_coro_closing_check()
         end
@@ -6932,8 +7306,14 @@ local function emit_globals_declarations()
         -- Declaration only inspects metadata; cloning keeps the entry in the
         -- drop list for the normal and error exits of `main`.
         local global = clone emit_global_order[i]
+        if global.link_section ~= nil then
+            line('/* #[link_section = "' .. global.link_section
+                .. '"] -> __attribute__((section("' .. global.link_section
+                .. '"))) */')
+            line('LUSA_LINK_SECTION("' .. global.link_section .. '")')
+        end
         line("static " .. c_decl(global.type, global.cname)
-            .. " = " .. default_c(global.type) .. ";")
+            .. " = " .. global_default_c(global.type) .. ";")
         i = i + 1
     end
     if #emit_global_order > 0 then
@@ -6972,6 +7352,12 @@ local function emit_function_definition(signature)
     end
     local param_text = table.concat(params, ", ")
 
+    if signature.link_section ~= nil then
+        line('/* #[link_section = "' .. signature.link_section
+            .. '"] -> __attribute__((section("' .. signature.link_section
+            .. '"))) */')
+        line('LUSA_LINK_SECTION("' .. signature.link_section .. '")')
+    end
     line("static " .. c_type(signature.ret) .. " " .. signature.cname
         .. "(" .. param_text .. ") {")
     emit_indent = emit_indent + 1
@@ -7038,23 +7424,90 @@ local function emit_main(ast)
     line("}")
 end
 
+local function emit_program_body(ast)
+    emit_is_main = true
+    emit_return_type = "i32"
+    line("static int lusa_program_body(void) {")
+    emit_indent = emit_indent + 1
+    emit_scope_enter()
+    emit_block_statements(ast.body)
+    emit_leave_scope()
+    line("return 0;")
+    emit_indent = emit_indent - 1
+    line("}")
+end
+
+local function emit_entry_wrapper(ast)
+    local signature = nil
+    local i = 1
+    while i <= #emit_functions do
+        if emit_functions[i].key == ast.entry_key then
+            signature = clone emit_functions[i]
+        end
+        i = i + 1
+    end
+    if signature == nil then
+        fail(0, 0, "internal: entry function signature is missing")
+    end
+    if signature.link_section ~= nil then
+        line('/* #[link_section = "' .. signature.link_section
+            .. '"] -> __attribute__((section("' .. signature.link_section
+            .. '"))) */')
+        line('LUSA_LINK_SECTION("' .. signature.link_section .. '")')
+    end
+    line("void " .. ast.entry_name .. "(void) {")
+    emit_indent = emit_indent + 1
+    line("if (lusa_program_body() != 0) {")
+    emit_indent = emit_indent + 1
+    if not ast.no_std then
+        emit_global_drops()
+    end
+    line("return;")
+    emit_indent = emit_indent - 1
+    line("}")
+    line(signature.cname .. "(NULL);")
+    if not ast.no_std then
+        emit_global_drops()
+        line("lusa_free_allocs();")
+    end
+    emit_indent = emit_indent - 1
+    line("}")
+end
+
 local function emit_c_impl(ast)
     reset_emitter()
+    emit_no_std = ast.no_std == true
+    -- Function bodies in `ast.body` are still unchecked; the checker stores
+    -- the checked bodies in the signature table that `setup_symbols` clones.
     collect_strings_block(clone ast.body)
     setup_symbols(clone ast)
+    local fi = 1
+    while fi <= #emit_functions do
+        collect_strings_block(clone emit_functions[fi].node.body)
+        fi = fi + 1
+    end
 
+    if ast.no_std then
+        put("/* lusa:no_std */")
+    end
     put("/* generated by Lusa " .. tostring(COMPILER_VERSION)
         .. " - C11 backend.  Do not edit by hand. */")
     put("")
+    local runtime = clone RUNTIME
+    if ast.no_std then
+        runtime = clone NO_STD_RUNTIME
+    end
     local i = 1
-    while i <= #RUNTIME do
-        put(RUNTIME[i])
+    while i <= #runtime do
+        put(runtime[i])
         i = i + 1
     end
-    i = 1
-    while i <= #COROUTINE_RUNTIME do
-        put(COROUTINE_RUNTIME[i])
-        i = i + 1
+    if not ast.no_std then
+        i = 1
+        while i <= #COROUTINE_RUNTIME do
+            put(COROUTINE_RUNTIME[i])
+            i = i + 1
+        end
     end
     put("")
     emit_static_strings()
@@ -7065,10 +7518,19 @@ local function emit_c_impl(ast)
 
     i = 1
     while i <= #emit_functions do
-        emit_function_definition(emit_functions[i])
+        -- Pass a clone: function arguments move, and the entry wrapper later
+        -- needs the signature table to find the entry name.
+        emit_function_definition(clone emit_functions[i])
         i = i + 1
     end
-    emit_main(clone ast)
+    if ast.has_entry then
+        emit_program_body(clone ast)
+        emit_entry_wrapper(ast)
+    elseif ast.no_std then
+        emit_program_body(clone ast)
+    else
+        emit_main(clone ast)
+    end
     return table.concat(emit_out, "\n") .. "\n"
 end
 

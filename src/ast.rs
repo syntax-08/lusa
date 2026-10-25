@@ -29,9 +29,17 @@ pub enum StKind {
         /// static type annotations (`u32`, `*mut u32`, struct names) captured
         /// for the dynamic engines' safe emulation layer.
         annotations: Vec<Option<String>>,
+        /// `#[link_section = "..."]` on a top-level declaration.  The C
+        /// backend promotes such a local to a file-scope global.
+        link_section: Option<String>,
     },
     /// `name = value` and `t.a = value` assignments
-    Assign { targets: Vec<Expr>, values: Vec<Expr> },
+    Assign {
+        targets: Vec<Expr>,
+        values: Vec<Expr>,
+        /// `#[link_section = "..."]` on a top-level implicit global.
+        link_section: Option<String>,
+    },
     /// `struct Name { field: type, ... }` declaration.  The native backend
     /// lowers it to a C struct; the dynamic engines simulate it as a
     /// fixed-field buffer.
@@ -71,7 +79,17 @@ pub enum StKind {
         body: Block,
     },
     /// `function name/path(args) body end` sugar
-    FuncSt { target: Expr, func: FuncLit },
+    FuncSt {
+        target: Expr,
+        func: FuncLit,
+        /// `#[entry]`: emit this function as the program entry symbol.
+        entry: bool,
+        /// `#[link_section = "..."]` on the function.
+        link_section: Option<String>,
+    },
+    /// `#[no_std]`: file-level bare-metal mode marker.  The dynamic engines
+    /// accept and ignore it; the C backend disables the hosted runtime.
+    NoStd,
     /// `do ... end` standalone block (new scope)
     Do { body: Block },
     Return { values: Vec<Expr>, span: Span },

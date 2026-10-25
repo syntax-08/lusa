@@ -487,6 +487,80 @@ registry.
 - Operand constraints and clobbers are not modeled yet; the current surface is
   raw instruction text without input/output operands.
 
+## Module 19 - Entry points, freestanding mode, and linker sections (shipped in v1.5.0)
+
+### 19.1 Custom entry points
+
+- `#[entry]` marks one top-level, parameterless function as the exported
+  startup symbol. The wrapper keeps the Lusa function name (for example
+  `void _start(void)`), returns `void`, and calls the internal `f<N>` function.
+- When an entry exists, the backend emits no `int main`. Top-level statements
+  run in `static int lusa_program_body(void)` before the entry call. Hosted
+  entries then run global drops and `lusa_free_allocs()`; `#[no_std]` entries
+  skip both.
+- Duplicate entries, entry functions with parameters, and `#[entry]` on a
+  method are `E0325`.
+
+### 19.2 `#[no_std]`
+
+- `#[no_std]` is a standalone first statement. It selects a minimal
+  freestanding preamble (`<stdint.h>`, `<stdbool.h>`, `<stddef.h>`, asm and
+  layout macros, checked integer helpers, and an error flag) and omits the
+  hosted runtime, `main`, coroutines, the pattern matcher, and the allocator.
+- All top-level `local` declarations become file-scope globals in this mode.
+  Typed globals without initializers are zero-initialized; partial
+  initialization of a multi-name declaration is `E0325`.
+- Duplicate, non-leading, and nested `#[no_std]` statements are `E0325`.
+- File-scope structs use `{0}` initializers so MSVC accepts them as constant
+  expressions. Functions receive `NULL` for the hidden coroutine argument, and
+  struct field keys/`asm!` text are not interned as `LusaString` values.
+
+### 19.3 `#[link_section = "..."]`
+
+- The attribute applies to top-level functions, top-level `local`
+  declarations, and top-level implicit globals.
+- Section names are validated in both parsers: 1–255 ASCII bytes from
+  `[A-Za-z0-9_.$-]`, otherwise `E0101`.
+- Emission writes a comment with the GNU lowering and calls
+  `LUSA_LINK_SECTION(name)`. GCC/Clang expand it to
+  `__attribute__((section(name)))`; MSVC expands it to nothing.
+- The dynamic engines accept and ignore the attribute.
+
+### 19.4 Promotion and placement diagnostics
+
+- A sectioned top-level `local` is rewritten as a file-scope global
+  declaration plus assignment. Annotated types are pre-declared, and an
+  attribute on an already-declared global is `E0325`.
+- Nested locals/assignments, struct declarations, and other statements reject
+  `#[link_section]`/`#[entry]` with `E0325` or `E0101` as appropriate.
+- The check runs in both the Rust parser and the self-hosted parser, so
+  `run`, `--vm`, `build`, and `--emit-c` agree on section validation.
+
+**Acceptance criteria**
+
+- `tests/module19.rs` covers the freestanding preamble, entry ordering and
+  `void` return, section lowering for functions/globals/promoted locals,
+  promotion initializer checks, `E0101` name validation, `E0325` placement and
+  duplicate diagnostics, dynamic parity, and native hosted/no_std builds.
+- `examples/baremetal_boot.lusa` runs in `run` and `--vm` and emits a
+  freestanding C11 translation unit with `--emit-c` that compiles without the
+  hosted runtime.
+- The full suite passes on Windows, Linux, and macOS.
+
+**Risks**
+
+- MSVC cannot place functions in a named code section; the macro is empty
+  there and only the comment records the intent. GCC/Clang are the supported
+  section-placement compilers.
+- `#[no_std]` covers a deliberately small subset. Strings, tables, `print`,
+  coroutines, and `unsafe_alloc` still require the hosted runtime and are
+  documented as unsupported rather than silently emulated.
+- The generated freestanding code still relies on the host C compiler for
+  scalar types and the linker script for section addresses; Lusa does not
+  provide a linker script or startup vector table.
+- Section names are ASCII-only and never escaped; the validation exists to
+  keep the emitted C string literal and attribute well-formed.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -515,6 +589,7 @@ registry.
 | v1.2.0 | Fixed arrays, address-of, pointer arithmetic (shipped) | zero-based C11 arrays, heap-element drop loops, `unsafe` dereference gate, three-engine parity |
 | v1.3.0 | Volatile MMIO and struct representation (shipped) | typed volatile lowering, scalar-element gate, packed/align portability macros, three-engine parity |
 | v1.4.0 | Inline assembly and hardware controls (shipped) | `asm!` parsing in both front ends, GNU volatile lowering, strict `unsafe` gate, three-engine parity |
+| v1.5.0 | Custom entries, `#[no_std]`, and linker sections (shipped) | freestanding preamble, entry-wrapper ordering, section lowering and promotion, `E0101`/`E0325` diagnostics, three-engine parity, native builds |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

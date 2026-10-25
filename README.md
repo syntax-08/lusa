@@ -25,7 +25,10 @@ AST work. Module 17 adds volatile MMIO access (`read_volatile`/
 `write_volatile`), packed structs (`#[packed]`), and explicit alignment
 (`#[repr(align(N))]`). Module 18 adds macro-style inline assembly
 (`asm!("...")`) for privileged instructions, fences, and architecture-specific
-hardware controls.
+hardware controls. Module 19 adds custom startup symbols (`#[entry]`),
+freestanding `#[no_std]` programs without the hosted C runtime, and
+`#[link_section = "..."]` placement for functions, globals, and promoted
+top-level locals.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -114,6 +117,7 @@ See [`examples/`](examples/):
 | `string_patterns.lusa`    | `find`/`match`/`gmatch`/`gsub` with captures and anchors |
 | `struct_match.lusa`       | struct literals, nested deep clone, and `match` arms |
 | `photocraft.lusa`         | mini photo-lab: 2D image in tables → filters → ASCII-art |
+| `baremetal_boot.lusa`     | `#[no_std]` `_start` entry with sectioned code/data |
 
 Also in the root: `bench.lusa` — reference workload for measuring speed
 (debug × release). Typical measurement on this machine: **4.6× faster** on
@@ -769,6 +773,68 @@ lusalang build examples/baremetal_asm.lusa --emit-c
 lowering with `unsafe_asm`, control-flow execution in the dynamic engines, and
 a native build-and-run.
 
+### Bare-metal entry points and linker sections (Module 19)
+
+`#[no_std]` switches the C11 backend to a freestanding translation unit: the
+hosted runtime, `int main`, the coroutine runtime, the pattern matcher, and the
+allocator are omitted, leaving only `<stdint.h>`, `<stdbool.h>`, `<stddef.h>`,
+the assembly/section macros, checked integer helpers, and a minimal error flag.
+It must be the first statement in the file. All top-level `local` declarations
+are promoted to file-scope globals so the entry function and helpers can share
+them.
+
+`#[entry]` marks one parameterless top-level function as the exported startup
+symbol. The function keeps its normal Lusa name (`_start` below); the generated
+wrapper returns `void`, runs the top-level statements in
+`static int lusa_program_body(void)` first, and then calls the function:
+
+```lusa
+#[no_std]
+
+#[link_section = ".data.boot"]
+local state: u32 = 0
+
+#[link_section = ".text.boot"]
+#[entry]
+function _start() : void
+    state = state + 1
+    unsafe do
+        asm!("nop")
+    end
+end
+```
+
+`#[link_section = "..."]` is accepted on top-level functions, top-level
+`local` declarations, and top-level implicit globals. Names are validated as
+1–255 ASCII bytes from `[A-Za-z0-9_.$-]` (`E0101`). Every placement emits a
+comment plus a portable macro:
+
+```c
+/* #[link_section = ".text.boot"] -> __attribute__((section(".text.boot"))) */
+LUSA_LINK_SECTION(".text.boot")
+static void f1(LusaCoro *lusa_co) { ... }
+```
+
+GCC/Clang define `LUSA_LINK_SECTION(name)` as
+`__attribute__((section(name)))`. MSVC has no GNU code-section attribute, so
+the macro expands to nothing and the comment documents the intended lowering.
+A sectioned top-level `local` is promoted to a file-scope global; if only some
+names have initializers, the promotion is rejected with `E0325`.
+
+```sh
+lusalang run examples/baremetal_boot.lusa
+lusalang run examples/baremetal_boot.lusa --vm
+lusalang build examples/baremetal_boot.lusa --emit-c
+```
+
+The dynamic engines accept and ignore `#[no_std]` and run `#[entry]` as an
+ordinary function, so the same source stays testable on a desktop. Freestanding
+programs currently support scalars, structs, pointers, `asm!`, and control
+flow; strings, tables, `print`, coroutine APIs, and `unsafe_alloc` still need
+the hosted runtime. `tests/module19.rs` covers the freestanding preamble, entry
+ordering and `void` return, section lowering, local promotion, parser and
+semantic diagnostics, dynamic parity, and native hosted/no_std builds.
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -781,8 +847,9 @@ Runnable examples: `examples/typed_native.lusa` (build/run),
 `examples/baremetal_gpio.lusa` (volatile polling with packed/aligned register
 layouts; uses `unsafe_alloc` so it runs on a desktop),
 `examples/baremetal_asm.lusa` (inline assembly fences and a `nop` polling
-loop), and `examples/unsafe_hardware.lusa` (simulated memory in `run`/`--vm`;
-replace the illustrative MMIO address before native execution).
+loop), `examples/baremetal_boot.lusa` (freestanding `_start` with sectioned
+code/data), and `examples/unsafe_hardware.lusa` (simulated memory in
+`run`/`--vm`; replace the illustrative MMIO address before native execution).
 
 `tests/c_backend.rs` covers typed mapping, functions/tables, moves/clone/drops,
 Cargo-style diagnostics, unsafe volatile emission, and a native build/run test
@@ -799,7 +866,10 @@ packed/aligned C layout macros, attribute validation, dynamic parity, and a
 native volatile/packed/aligned build-and-run. `tests/module18.rs` adds
 `asm!("...")` emission, multiple instructions, `unsafe` gating, malformed
 input diagnostics, shared lowering with `unsafe_asm`, dynamic control-flow
-parity, and a native build-and-run. See
+parity, and a native build-and-run. `tests/module19.rs` adds freestanding
+`#[no_std]` emission, entry-wrapper ordering, section placement, promoted
+locals, `E0101`/`E0325` diagnostics, dynamic parity, and native hosted and
+no_std build-and-run checks. See
 [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
 [`docs/LANGUAGE.md`](docs/LANGUAGE.md) section 9 for details.
 
@@ -864,6 +934,9 @@ Near-term milestones:
 - **v1.4.0 (shipped):** `asm!("...")` inline assembly inside `unsafe`, lowered
   to GCC/Clang volatile statements, with a shared no-op path in the
   interpreter and bytecode VM.
+- **v1.5.0 (shipped):** custom `#[entry]` startup symbols, freestanding
+  `#[no_std]` translation units, and `#[link_section = "..."]` placement for
+  functions, globals, and promoted top-level locals.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of
