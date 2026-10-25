@@ -1158,12 +1158,15 @@ function _start() : void
 end
 ```
 
-The wrapper exports the function's own name (`_start` here) and returns
-`void`. Top-level statements run in `static int lusa_program_body(void)` before
-the entry call; in hosted programs the wrapper then drops globals and calls
+The wrapper exports the function's own name (`_start` here) and normally
+returns `void`. A function named `main` is special-cased to `int main(void)`
+returning `0`, because C and macOS Clang require `main` to return `int`;
+top-level statements run in `static int lusa_program_body(void)` before the
+entry call. In hosted programs the wrapper then drops globals and calls
 `lusa_free_allocs()`. Duplicate `#[entry]` markers, entry functions with
 parameters, and `#[entry]` on a method are `E0325`. An entry may be used with or
-without `#[no_std]`; when present, no `int main` is emitted.
+without `#[no_std]`; when present, no separate `int main` is emitted (a `main`
+entry is itself the process entry).
 
 `#[link_section = "..."]` is accepted on top-level functions, top-level
 `local` declarations, and top-level implicit globals:

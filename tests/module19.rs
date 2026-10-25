@@ -114,6 +114,17 @@ counter = 1
 }
 
 #[test]
+fn c_main_entry_keeps_the_mandatory_int_return() {
+    let c = emit("#[entry]\nfunction main() : void\nend\n");
+
+    assert!(c.contains("int main(void) {"), "{c}");
+    assert!(!c.contains("void main(void)"), "{c}");
+    let wrapper = &c[c.find("int main(void) {").expect("main wrapper")..];
+    let end = wrapper.find("\n}").expect("wrapper end");
+    assert!(wrapper[..end].contains("return 0;"), "{c}");
+}
+
+#[test]
 fn entry_wrapper_is_void_even_when_the_function_returns_a_value() {
     let source = r#"
 #[entry]

@@ -786,7 +786,11 @@ them.
 `#[entry]` marks one parameterless top-level function as the exported startup
 symbol. The function keeps its normal Lusa name (`_start` below); the generated
 wrapper returns `void`, runs the top-level statements in
-`static int lusa_program_body(void)` first, and then calls the function:
+`static int lusa_program_body(void)` first, and then calls the function. The
+only exception is a function literally named `main`: C requires `main` to
+return `int`, so that wrapper is emitted as `int main(void)` and returns `0`
+(`1` if the program body reports a failure), which keeps hosted native builds
+portable to macOS Clang:
 
 ```lusa
 #[no_std]

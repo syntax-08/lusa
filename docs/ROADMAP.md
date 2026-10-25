@@ -493,7 +493,9 @@ registry.
 
 - `#[entry]` marks one top-level, parameterless function as the exported
   startup symbol. The wrapper keeps the Lusa function name (for example
-  `void _start(void)`), returns `void`, and calls the internal `f<N>` function.
+  `void _start(void)`), normally returns `void`, and calls the internal `f<N>`
+  function. A function literally named `main` is emitted as `int main(void)`
+  returning `0`, as the C standard requires.
 - When an entry exists, the backend emits no `int main`. Top-level statements
   run in `static int lusa_program_body(void)` before the entry call. Hosted
   entries then run global drops and `lusa_free_allocs()`; `#[no_std]` entries

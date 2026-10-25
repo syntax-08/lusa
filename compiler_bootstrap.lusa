@@ -7455,20 +7455,36 @@ local function emit_entry_wrapper(ast)
             .. '"))) */')
         line('LUSA_LINK_SECTION("' .. signature.link_section .. '")')
     end
-    line("void " .. ast.entry_name .. "(void) {")
+    -- C gives the identifier `main` a mandatory `int` return type, and macOS
+    -- Clang rejects `void main` outright.  Keep the wrapper's usual `void`
+    -- contract for every other name, but honor the C rule when the user picks
+    -- the hosted entry name.
+    local c_main = ast.entry_name == "main"
+    if c_main then
+        line("int main(void) {")
+    else
+        line("void " .. ast.entry_name .. "(void) {")
+    end
     emit_indent = emit_indent + 1
     line("if (lusa_program_body() != 0) {")
     emit_indent = emit_indent + 1
     if not ast.no_std then
         emit_global_drops()
     end
-    line("return;")
+    if c_main then
+        line("return 1;")
+    else
+        line("return;")
+    end
     emit_indent = emit_indent - 1
     line("}")
     line(signature.cname .. "(NULL);")
     if not ast.no_std then
         emit_global_drops()
         line("lusa_free_allocs();")
+    end
+    if c_main then
+        line("return 0;")
     end
     emit_indent = emit_indent - 1
     line("}")
