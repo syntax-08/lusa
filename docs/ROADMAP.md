@@ -333,6 +333,63 @@ registry.
 - Forward struct references remain unsupported because the native checker is
   single-pass.
 
+## Module 16 - Fixed arrays, address-of, and pointer arithmetic (shipped in v1.2.0)
+
+### 16.1 Syntax and C11 layout
+
+- `[T; N]` declares a fixed-size array; it remains distinct from `[T]`
+  (`table<T>`) and needs a positive literal length.
+- `[a, b, c]` builds an array literal. Its type is inferred from the first
+  element and must match the annotation exactly in length.
+- Access is zero-based: `a[0]` is the first element and `a[i] = v` writes an
+  element. `#a` folds to the declared length in native code.
+- Native locals, globals, and struct fields use real C declarators such as
+  `int32_t samples[4]` and `LusaString *items[2]`; the array is contiguous
+  storage, not a heap table.
+- Arrays are not passed or returned by value and cannot be assigned as a whole.
+  Use element writes, an indexed loop, or a raw pointer.
+
+### 16.2 RAII drop loops
+
+- A fixed array whose element type owns heap storage (`string`, `table`, or a
+  heap-bearing struct) is an owning value. The emitter generates a drop loop on
+  every normal and error exit:
+  `for (int32_t lusa_i = 0; lusa_i < N; lusa_i++) lusa_drop_...`.
+- Struct drop and clone helpers apply the same loop to array fields, so nested
+  arrays release and deep-copy their elements exactly once.
+- Partially initialized arrays are zero-filled by C aggregate initialization,
+  and `lusa_drop_*` tolerate `NULL`, so the drop loop is safe.
+
+### 16.3 Address-of and pointer arithmetic
+
+- `&place` accepts a variable, field, index, or dereference and yields
+  `*mut T`; `&a[i]` and `&obj.field` lower to C `&(...)` expressions.
+- `*ptr` reads and `*ptr = value` writes through the pointer. Both remain gated
+  by `unsafe do ... end` with `E0321`; writes through `*const` report `E0322`.
+- `ptr + n` and `ptr - n` lower to ordinary C pointer offsets, which scale by
+  `sizeof(element)`. Pointer arithmetic outside `unsafe` reports `E0320`.
+- The interpreter and VM keep simulating pointers as cells in a process-local
+  address map. `&place` allocates a simulated cell, and dereferences read/write
+  that cell; they never touch host memory.
+
+**Acceptance criteria**
+
+- `tests/module16.rs` covers fixed arrays, zero-based reads/writes, struct
+  array fields, generated drop loops, `&place`, dereference gating, pointer
+  arithmetic lowering, and a native build-and-run program.
+- Interpreter, VM, and native builds agree on the shared example
+  `examples/arrays_pointers.lusa`.
+
+**Risks**
+
+- Dynamic pointer writes do not alias the originating local; only native code
+  observes `*p = v` through `&x`. Document this simulation boundary.
+- C arrays decay to pointers in function position. Passing fixed arrays by
+  value or returning them needs an explicit pointer/out-parameter design in a
+  future module.
+- Fixed-size arrays are intentionally not iterable with `pairs`/`ipairs`;
+  index them with a numeric loop.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -358,6 +415,7 @@ registry.
 | v0.9.0 | Pattern matching and string utilities (shipped) | shared matcher, native/VM/interpreter parity, RAII lifetime tests |
 | v1.0.0 | Static borrow checker, explicit `move`, stabilization (shipped) | golden diagnostics, native/VM/interpreter parity, frozen semantics |
 | v1.1.0 | Struct literals, `match`, compile-time modules, inline asm (shipped) | deep struct RAII, per-arm ownership, import deduplication, three-engine parity |
+| v1.2.0 | Fixed arrays, address-of, pointer arithmetic (shipped) | zero-based C11 arrays, heap-element drop loops, `unsafe` dereference gate, three-engine parity |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

@@ -54,6 +54,8 @@ pub struct Interp {
     pub struct_tables: RefCell<HashMap<u64, String>>,
     /// next simulated base address handed out by `unsafe_alloc`
     pub unsafe_alloc_next: u64,
+    /// next simulated address handed out by `&place`
+    pub addr_next: u64,
     /// ids of coroutines currently executing (innermost last)
     pub active_coroutines: Vec<u64>,
     /// upvalue cells of the running coroutine, used when helper functions are
@@ -102,6 +104,7 @@ impl Interp {
             struct_defs: HashMap::new(),
             struct_tables: RefCell::new(HashMap::new()),
             unsafe_alloc_next: 0x1000,
+            addr_next: 0x8000_0000,
             active_coroutines: Vec::new(),
             coroutine_captures: Vec::new(),
         }
@@ -803,6 +806,24 @@ impl Interp {
                 if ann.starts_with('*') {
                     // raw pointer: a cell index into the simulated address space
                     vals[i] = Value::Number(0.0);
+                } else if let Some((element, length)) = array_annotation(ann) {
+                    // fixed array: a 0-based table, matching the native C buffer
+                    let tbl = TableObj::new();
+                    let zero = if element == "bool" {
+                        Value::Bool(false)
+                    } else if element == "string"
+                        || element == "table"
+                        || element.starts_with("table<")
+                        || self.struct_defs.contains_key(element)
+                    {
+                        Value::Nil
+                    } else {
+                        Value::Number(0.0)
+                    };
+                    for index in 0..length {
+                        tbl.set(Value::Number(index as f64), zero.clone()).ok();
+                    }
+                    vals[i] = Value::Table(Rc::new(tbl));
                 } else if self.struct_defs.contains_key(ann) {
                     // static struct: a fixed-field simulated buffer
                     if let Some(v) = self.default_struct_value(ann) {
@@ -926,6 +947,24 @@ impl Interp {
             } else if depth < 8 && self.struct_defs.contains_key(ty) {
                 self.default_struct_value_at(ty, depth + 1)
                     .unwrap_or(Value::Nil)
+            } else if let Some((element, length)) = array_annotation(ty) {
+                let tbl = TableObj::new();
+                let zero = if element == "bool" {
+                    Value::Bool(false)
+                } else if element == "string" || element == "table"
+                    || element.starts_with("table<")
+                {
+                    Value::Nil
+                } else if depth < 8 && self.struct_defs.contains_key(element) {
+                    self.default_struct_value_at(element, depth + 1)
+                        .unwrap_or(Value::Nil)
+                } else {
+                    Value::Number(0.0)
+                };
+                for index in 0..length {
+                    tbl.set(Value::Number(index as f64), zero.clone()).ok();
+                }
+                Value::Table(Rc::new(tbl))
             } else {
                 Value::Number(0.0)
             };

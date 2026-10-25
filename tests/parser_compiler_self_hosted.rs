@@ -362,7 +362,7 @@ local keyed_ast = M6Parser.parse(M6Lexer.lex("local x = { id = 1, name = 7 }"))
 assert(keyed_ast.body[1].values[1].tag == "Table")
 assert(keyed_ast.body[1].values[1].keys[1] == "id")
 assert(keyed_ast.body[1].values[1].keys[2] == "name")
-expect_parser_error("t[1] = 2")
+expect_parser_error("f() = 2")
 
 local ok, err = pcall(function()
     local a = M6Parser.parse(M6Lexer.lex(

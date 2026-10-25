@@ -142,6 +142,9 @@ pub enum Instr {
     Add, Sub, Mul, Div, FloorDiv, Mod, Pow, Concat,
     Eq, Ne, Lt, Le, Gt, Ge,
     Neg, Not, Len,
+    /// `&place`: stores the value in the interpreter's simulated memory and
+    /// pushes its address (the dynamic-engine analogue of a C `&`).
+    AddrOf,
     CloneV,
     BorrowErr, // borrow is rejected in bytecode mode
     // calls — `nt` = number of journaled argument takes finalized by this call
@@ -786,6 +789,13 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
             compile_method(c, obj, name, args, e.span, *span_args_end)?;
         }
         ExprKind::Table(entries) => compile_table(c, entries)?,
+        ExprKind::ArrayLit(items) => compile_array(c, items)?,
+        ExprKind::AddrOf(inner) => {
+            compile_expr(c, inner)?;
+            truncate_if_expansion(c, inner);
+            c.set_line(e.span);
+            c.em(Instr::AddrOf);
+        }
         ExprKind::StructLit { name, fields } => compile_struct_lit(c, name, fields, e.span)?,
         ExprKind::Func(lit) => {
             compile_nested_fn(c, lit, "anonymous")?;
@@ -1155,6 +1165,22 @@ fn compile_table(c: &mut Compiler, entries: &[TableEntry]) -> LResult<()> {
     Ok(())
 }
 
+/// Compiles a fixed-size array literal into a table with 0-based numeric keys.
+fn compile_array(c: &mut Compiler, items: &[Expr]) -> LResult<()> {
+    c.em(Instr::NewTable);
+    for (i, item) in items.iter().enumerate() {
+        let key = ConstKey::Num((i as f64).to_bits());
+        let k = c.konst(&key);
+        c.em(Instr::LoadConst(k));
+        let dest = format!("item {i}");
+        let _ = compile_take_value(c, item, &dest, false)?;
+        truncate_if_expansion(c, item);
+        c.set_line(item.span);
+        c.em(Instr::SetIndex);
+    }
+    Ok(())
+}
+
 /// Compiles a static struct literal into a table with the struct's declared
 /// fields initialized in declaration order, then the supplied fields in source
 /// order.  The dynamic engines use the same shape, so programs produce the
@@ -1242,6 +1268,17 @@ fn emit_struct_default_value(
     if ty == "bool" {
         let k = c.konst(&ConstKey::of(&Value::Bool(false)));
         c.em(Instr::LoadConst(k));
+        return Ok(());
+    }
+    if let Some((element, length)) = array_annotation(ty) {
+        c.em(Instr::NewTable);
+        for index in 0..length {
+            let key = c.konst(&ConstKey::Num((index as f64).to_bits()));
+            c.em(Instr::LoadConst(key));
+            emit_struct_default_value(c, element, depth + 1, span)?;
+            c.set_line(span);
+            c.em(Instr::SetIndex);
+        }
         return Ok(());
     }
     if ty == "string"
@@ -1438,23 +1475,31 @@ fn compile_local(
                 let k = c.konst(&ConstKey::Num(0.0f64.to_bits()));
                 let _ = c.em(Instr::LoadConst(k));
             }
-            Some(ann) if c.struct_defs.contains_key(ann) => {
+            Some(ann) if array_annotation(ann).is_some() => {
+                let (element, length) = array_annotation(ann).unwrap();
+                let zero = if element == "bool" {
+                    ConstKey::Bool(false)
+                } else if element == "string"
+                    || element == "table"
+                    || element.starts_with("table<")
+                    || c.struct_defs.contains_key(element)
+                {
+                    ConstKey::Nil
+                } else {
+                    ConstKey::Num(0.0f64.to_bits())
+                };
                 c.em(Instr::NewTable);
-                let fields = c.struct_defs.get(ann).cloned().unwrap_or_default();
-                for (fname, ty) in &fields {
-                    let name_k = c.konst_str(fname);
-                    let zero = if ty == "bool" {
-                        ConstKey::Bool(false)
-                    } else {
-                        ConstKey::Num(0.0f64.to_bits())
-                    };
-                    let zero_k = c.konst(&zero);
-                    c.em(Instr::LoadConst(name_k));
-                    c.em(Instr::LoadConst(zero_k));
+                for index in 0..length {
+                    let key = c.konst(&ConstKey::Num((index as f64).to_bits()));
+                    let value = c.konst(&zero);
+                    c.em(Instr::LoadConst(key));
+                    c.em(Instr::LoadConst(value));
                     c.em(Instr::SetIndex);
                 }
-                let tag = c.konst_str(ann);
-                c.em(Instr::MarkStruct(tag));
+            }
+            Some(ann) if c.struct_defs.contains_key(ann) => {
+                let fields = c.struct_defs.get(ann).cloned().unwrap_or_default();
+                emit_struct_defaults(c, &fields, 0, span, ann)?;
             }
             _ => {
                 let _ = c.em(Instr::LoadNil);

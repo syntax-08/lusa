@@ -251,7 +251,7 @@ impl Parser {
             }
             TK::Borrow | TK::Clone | TK::Move | TK::LParen | TK::Num(_) | TK::Int(_) | TK::Str(_)
             | TK::Nil | TK::True | TK::False | TK::Minus | TK::Not | TK::Len
-            | TK::DotDotDot | TK::LBrace => {
+            | TK::DotDotDot | TK::LBrace | TK::LBracket | TK::Amp => {
                 let e = self.parse_expr()?;
                 St { kind: StKind::ExprSt(e), span: tk.span }
             }
@@ -328,6 +328,11 @@ impl Parser {
     fn parse_type_annotation(&mut self) -> LResult<String> {
         if self.eat(TK::LBracket) {
             let element = self.parse_type_annotation()?;
+            if self.eat(TK::Semi) {
+                let size = self.parse_array_size()?;
+                self.expect(TK::RBracket, "`]` to close the array type")?;
+                return Ok(format!("array<{element},{size}>"));
+            }
             self.expect(TK::RBracket, "`]` to close the table type")?;
             return Ok(format!("table<{element}>"));
         }
@@ -350,6 +355,35 @@ impl Parser {
             return Ok(format!("table<{inner}>"));
         }
         Ok(name)
+    }
+
+    /// Parses the `N` in `[T; N]`.  Only literal sizes are accepted: the C11
+    /// backend needs the bound at declaration time.
+    fn parse_array_size(&mut self) -> LResult<String> {
+        let tk = self.peek().clone();
+        let size = match tk.kind.clone() {
+            TK::Int(text) => text,
+            TK::Num(n) => {
+                if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
+                    return Err(LusaError::new(
+                        E_PARSE,
+                        Some(tk.span),
+                        "array length must be a non-negative integer literal",
+                    ));
+                }
+                format!("{}", n as u64)
+            }
+            _ => {
+                return Err(LusaError::new(
+                    E_PARSE,
+                    Some(tk.span),
+                    format!("expected an array length, found {}", tk.desc()),
+                )
+                .help("fixed arrays need a literal length, e.g. `[u8; 16]`"));
+            }
+        };
+        self.bump();
+        Ok(size)
     }
 
     fn parse_struct_st(&mut self) -> LResult<St> {
@@ -804,6 +838,7 @@ impl Parser {
             | TK::Len
             | TK::Star
             | TK::StarLine
+            | TK::Amp
             | TK::Borrow
             | TK::Clone
             | TK::Move => {
@@ -816,6 +851,7 @@ impl Parser {
                     TK::Minus => ExprKind::Un { op: UnOp::Neg, e: Box::new(e) },
                     TK::Len => ExprKind::Un { op: UnOp::Len, e: Box::new(e) },
                     TK::Star | TK::StarLine => ExprKind::Un { op: UnOp::Deref, e: Box::new(e) },
+                    TK::Amp => ExprKind::AddrOf(Box::new(e)),
                     TK::Borrow => ExprKind::Borrow { e: Box::new(e), is_mut: false },
                     TK::Move => ExprKind::Move { e: Box::new(e) },
                     _ => ExprKind::Clone { e: Box::new(e) },
@@ -912,6 +948,22 @@ impl Parser {
                 ExprKind::Paren(Box::new(e))
             }
             TK::LBrace => return self.parse_table_ctor(tk.span),
+            TK::LBracket => {
+                let mut elems = Vec::new();
+                if !self.at(TK::RBracket) {
+                    loop {
+                        elems.push(self.parse_expr()?);
+                        if !self.eat(TK::Comma) {
+                            break;
+                        }
+                        if self.at(TK::RBracket) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(TK::RBracket, "`]` to close the array literal")?;
+                ExprKind::ArrayLit(elems)
+            }
             TK::Function => {
                 let f = self.parse_funclit()?;
                 ExprKind::Func(f)

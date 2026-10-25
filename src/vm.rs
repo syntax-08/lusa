@@ -1029,6 +1029,26 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             interp.vm.stack.push(Value::Number(-n));
             StepOutcome::Continue
         }
+        Instr::AddrOf => {
+            let v = pop1(interp);
+            let value = match v.base_value() {
+                Value::Number(n) => *n,
+                other => {
+                    return Err(err(
+                        E_RUNTIME,
+                        format!(
+                            "the dynamic engines can take the address of numeric values only; found {}",
+                            other.type_name()
+                        ),
+                    ));
+                }
+            };
+            let addr = interp.addr_next;
+            interp.addr_next = interp.addr_next.saturating_add(8);
+            interp.unsafe_mem.insert(addr, value);
+            interp.vm.stack.push(Value::Number(addr as f64));
+            StepOutcome::Continue
+        }
         Instr::Not => {
             let v = pop1(interp);
             interp.vm.stack.push(Value::Bool(!v.truthy()));

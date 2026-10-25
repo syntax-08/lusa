@@ -19,7 +19,9 @@ the v1.0.0 language with a compile-time borrow checker, explicit `move`
 expressions, stronger aliasing diagnostics, and borrow support in the bytecode
 VM. Module 15 turns structs into literals with defaults and deep RAII, adds
 zero-overhead `match`, compile-time `import`/`mod` composition, and GNU-style
-inline assembly.
+inline assembly. Module 16 adds fixed-size `[T; N]` arrays, zero-based
+indexing, address-of (`&place`), and raw-pointer arithmetic for buffering and
+AST work.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -606,6 +608,51 @@ lusalang run examples/struct_match.lusa --vm
 lusalang run examples/struct_match.lusa --native
 ```
 
+### Fixed arrays and address-of (Module 16)
+
+Fixed arrays have a compile-time length and contiguous C11 storage. `[T; N]`
+is distinct from the existing `[T]` (`table<T>`) spelling, and indexing is
+zero-based:
+
+```lusa
+local samples: [i32; 4] = [10, 20, 30, 40]
+samples[1] = samples[0] + samples[2]
+print(samples[0], samples[3], #samples)   -- 10	40	4
+```
+
+Native declarations use real C declarators (`int32_t samples[4]`), including
+inside structs (`LusaString *items[2]`). Arrays whose element type owns heap
+storage (`string`, `table`, or a heap-bearing struct) get a generated RAII drop
+loop on every scope exit, so elements are released exactly once. The dynamic
+engines represent fixed arrays as zero-based tables and report `#a` from key
+`0`, keeping the same index arithmetic.
+
+`&place` produces a mutable raw pointer, and `*ptr` reads or writes through it.
+Dereferences and pointer arithmetic remain gated by `unsafe`:
+
+```lusa
+local x: u32 = 5
+local p: *mut u32 = &x
+unsafe do
+    *p = 9
+    local q: *mut u32 = p + 2
+    print(x, *q)
+end
+```
+
+`&x`, `&obj.field`, `&a[i]`, and `&*p` are accepted. Native pointer offsets use
+ordinary C pointer arithmetic, which scales by the element size. Native arrays
+are not passed or returned by value and whole-array assignment is rejected; use
+element assignments or a raw pointer. The dynamic engines simulate raw
+addresses in a process-local cell map, so writes through a simulated pointer do
+not alias the originating local (native code does).
+
+```sh
+lusalang run examples/arrays_pointers.lusa
+lusalang run examples/arrays_pointers.lusa --vm
+lusalang run examples/arrays_pointers.lusa --native
+```
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -625,7 +672,9 @@ that skips when no compiler is installed. `tests/module12.rs` adds native
 nested yields, and dynamic parity. `tests/module15.rs` adds both struct
 declaration forms, literals/defaults/nested deep clone, `match` arms and
 per-arm ownership, recursive import/module deduplication, and inline assembly.
-See [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
+`tests/module16.rs` adds fixed-array indexing, C declarators, array drop loops,
+address-of/pointer arithmetic lowering, `unsafe` gating, and a native
+build-and-run check. See [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
 [`docs/LANGUAGE.md`](docs/LANGUAGE.md) section 9 for details.
 
 ## Bytecode VM: registers and source lines
@@ -681,6 +730,8 @@ Near-term milestones:
 - **v1.1.0 (shipped):** struct literals with defaults and deep RAII,
   zero-overhead `match`, compile-time `import`/`mod` modules, and GNU-style
   inline assembly.
+- **v1.2.0 (shipped):** fixed-size `[T; N]` arrays with zero-based indexing,
+  address-of (`&place`), and raw-pointer arithmetic for direct buffer work.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

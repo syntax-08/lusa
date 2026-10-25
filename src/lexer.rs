@@ -210,6 +210,7 @@ impl Lexer {
             }
             '%' => TokenKind::Percent,
             '#' => TokenKind::Len,
+            '&' => TokenKind::Amp,
             '^' => TokenKind::Caret,
             '.' => {
                 if self.peek() == '.' {

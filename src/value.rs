@@ -526,13 +526,25 @@ impl TableObj {
     /// Lua border heuristic: the largest n such that keys 1..=n exist.
     pub fn len(&self) -> usize {
         let cell = self.cell.borrow();
+        let has_key = |k: usize| {
+            let key = Value::Number(k as f64);
+            cell.entries.iter().any(|(ek, esv)| {
+                matches!(esv, SlotV::Set(_)) && key_eq_loose(ek, &key)
+            })
+        };
+        // Fixed arrays use 0-based keys; ordinary table constructors use
+        // 1-based positional keys.  Key 0 is the marker that distinguishes
+        // the two layouts.
+        if has_key(0) {
+            let mut count = 0;
+            while has_key(count) {
+                count += 1;
+            }
+            return count;
+        }
         let mut n = self.next_arr.get();
         while n > 0 {
-            let k = Value::Number(n as f64);
-            let found = cell.entries.iter().any(|(ek, esv)| {
-                matches!(esv, SlotV::Set(_)) && key_eq_loose(ek, &k)
-            });
-            if found {
+            if has_key(n) {
                 break;
             }
             n -= 1;

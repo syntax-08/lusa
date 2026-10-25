@@ -418,7 +418,7 @@ Codes `E{category}{n}`, like rustc:
 | E0308  | static   | C11 backend: mismatched types (assignment, return, call, condition) |
 | E0309  | static   | C11 backend: struct/table has no such field |
 | E0311  | static   | C11 backend: wrong argument/initializer count |
-| E0312  | static   | C11 backend: unsupported struct field type |
+| E0312  | static   | C11 backend: unsupported construct (struct field type, whole-array value, invalid `&` place, or array-by-value call) |
 | E0313  | static   | C11 backend: zero or one return value only; void/value return mismatch |
 | E0316  | unsafe   | C11 backend: raw pointer intrinsic used outside `unsafe` |
 | E0317  | static   | C11 backend: `pcall`, `coroutine.resume`, or `string.gmatch` used outside its required local/loop form |
@@ -696,6 +696,8 @@ local regs: *mut u32 = 0x1000   -- volatile uint32_t *
 local rom:  *const u32 = 0x2000 -- const volatile uint32_t *
 ```
 
+The element may be any supported scalar, `string`, table, or previously
+declared struct; numeric elements remain the common case for hardware access.
 Pointer arithmetic and dereferences are only legal inside `unsafe do ... end`;
 outside it they report `E0320` (arithmetic) and `E0321` (dereference):
 
@@ -927,18 +929,78 @@ mod counter               -- counter.lusa, counter/mod.lusa, or counter/main.lus
 
 Inline assembly is covered in section 9.5.
 
-### 9.9 Native subset limits
+### 9.9 Fixed-size arrays and address-of (Module 16)
+
+`[T; N]` is a fixed-size array with a compile-time length. It is distinct from
+`[T]`, which remains the existing `table<T>` spelling:
+
+```lusa
+local samples: [i32; 4] = [10, 20, 30, 40]
+samples[1] = samples[0] + samples[2]
+print(samples[0], samples[3], #samples)   -- 10	40	4
+```
+
+- Array literals use `[elem1, elem2, ...]`; an empty literal cannot infer its
+  element type and is rejected.
+- The length must be a positive integer literal. The literal length must match
+  the annotation.
+- Indexing is zero-based. Reads return a view of the element; writes update the
+  buffer in place.
+- `#a` is the declared length in native code and the number of zero-based keys
+  in the dynamic engines.
+- Whole-array assignment, passing an array by value, returning one, and taking
+  `&array` are rejected. Index the array or pass a raw pointer instead.
+
+Native locals, globals, and struct fields are real C declarators:
+
+```lusa
+struct Frame { samples: [i32; 4], label: string }
+local frame: Frame
+frame.samples[0] = 10
+```
+
+```c
+typedef struct { int32_t samples[4]; LusaString *label; } Frame;
+```
+
+Arrays of heap-owning elements get a generated RAII drop loop on every exit,
+and struct drop/clone helpers loop over array fields. C aggregate
+initialization zero-fills omitted elements, so every slot is safe to drop.
+
+`&place` takes the address of a variable, field, index, or dereference and
+produces `*mut T`. Pointer reads and writes are still restricted to `unsafe`:
+
+```lusa
+local x: u32 = 5
+local p: *mut u32 = &x
+unsafe do
+    *p = 9
+    print(x)                    -- 9 in native code
+    local q: *mut u32 = p + 2   -- scales by sizeof(u32)
+    local r: *mut u32 = q - 1
+    print(*r)
+end
+```
+
+`ptr + n` and `ptr - n` lower to ordinary C pointer offsets. Dereferencing
+outside `unsafe` reports `E0321`, pointer arithmetic outside it reports
+`E0320`, and writes through `*const` report `E0322`. In the interpreter and VM,
+`&place` allocates a simulated cell and dereferences read/write that cell; they
+never touch host memory, and writes do not alias the originating local.
+
+### 9.10 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
-array/keyed table literals, nested keyed tables, field reads/writes, colon
-methods, `pairs`/`ipairs` generic `for`, one-based array indexing, `#`, `if`,
-`while`, `repeat`, `do`, `return`, `break`, assignments, globals, `print`,
-`clone`, `borrow`, `move`, the compile-time borrow checker, `unsafe` blocks,
-static `struct` declarations in brace and bare form, struct literals with
-defaults (scalar, `string`, `table`, pointer, and previously declared struct
-fields), `match`, compile-time `import`/`mod`, raw pointer
-types (`*mut u32`, `*const u32`, `*mut i32`, `*const i32`), pointer arithmetic
-and volatile dereferences inside `unsafe`, the raw intrinsics above
+table literals, fixed-size `[T; N]` arrays and array literals, nested keyed
+tables, field reads/writes, zero-based array indexing and element assignment,
+colon methods, `pairs`/`ipairs` generic `for` over tables, `#` on strings,
+tables, and arrays, `if`, `while`, `repeat`, `do`, `return`, `break`,
+assignments, globals, `print`, `clone`, `borrow`, `move`, the compile-time
+borrow checker, `unsafe` blocks, static `struct` declarations in brace and bare
+form, struct literals with defaults (scalar, `string`, `table`, pointer, and
+previously declared struct fields), `match`, compile-time `import`/`mod`,
+address-of (`&place`), raw pointer types (`*mut T`, `*const T`), pointer
+arithmetic and dereferences inside `unsafe`, the raw intrinsics above
 (`unsafe_ptr_cast`, `unsafe_read_mem`, `unsafe_write_mem`, `unsafe_alloc`,
 `unsafe_nop`, `unsafe_asm`), native `pcall`, the string-pattern surface in
 section 9.7, and the restricted
@@ -948,6 +1010,7 @@ section 9.6.
 Not supported by the C emitter: numeric `for`, arbitrary dynamic key
 construction in table literals, assignment through a dynamic index, varargs,
 interpolated strings, closures/nested functions, forward struct references,
+whole-array assignment or arrays passed/returned by value, `&array`,
 namespaced or selectively exported imports, the rest of the dynamic string
 library, multiple function return values (`E0313`), dynamic `pcall`
 expressions, and general first-class coroutine operations. Native colon methods are static functions

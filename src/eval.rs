@@ -174,6 +174,38 @@ pub fn eval_expr(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr
             build_table(interp, frame, &tbl, entries)?;
             Ok(Value::Table(Rc::new(tbl)))
         }
+        ExprKind::ArrayLit(elems) => {
+            // Fixed-size arrays use 0-based numeric keys so `arr[i]` reads the
+            // i-th element directly in every engine.
+            let tbl = TableObj::new();
+            for (i, item) in elems.iter().enumerate() {
+                let label = format!("item {i}");
+                let value = eval_take_single(interp, frame, item, &label, item.span)?;
+                tbl.set(Value::Number(i as f64), value)?;
+            }
+            Ok(Value::Table(Rc::new(tbl)))
+        }
+        ExprKind::AddrOf(inner) => {
+            let value = eval_expr(interp, frame, inner)?;
+            let value = match value.base_value() {
+                Value::Number(n) => *n,
+                other => {
+                    return Err(LusaError::new(
+                        crate::error::E_RUNTIME,
+                        Some(e.span),
+                        format!(
+                            "the dynamic engines can take the address of numeric values only; found {} ({})",
+                            other.type_name(),
+                            other.fmt_value()
+                        ),
+                    ));
+                }
+            };
+            let addr = interp.addr_next;
+            interp.addr_next = interp.addr_next.saturating_add(8);
+            interp.unsafe_mem.insert(addr, value);
+            Ok(Value::Number(addr as f64))
+        }
         ExprKind::StructLit { name, fields } => {
             let def = match interp.struct_defs.get(name) {
                 Some(def) => def.clone(),

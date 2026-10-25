@@ -242,6 +242,65 @@ a process-local `HashMap<u64, f64>`. `lusalang run` and `lusalang run --vm`
 therefore simulate register writes/reads without dereferencing memory; the
 `build`/`run --native` path emits the volatile pointer access shown above.
 
+### Fixed arrays, address-of, and pointer arithmetic
+
+`[T; N]` is lowered to a C declarator with contiguous storage. Locals,
+globals, and struct fields keep the bound next to the name:
+
+```lusa
+local samples: [i32; 4] = [10, 20, 30, 40]
+local names: [string; 2] = ["alpha", "beta"]
+
+struct Frame
+    samples: [i32; 4],
+    label: string
+end
+```
+
+```c
+int32_t v1[4] = {10, 20, 30, 40};
+LusaString *v2[2] = { ... };
+typedef struct { int32_t samples[4]; LusaString *label; } Frame;
+```
+
+Indexing is zero-based and lowers directly to `(buffer)[i]`. `#array` folds to
+the declared bound. Arrays whose element type owns heap storage are tracking
+values: the emitter inserts a drop loop
+
+```c
+for (int32_t lusa_i = 0; lusa_i < 2; lusa_i++) {
+    lusa_drop_string(&v2[lusa_i]);
+}
+```
+
+on every scope exit, and `lusa_drop_<Struct>`/`lusa_clone_<Struct>` apply the
+same loop to array fields. C initializes omitted elements to zero, so a partial
+initializer is still safe to drop.
+
+`&place` emits C `&(place)` and produces `*mut T`:
+
+```lusa
+local x: u32 = 5
+local p: *mut u32 = &x
+unsafe do
+    *p = 9
+    local q: *mut u32 = p + 2
+    print(x, *q)
+end
+```
+
+```c
+volatile uint32_t *init = (volatile uint32_t *)(uintptr_t)(&(x));
+(*(init)) = (uint32_t)9;
+volatile uint32_t *q = init + 2;
+```
+
+Pointer offsets use ordinary C arithmetic and therefore scale by the element
+size. The checker still requires `unsafe` for dereferences (`E0321`) and
+pointer offset expressions (`E0320`), and rejects writes through `*const`
+(`E0322`). Whole-array assignment and arrays as function parameters/results are
+rejected with `E0312`; use element access or a raw pointer.
+
 ### C runtime and heap ABI
 
 `Compiler.memory_layout()` describes the generated runtime:
@@ -365,14 +424,19 @@ writes, colon methods, `pairs`, `ipairs`, and per-iteration RAII.
 `tests/module15.rs` covers both struct declaration forms, literal defaults,
 nested deep clone/drop, `match` arms and per-arm ownership, recursive
 `import`/`mod` deduplication, and the GNU inline-assembly form.
+`tests/module16.rs` covers fixed arrays, zero-based indexing, C declarators and
+array drop loops, struct array fields, address-of, `unsafe` dereference gating,
+pointer arithmetic lowering, dynamic-engine parity, and a native build/run.
 
 ### Current limits
 
 The C emitter supports the typed subset above, not the full dynamic language:
 numeric `for`, dynamic key construction in table literals, assignment through a
 dynamic index, varargs, interpolated strings, and closures/nested functions are
-rejected with diagnostics. Struct fields must name a scalar, `string`, table,
-raw pointer, or previously declared struct (no forward references). `match`
+rejected with diagnostics. Fixed arrays cannot be assigned as a whole, passed
+or returned by value, or addressed with `&array`; index them or pass a raw
+pointer. Struct fields must name a scalar, `string`, table, raw pointer, fixed
+array, or previously declared struct (no forward references). `match`
 patterns are literals, one binding name, or `_`; there are no destructuring,
 range, or guard arms. Imports are flat textual includes with one shared symbol
 table, not namespaces with selective exports. Native colon methods are static
@@ -380,7 +444,7 @@ functions rather than table fields, so `pairs` does not enumerate method names;
 use a separate data table when enumerating. The dynamic interpreter and
 bytecode VM remain the complete-language engines; they accept typed/`unsafe`
 source but use f64 arithmetic and simulated memory, so exact 128-bit arithmetic
-is a C11-backend feature.
+and aliasing through `&local` are C11-backend features.
 
 ## Extension points
 

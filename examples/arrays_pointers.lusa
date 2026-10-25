@@ -1,0 +1,35 @@
+-- Module 16 example: fixed arrays, struct-embedded arrays, address-of, and
+-- pointer arithmetic.  Runs in the interpreter, bytecode VM, and C11 backend:
+--   lusalang run examples/arrays_pointers.lusa
+--   lusalang run examples/arrays_pointers.lusa --vm
+--   lusalang run examples/arrays_pointers.lusa --native
+--   lusalang build examples/arrays_pointers.lusa
+
+struct Frame
+    samples: [i32; 4],
+    label: string
+end
+
+local frame: Frame
+frame.samples[0] = 10
+frame.samples[1] = 20
+frame.samples[2] = 30
+frame.samples[3] = 40
+frame.label = "buffer"
+
+print(frame.label, frame.samples[0], frame.samples[3], #frame.samples)
+
+-- `&place` yields a raw pointer; the dereference stays inside `unsafe`.
+local x: u32 = 7
+local p: *mut u32 = &x
+
+unsafe do
+    print(*p)
+
+    local buf: *mut u32 = unsafe_alloc(64)
+    *(buf + 0) = 11
+    *(buf + 1) = 31
+    print(*(buf + 0), *(buf + 1))
+end
+
+return 0

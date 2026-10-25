@@ -531,6 +531,37 @@ local function is_mut_pointer(type_name)
     return type_name ~= nil and string.sub(type_name, 1, 5) == "*mut "
 end
 
+-- ---- fixed-size arrays (module 16) ---------------------------------------
+
+-- `[T; N]` is spellt `array<T,N>` by both parsers.  The element spelling is
+-- kept verbatim and canonicalised in one place, exactly like `table<T>`.
+local function array_info(type_name)
+    if type_name == nil then
+        return nil
+    end
+    if string.sub(type_name, 1, 6) ~= "array<" then
+        return nil
+    end
+    if string.sub(type_name, #type_name, #type_name) ~= ">" then
+        return nil
+    end
+    local body = string.sub(type_name, 7, #type_name - 1)
+    local comma = string.find(body, ",", 1, true)
+    if comma == nil then
+        return nil
+    end
+    local element = string.sub(body, 1, comma - 1)
+    local length = tonumber(string.sub(body, comma + 1))
+    if element == "" or length == nil then
+        return nil
+    end
+    return element, math.floor(length)
+end
+
+local function is_array_type(type_name)
+    return array_info(type_name) ~= nil
+end
+
 local function is_struct_type(type_name)
     return type_name ~= nil and check_structs[type_name] ~= nil
 end
@@ -545,6 +576,20 @@ local function canonical_type(name, line, column)
     if TYPE_NAMES[name] == true then
         return name
     end
+    local array_element, array_length = array_info(name)
+    if array_element ~= nil then
+        if array_length < 1 or array_length > 1048576 then
+            type_fail("E0301", line, column,
+                "array length must be between 1 and 1048576, found "
+                .. tostring(array_length))
+        end
+        local canonical = canonical_type(array_element, line, column)
+        if canonical == "void" or canonical == "nil" or canonical == "auto" then
+            type_fail("E0301", line, column,
+                "invalid array element type `" .. tostring(canonical) .. "`")
+        end
+        return "array<" .. canonical .. "," .. tostring(array_length) .. ">"
+    end
     local element = table_element(name)
     if element ~= nil then
         local canonical = canonical_type(element, line, column)
@@ -556,12 +601,16 @@ local function canonical_type(name, line, column)
     end
     if is_pointer_type(name) then
         local element = pointer_element(name)
-        if element == "u32" or element == "i32" then
-            return name
+        local canonical = canonical_type(element, line, column)
+        if canonical == "void" or canonical == "nil" or canonical == "auto" then
+            type_fail("E0301", line, column,
+                "invalid raw pointer element type `"
+                .. tostring(canonical) .. "`")
         end
-        type_fail("E0301", line, column,
-            "raw pointers support only `u32` and `i32` elements, found `"
-            .. tostring(element) .. "`")
+        if string.sub(name, 1, 5) == "*mut " then
+            return "*mut " .. canonical
+        end
+        return "*const " .. canonical
     end
     if is_struct_type(name) then
         return name
@@ -621,6 +670,12 @@ local function is_heap_type(type_name)
         or table_element(type_name) ~= nil then
         return true
     end
+    local array_element = array_info(type_name)
+    if array_element ~= nil then
+        -- A fixed array embeds its elements, so it owns heap elements and
+        -- needs a drop loop at scope exit.
+        return is_heap_type(array_element)
+    end
     if type_name == nil or check_structs[type_name] == nil then
         return false
     end
@@ -677,6 +732,28 @@ local function assignable(target, source, expr)
     if target == source then
         return true
     end
+    local target_elem, target_len = array_info(target)
+    if target_elem ~= nil then
+        local source_elem, source_len = array_info(source)
+        if source_elem == nil or source_len ~= target_len then
+            return false
+        end
+        if expr ~= nil and expr.tag == "Array" then
+            local item_types = expr.item_types or {}
+            local i = 1
+            while i <= #item_types do
+                if not assignable(target_elem, item_types[i], expr.items[i]) then
+                    return false
+                end
+                i = i + 1
+            end
+            return true
+        end
+        return target_elem == source_elem
+    end
+    if array_info(source) ~= nil then
+        return false
+    end
     if source == "nil" then
         return target == "nil"
             or (is_heap_type(target) and not is_struct_type(target))
@@ -713,6 +790,23 @@ end
 local function coerce_literal(expr, target)
     if expr == nil then
         return nil
+    end
+    local target_elem, _ = array_info(target)
+    if target_elem ~= nil then
+        if expr.tag == "Array" then
+            local items = expr.items
+            local types = expr.item_types or {}
+            local i = 1
+            while i <= #items do
+                items[i] = coerce_literal(items[i], target_elem)
+                types[i] = target_elem
+                i = i + 1
+            end
+            expr.items = items
+            expr.item_types = types
+            expr.ctype = target
+        end
+        return expr
     end
     if expr.tag == "Paren" then
         expr.value = coerce_literal(expr.value, target)
@@ -2052,10 +2146,11 @@ check_expr = function(expr)
             return result, "bool"
         end
         if op == "#" then
-            if operand ~= "string" and table_element(operand) == nil then
+            if operand ~= "string" and table_element(operand) == nil
+                and not is_array_type(operand) then
                 type_fail("E0308", line, column,
-                    "the length operator requires a string or table",
-                    "string | table", operand)
+                    "the length operator requires a string, table, or fixed array",
+                    "string | table | array<T,N>", operand)
             end
             result.ctype = "i32"
             return result, "i32"
@@ -2264,6 +2359,79 @@ check_expr = function(expr)
         return check_struct_lit(expr)
     end
 
+    if tag == "Array" then
+        local items = expr.items or {}
+        local item_count = #items
+        if item_count == 0 then
+            type_fail("E0302", line, column,
+                "cannot infer the element type of an empty array literal",
+                "non-empty array literal", "[]")
+        end
+        local checked_items = {}
+        local item_types = {}
+        local elem = nil
+        local i = 1
+        while i <= item_count do
+            local checked_item, item_type = check_expr(items[i])
+            if item_type == "void" then
+                type_fail("E0308", checked_item.line, checked_item.column,
+                    "array element cannot have type `void`")
+            end
+            if elem == nil then
+                elem = item_type
+            elseif item_type ~= elem then
+                local literal = literal_int(checked_item)
+                if is_integer_type(elem) and literal ~= nil
+                    and integer_fits(elem, literal) then
+                    checked_item = coerce_literal(checked_item, elem)
+                    item_type = elem
+                else
+                    check_mismatch(checked_item.line, checked_item.column,
+                        "array literal", elem, item_type)
+                end
+            end
+            if checked_item.tag ~= "Clone" and checked_item.tag ~= "Borrow"
+                and checked_item.tag ~= "Move" then
+                consume_expr(clone checked_item, checked_item.line,
+                    checked_item.column)
+            end
+            checked_items[i] = checked_item
+            item_types[i] = item_type
+            i = i + 1
+        end
+        local type_name = "array<" .. elem .. "," .. tostring(item_count) .. ">"
+        expr.items = checked_items
+        expr.item_types = item_types
+        expr.ctype = type_name
+        expr.own = false
+        return expr, type_name
+    end
+
+    if tag == "AddrOf" then
+        local place = expr.value
+        if place == nil or (place.tag ~= "Name" and place.tag ~= "Field"
+            and place.tag ~= "Index" and place.tag ~= "Deref") then
+            type_fail("E0312", line, column,
+                "`&` requires a variable, field, index, or dereference")
+        end
+        local checked_place, place_type = check_expr(place)
+        if place_type == "void" or place_type == "nil"
+            or place_type == "auto" then
+            type_fail("E0308", line, column,
+                "cannot take the address of a `" .. tostring(place_type)
+                .. "` value")
+        end
+        if is_array_type(place_type) then
+            type_fail("E0312", line, column,
+                "address-of an array is not supported; index the array directly")
+        end
+        local pointer_type = "*mut " .. place_type
+        expr.value = checked_place
+        expr.ctype = pointer_type
+        expr.own = false
+        return expr, pointer_type
+    end
+
     if tag == "Index" then
         local checked_table, table_type = check_expr(expr.table)
         local table_schema = checked_table.schema
@@ -2294,6 +2462,19 @@ check_expr = function(expr)
         local element = table_element(table_type)
         if element == nil and table_type == "table" then
             element = table_elem_type
+        end
+        local array_element, array_length = array_info(table_type)
+        if array_element ~= nil then
+            if not is_integer_type(index_type) then
+                check_mismatch(line, column, "array index", "integer",
+                    index_type)
+            end
+            expr.ctype = array_element
+            expr.elem_type = array_element
+            expr.array_access = true
+            expr.array_length = array_length
+            expr.own = false
+            return expr, array_element
         end
         if element == nil then
             check_mismatch(line, column, "index expression",
@@ -2700,6 +2881,7 @@ local function check_local(stmt)
             -- emitter deep-copies them only when they must escape
             -- (return/store).
             own = final_type == "string" or is_struct_type(final_type)
+                or is_array_type(final_type)
         end
         resolved[i] = final_type
         owns[i] = own
@@ -2753,9 +2935,9 @@ local function check_assign(stmt)
     while i <= target_count do
         local target = targets[i]
         if target.tag ~= "Name" and target.tag ~= "Field"
-            and target.tag ~= "Deref" then
+            and target.tag ~= "Deref" and target.tag ~= "Index" then
             type_fail("E0312", target.line, target.column,
-                "only name, field, and dereference assignment targets are supported by the C backend")
+                "only name, field, index, and dereference assignment targets are supported by the C backend")
         end
         local expected = nil
         if target.tag == "Name" then
@@ -2804,6 +2986,24 @@ local function check_assign(stmt)
             end
             expected = element
             target.deref_target = true
+        elseif target.tag == "Index" then
+            local checked_table, table_type = check_expr(target.table)
+            local array_element = array_info(table_type)
+            if array_element == nil then
+                type_fail("E0312", target.line, target.column,
+                    "indexed assignment supports fixed-size arrays only",
+                    "array<T,N>", table_type)
+            end
+            local checked_index, index_type = check_expr(target.index)
+            if not is_integer_type(index_type) then
+                check_mismatch(target.line, target.column, "array index",
+                    "integer", index_type)
+            end
+            target.table = checked_table
+            target.index = checked_index
+            target.array_access = true
+            expected = array_element
+            target.own = false
         else
             local checked_table, table_type = check_expr(target.table)
             local table_schema = checked_table.schema
@@ -2849,6 +3049,11 @@ local function check_assign(stmt)
 
         local actual = nil
         local checked = nil
+        if target.tag ~= "Index" and is_array_type(expected) then
+            type_fail("E0312", target.line, target.column,
+                "whole-array assignment is not supported; assign elements individually",
+                "array element assignment", expected)
+        end
         if i <= #values then
             checked, actual = check_expr(values[i])
             if not assignable(expected, actual, clone checked) then
@@ -2945,7 +3150,7 @@ local function check_struct_decl(stmt)
         local valid = field_type == "u32" or field_type == "i32"
             or field_type == "i128" or field_type == "f32"
             or field_type == "bool" or field_type == "string"
-            or is_table_type(field_type)
+            or is_table_type(field_type) or is_array_type(field_type)
         if not valid and not is_pointer_type(field_type)
             and not is_struct_type(field_type) then
             type_fail("E0312", field.line, field.column,
@@ -3031,6 +3236,10 @@ local function scan_functions(body)
                     type_fail("E0301", param.line, param.column,
                         "function parameter `" .. param.name .. "` cannot have type `nil`")
                 end
+                if is_array_type(param_type) then
+                    type_fail("E0312", param.line, param.column,
+                        "fixed arrays cannot be passed by value; use a raw pointer or index the array in the callee")
+                end
                 params[#params + 1] = {
                     name = param.name,
                     type = param_type,
@@ -3048,6 +3257,10 @@ local function scan_functions(body)
             if ret == "nil" then
                 type_fail("E0301", fline, fcolumn,
                     "function return type cannot be `nil`")
+            end
+            if is_array_type(ret) then
+                type_fail("E0312", fline, fcolumn,
+                    "fixed arrays cannot be returned by value; use a raw pointer")
             end
             local signature = {
                 name = fname,
@@ -3475,6 +3688,10 @@ local function fresh(prefix)
 end
 
 local function c_type(type_name)
+    local array_element = array_info(type_name)
+    if array_element ~= nil then
+        return c_type(array_element)
+    end
     if type_name == "i32" then return "int32_t" end
     if type_name == "u32" then return "uint32_t" end
     if type_name == "i128" then return "lusa_i128" end
@@ -3491,10 +3708,7 @@ local function c_type(type_name)
     if type_name == "value" then return "LusaValue" end
     if pointer_element(type_name) ~= nil then
         local element = pointer_element(type_name)
-        local base = "uint32_t"
-        if element == "i32" then
-            base = "int32_t"
-        end
+        local base = c_type(element)
         if string.sub(type_name, 1, 5) == "*mut " then
             return "volatile " .. base .. " *"
         end
@@ -3506,7 +3720,20 @@ local function c_type(type_name)
     fail(0, 0, "internal: no C type for `" .. tostring(type_name) .. "`")
 end
 
+-- Declarator form: fixed arrays need the bound next to the variable name.
+local function c_decl(type_name, name)
+    local array_element, array_length = array_info(type_name)
+    if array_element ~= nil then
+        return c_type(array_element) .. " " .. name
+            .. "[" .. tostring(array_length) .. "]"
+    end
+    return c_type(type_name) .. " " .. name
+end
+
 local function default_c(type_name)
+    if is_array_type(type_name) then
+        return "{0}"
+    end
     if type_name == "f32" then return "0.0f" end
     if type_name == "bool" then return "false" end
     if type_name == "i32" or type_name == "u32" or type_name == "i128" then
@@ -3657,21 +3884,47 @@ local function emit_scope_pop_without_drops()
     emit_scope_count = emit_scope_count - 1
 end
 
+local function emit_clone_place(type_name, access)
+    if type_name == "string" then
+        line(access .. " = lusa_string_clone(" .. access .. ");")
+    elseif is_table_type(type_name) then
+        line(access .. " = lusa_table_clone(" .. access .. ");")
+    elseif is_struct_type(type_name) and is_heap_type(type_name) then
+        line(access .. " = lusa_clone_" .. type_name .. "(" .. access .. ");")
+    end
+end
+
+local function emit_drop_place(type_name, access)
+    if type_name == "string" then
+        line("lusa_drop_string(&" .. access .. ");")
+    elseif type_name == "table" or table_element(type_name) ~= nil then
+        line("lusa_drop_table(&" .. access .. ");")
+    elseif type_name == "coroutine" then
+        line("lusa_drop_coroutine(&" .. access .. ");")
+    elseif type_name == "gmatch" then
+        line("lusa_drop_gmatch(&" .. access .. ");")
+    elseif is_struct_type(type_name) then
+        line("lusa_drop_" .. type_name .. "(&" .. access .. ");")
+    end
+end
+
 local function emit_drop_entry(entry)
     if entry == nil or not entry.own or entry.moved then
         return
     end
-    if entry.type == "string" then
-        line("lusa_drop_string(&" .. entry.cname .. ");")
-    elseif entry.type == "table" or table_element(entry.type) ~= nil then
-        line("lusa_drop_table(&" .. entry.cname .. ");")
-    elseif entry.type == "coroutine" then
-        line("lusa_drop_coroutine(&" .. entry.cname .. ");")
-    elseif entry.type == "gmatch" then
-        line("lusa_drop_gmatch(&" .. entry.cname .. ");")
-    elseif is_struct_type(entry.type) then
-        line("lusa_drop_" .. entry.type .. "(&" .. entry.cname .. ");")
+    local array_element, array_length = array_info(entry.type)
+    if array_element ~= nil then
+        if is_heap_type(array_element) then
+            line("for (int32_t lusa_i = 0; lusa_i < "
+                .. tostring(array_length) .. "; lusa_i++) {")
+            emit_indent = emit_indent + 1
+            emit_drop_place(array_element, entry.cname .. "[lusa_i]")
+            emit_indent = emit_indent - 1
+            line("}")
+        end
+        return
     end
+    emit_drop_place(entry.type, entry.cname)
 end
 
 local function emit_scope_drops(scope_index)
@@ -4815,8 +5068,16 @@ collect_strings_expr = function(expr)
         return
     end
     if tag == "Paren" or tag == "Unary" or tag == "Clone"
-        or tag == "Borrow" or tag == "Move" then
+        or tag == "Borrow" or tag == "Move" or tag == "AddrOf" then
         collect_strings_expr(expr.value)
+        return
+    end
+    if tag == "Array" then
+        local i = 1
+        while i <= #expr.items do
+            collect_strings_expr(expr.items[i])
+            i = i + 1
+        end
         return
     end
     if tag == "Binary" or tag == "Logical" then
@@ -4891,6 +5152,9 @@ collect_strings_block = function(body)
                 if target.tag == "Field" then
                     add_string(target.field_name)
                     collect_strings_expr(target.table)
+                elseif target.tag == "Index" then
+                    collect_strings_expr(target.table)
+                    collect_strings_expr(target.index)
                 end
                 j = j + 1
             end
@@ -5255,6 +5519,11 @@ emit_expr = function(expr)
             return "(!" .. emit_expr(expr.value) .. ")"
         end
         if expr.op == "#" then
+            local operand_type = expr.value.ctype
+            local array_element, array_length = array_info(operand_type)
+            if array_element ~= nil then
+                return "((int32_t)" .. tostring(array_length) .. ")"
+            end
             local inner = emit_expr(expr.value)
             return "((int32_t)(((const LusaObj *)(" .. inner .. "))->length))"
         end
@@ -5428,6 +5697,33 @@ emit_expr = function(expr)
         end
         return name
     end
+    if tag == "Array" then
+        local array_element, array_length = array_info(expr.ctype)
+        if array_element == nil then
+            fail(expr.line, expr.column,
+                "internal: array literal has no canonical array type")
+        end
+        local parts = {}
+        local i = 1
+        while i <= #expr.items do
+            local item = expr.items[i]
+            local value = emit_expr(clone item)
+            if is_heap_type(array_element) and item.own == false then
+                value = emit_clone_heap(array_element, clone value)
+            end
+            parts[#parts + 1] = emit_cast_to(array_element, value)
+            if item.own ~= false then
+                null_moved_source(item, nil)
+            end
+            i = i + 1
+        end
+        return "((" .. c_type(array_element) .. "["
+            .. tostring(array_length) .. "]){ "
+            .. table.concat(parts, ", ") .. " })"
+    end
+    if tag == "AddrOf" then
+        return "(&(" .. emit_expr(expr.value) .. "))"
+    end
     if tag == "Table" then
         local array_count = 0
         local i = 1
@@ -5536,6 +5832,12 @@ emit_expr = function(expr)
         return cname .. "(" .. table.concat(args, ", ") .. ")"
     end
     if tag == "Index" then
+        if expr.array_access then
+            local table_value = emit_expr(expr.table)
+            local index_value = emit_expr(expr.index)
+            return "(" .. table_value .. ")[(int32_t)("
+                .. index_value .. ")]"
+        end
         local table_type = expr.table.ctype
         local table_value = emit_expr(expr.table)
         local index_value = emit_expr(expr.index)
@@ -5767,6 +6069,29 @@ local function emit_string_result_local(stmt)
     line("int32_t " .. second.cname .. " = " .. count_value .. ";")
 end
 
+local function emit_array_initializer(type_name, value)
+    local element = array_info(type_name)
+    if value == nil then
+        return "{0}"
+    end
+    if value.tag ~= "Array" then
+        fail(value.line, value.column,
+            "fixed arrays can only be initialized from an array literal in the native backend")
+    end
+    local parts = {}
+    local i = 1
+    while i <= #value.items do
+        local item = value.items[i]
+        local rendered = emit_expr(clone item)
+        if is_heap_type(element) and item.own == false then
+            rendered = emit_clone_heap(element, rendered)
+        end
+        parts[#parts + 1] = emit_cast_to(element, rendered)
+        i = i + 1
+    end
+    return "{ " .. table.concat(parts, ", ") .. " }"
+end
+
 local function emit_local(stmt)
     if stmt.string_result ~= nil then
         emit_string_result_local(stmt)
@@ -5785,30 +6110,35 @@ local function emit_local(stmt)
     local values = stmt.values
     local temporaries = {}
     local entries = {}
+    local array_values = {}
     local i = 1
 
     while i <= #names do
         local type_name = types[i]
         local value = values[i]
-        local temp_name = fresh("init")
-        if value ~= nil then
-            local rendered = emit_expr(clone value)
-            if (type_name == "string" or is_struct_type(type_name))
-                and value.own == false and value.tag ~= "Borrow" then
-                -- Strings and structs are value types: reading a field/index
-                -- copies it, including nested heap fields.
-                rendered = emit_clone_heap(type_name, rendered)
-            end
-            rendered = emit_cast_to(type_name, rendered)
-            line(c_type(type_name) .. " " .. temp_name .. " = " .. rendered .. ";")
-            if value.own ~= false then
-                null_moved_source(value, nil)
-            end
+        if is_array_type(type_name) then
+            array_values[i] = value
         else
-            line(c_type(type_name) .. " " .. temp_name .. " = "
-                .. default_c(type_name) .. ";")
+            local temp_name = fresh("init")
+            if value ~= nil then
+                local rendered = emit_expr(clone value)
+                if (type_name == "string" or is_struct_type(type_name))
+                    and value.own == false and value.tag ~= "Borrow" then
+                    -- Strings and structs are value types: reading a field/index
+                    -- copies it, including nested heap fields.
+                    rendered = emit_clone_heap(type_name, rendered)
+                end
+                rendered = emit_cast_to(type_name, rendered)
+                line(c_type(type_name) .. " " .. temp_name .. " = " .. rendered .. ";")
+                if value.own ~= false then
+                    null_moved_source(value, nil)
+                end
+            else
+                line(c_type(type_name) .. " " .. temp_name .. " = "
+                    .. default_c(type_name) .. ";")
+            end
+            temporaries[i] = temp_name
         end
-        temporaries[i] = temp_name
         i = i + 1
     end
 
@@ -5817,8 +6147,23 @@ local function emit_local(stmt)
         local own = stmt.own[i]
         local entry = emit_scope_declare(names[i], types[i], own,
             values[i] ~= nil and values[i].tag == "Borrow")
-        line(c_type(types[i]) .. " " .. entry.cname .. " = "
-            .. temporaries[i] .. ";")
+        if is_array_type(types[i]) then
+            local value = array_values[i]
+            line(c_decl(types[i], entry.cname) .. " = "
+                .. emit_array_initializer(types[i], clone value) .. ";")
+            if value ~= nil then
+                local j = 1
+                while j <= #value.items do
+                    if value.items[j].own ~= false then
+                        null_moved_source(value.items[j], nil)
+                    end
+                    j = j + 1
+                end
+            end
+        else
+            line(c_type(types[i]) .. " " .. entry.cname .. " = "
+                .. temporaries[i] .. ";")
+        end
         entries[i] = entry
         i = i + 1
     end
@@ -5893,6 +6238,21 @@ local function emit_assign(stmt)
             local pointer_value = emit_expr(target.value)
             local value_expr = emit_cast_to(target_types[i], temporaries[i])
             line("(*(" .. pointer_value .. ")) = " .. value_expr .. ";")
+        elseif target.tag == "Index" and target.array_access then
+            local table_value = emit_expr(target.table)
+            local index_value = emit_expr(target.index)
+            local access = "(" .. table_value .. ")["
+                .. index_value .. "]"
+            local assigned = temporaries[i]
+            if i <= #values and values[i].own == false
+                and is_heap_type(target_types[i]) then
+                assigned = emit_clone_heap(target_types[i], assigned)
+            end
+            assigned = emit_cast_to(target_types[i], assigned)
+            if is_heap_type(target_types[i]) then
+                emit_drop_place(target_types[i], access)
+            end
+            line(access .. " = " .. assigned .. ";")
         elseif target.struct_access then
             local table_value = emit_expr(target.table)
             local assigned = temporaries[i]
@@ -6349,7 +6709,7 @@ local function emit_struct_declarations(ast)
         while j <= #layout.order do
             local field_name = clone layout.order[j]
             local field_type = clone (borrow layout.fields[field_name]).type
-            line(c_type(field_type) .. " " .. field_name .. ";")
+            line(c_decl(field_type, field_name) .. ";")
             j = j + 1
         end
         emit_indent = emit_indent - 1
@@ -6372,14 +6732,19 @@ local function emit_struct_declarations(ast)
             local field_name = clone layout.order[j]
             local field_type = clone (borrow layout.fields[field_name]).type
             local access = "value->" .. field_name
-            if field_type == "string" then
-                line("lusa_drop_string(&" .. access .. ");")
-            elseif field_type == "table"
-                or table_element(field_type) ~= nil then
-                line("lusa_drop_table(&" .. access .. ");")
-            elseif is_struct_type(field_type)
-                and is_heap_type(field_type) then
-                line("lusa_drop_" .. field_type .. "(&" .. access .. ");")
+            local array_element, array_length = array_info(field_type)
+            if array_element ~= nil then
+                if is_heap_type(array_element) then
+                    line("for (int32_t lusa_i = 0; lusa_i < "
+                        .. tostring(array_length) .. "; lusa_i++) {")
+                    emit_indent = emit_indent + 1
+                    emit_drop_place(array_element,
+                        access .. "[lusa_i]")
+                    emit_indent = emit_indent - 1
+                    line("}")
+                end
+            else
+                emit_drop_place(field_type, access)
             end
             j = j + 1
         end
@@ -6395,15 +6760,19 @@ local function emit_struct_declarations(ast)
             local field_name = clone layout.order[j]
             local field_type = clone (borrow layout.fields[field_name]).type
             local access = "value." .. field_name
-            if field_type == "string" then
-                line(access .. " = lusa_string_clone(" .. access .. ");")
-            elseif field_type == "table"
-                or table_element(field_type) ~= nil then
-                line(access .. " = lusa_table_clone(" .. access .. ");")
-            elseif is_struct_type(field_type)
-                and is_heap_type(field_type) then
-                line(access .. " = lusa_clone_" .. field_type
-                    .. "(" .. access .. ");")
+            local array_element, array_length = array_info(field_type)
+            if array_element ~= nil then
+                if is_heap_type(array_element) then
+                    line("for (int32_t lusa_i = 0; lusa_i < "
+                        .. tostring(array_length) .. "; lusa_i++) {")
+                    emit_indent = emit_indent + 1
+                    emit_clone_place(array_element,
+                        access .. "[lusa_i]")
+                    emit_indent = emit_indent - 1
+                    line("}")
+                end
+            else
+                emit_clone_place(field_type, access)
             end
             j = j + 1
         end
@@ -6421,7 +6790,7 @@ local function emit_globals_declarations()
         -- Declaration only inspects metadata; cloning keeps the entry in the
         -- drop list for the normal and error exits of `main`.
         local global = clone emit_global_order[i]
-        line("static " .. c_type(global.type) .. " " .. global.cname
+        line("static " .. c_decl(global.type, global.cname)
             .. " = " .. default_c(global.type) .. ";")
         i = i + 1
     end

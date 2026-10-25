@@ -4,6 +4,16 @@ use crate::error::Span;
 
 pub type Block = Vec<St>;
 
+/// Splits a canonical `array<T,N>` annotation into its element spelling and
+/// length.  Both parsers emit this spelling, so the dynamic engines and the
+/// self-hosted C backend agree on the representation.
+pub fn array_annotation(ann: &str) -> Option<(&str, usize)> {
+    let rest = ann.strip_prefix("array<")?.strip_suffix('>')?;
+    let (element, size) = rest.rsplit_once(',')?;
+    let length = size.parse().ok()?;
+    Some((element, length))
+}
+
 #[derive(Clone, Debug)]
 pub struct St {
     pub kind: StKind,
@@ -101,6 +111,11 @@ pub enum ExprKind {
         span_args_end: Span,
     },
     Table(Vec<TableEntry>),
+    /// `[a, b, c]` fixed-size array literal.  The native backend emits a C
+    /// compound literal; the dynamic engines build a 0-based table.
+    ArrayLit(Vec<Expr>),
+    /// `&place` — address of a variable, field, or index expression.
+    AddrOf(Box<Expr>),
     /// `Point{x: 10, y: 20}` static struct literal.
     StructLit {
         name: String,

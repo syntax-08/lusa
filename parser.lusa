@@ -386,6 +386,19 @@ parse_type = function()
     if at_value("[") then
         advance()
         local element = parse_type()
+        if at_value(";") then
+            advance()
+            if peek_kind() ~= "number" then
+                fail("expected an array length, found " .. describe_token())
+            end
+            local size = peek_value()
+            if math.floor(tonumber(size)) ~= tonumber(size) then
+                fail("array length must be a non-negative integer literal")
+            end
+            advance()
+            expect_value("]", "`]` to close the array type")
+            return "array<" .. element .. "," .. size .. ">"
+        end
         expect_value("]", "`]` to close the table type")
         return "table<" .. element .. ">"
     end
@@ -930,9 +943,9 @@ parse_assign_or_call = function()
         local i = 1
         while i <= target_count do
             if targets[i].tag ~= "Name" and targets[i].tag ~= "Field"
-                and targets[i].tag ~= "Deref" then
+                and targets[i].tag ~= "Deref" and targets[i].tag ~= "Index" then
                 fail_at(targets[i].line, targets[i].column,
-                    "invalid assignment target (expected a name, field, or dereference)")
+                    "invalid assignment target (expected a name, field, index, or dereference)")
             end
             i = i + 1
         end
@@ -994,7 +1007,7 @@ parse_stmt = function()
         end
     elseif kind == "name" then
         return parse_assign_or_call()
-    elseif kind == "operator" and value == "*" then
+    elseif kind == "operator" and (value == "*" or value == "&") then
         return parse_assign_or_call()
     end
 
@@ -1197,7 +1210,8 @@ parse_prefix = function()
     local column = peek_column()
 
     local is_unary = false
-    if kind == "operator" and (value == "-" or value == "#" or value == "*") then
+    if kind == "operator" and (value == "-" or value == "#" or value == "*"
+        or value == "&") then
         is_unary = true
     elseif kind == "keyword"
         and (value == "not" or value == "borrow" or value == "clone"
@@ -1217,6 +1231,8 @@ parse_prefix = function()
             tag = "Move"
         elseif value == "*" then
             tag = "Deref"
+        elseif value == "&" then
+            tag = "AddrOf"
         end
         local node = {
             tag = tag,
@@ -1354,6 +1370,29 @@ parse_primary = function()
             tag = "Table",
             items = items,
             keys = keys,
+            line = line,
+            column = column
+        }
+    end
+    if value == "[" then
+        advance()
+        local items = {}
+        if not at_value("]") then
+            while true do
+                items[#items + 1] = parse_expr()
+                if not at_value(",") then
+                    break
+                end
+                advance()
+                if at_value("]") then
+                    break
+                end
+            end
+        end
+        expect_value("]", "`]` to close the array literal")
+        return {
+            tag = "Array",
+            items = items,
             line = line,
             column = column
         }

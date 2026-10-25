@@ -63,6 +63,6 @@ Download `lusa-setup.zip` or the platform tarball.
 
 ## Current release
 
-The v1.1.0 body is [`.github/release-notes/v1.1.0.md`](../.github/release-notes/v1.1.0.md).
-It follows this structure and documents struct literals, `match`, compile-time
-modules, and inline assembly.
+The v1.2.0 body is [`.github/release-notes/v1.2.0.md`](../.github/release-notes/v1.2.0.md).
+It follows this structure and documents fixed arrays, address-of, pointer
+arithmetic, and RAII drop loops.

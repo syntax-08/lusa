@@ -63,6 +63,8 @@ pub enum TokenKind {
     Dot,
     DotDotDot,
     Len, // `#`
+    /// `&` — address-of a place expression (`&x`, `&arr[i]`).
+    Amp,
     /// `*` at the start of a line - begins a pointer dereference instead of
     /// continuing a multiplication.
     StarLine,
@@ -180,6 +182,7 @@ impl Token {
             TokenKind::Dot => "`.`".into(),
             TokenKind::DotDotDot => "`...`".into(),
             TokenKind::Len => "`#`".into(),
+            TokenKind::Amp => "`&`".into(),
             TokenKind::StarLine => "`*`".into(),
             TokenKind::Eq => "`==`".into(),
             TokenKind::Ne => "`~=`".into(),
