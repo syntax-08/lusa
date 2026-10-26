@@ -28,7 +28,10 @@ AST work. Module 17 adds volatile MMIO access (`read_volatile`/
 hardware controls. Module 19 adds custom startup symbols (`#[entry]`),
 freestanding `#[no_std]` programs without the hosted C runtime, and
 `#[link_section = "..."]` placement for functions, globals, and promoted
-top-level locals.
+top-level locals. Module 20 adds the global allocator contract
+(`#[global_allocator]`), the `lusa_heap_alloc`/`lusa_heap_dealloc` dispatch, and
+the first growable collections: `Vec<T>` with push/pop/indexing and `Box<T>`
+owned pointers, both with RAII drops on hosted and freestanding targets.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -118,6 +121,7 @@ See [`examples/`](examples/):
 | `struct_match.lusa`       | struct literals, nested deep clone, and `match` arms |
 | `photocraft.lusa`         | mini photo-lab: 2D image in tables → filters → ASCII-art |
 | `baremetal_boot.lusa`     | `#[no_std]` `_start` entry with sectioned code/data |
+| `dynamic_heap.lusa`       | `Vec<T>` growth/pop/clear and `Box<T>` owned pointers |
 
 Also in the root: `bench.lusa` — reference workload for measuring speed
 (debug × release). Typical measurement on this machine: **4.6× faster** on
@@ -147,6 +151,10 @@ cargo run -- examples/basics.lusa
   its arguments, other reads, borrows, or moves of the receiver are rejected
   with **E1002**. The C11 front end performs the same analysis statically with
   Cargo-style spans and zero generated-code overhead.
+- **Heap collections**: `Vec<T>` is a growable 0-based buffer with `push`,
+  `pop`, `len`, `capacity`, `is_empty`, `reserve`, and `clear`; `Box<T>` is an
+  owned pointer read and written with `*b`. Both own their contents and run
+  RAII drops in every engine.
 - **stdlib**: `print type tostring tonumber error assert pcall pairs ipairs`
   `io_read_file` `io_write_binary` `io_read_binary` + `string` `table` `math`
   `json` modules, and `coroutine.create/resume/yield/status/close/isyieldable`.
@@ -839,6 +847,72 @@ the hosted runtime. `tests/module19.rs` covers the freestanding preamble, entry
 ordering and `void` return, section lowering, local promotion, parser and
 semantic diagnostics, dynamic parity, and native hosted/no_std builds.
 
+### Heap allocation and dynamic collections (Module 20)
+
+`#[global_allocator]` plugs a custom heap into the C11 backend. The attribute
+marks either half of the contract:
+
+```lusa
+#[global_allocator]
+function my_alloc(size: u32, align: u32): *mut u32
+    unsafe do
+        return unsafe_alloc(size)
+    end
+end
+
+#[global_allocator]
+function my_dealloc(ptr: *mut u32, size: u32, align: u32): void
+    -- release or recycle the block
+end
+```
+
+The allocator must return `*mut u32`; the deallocator receives the original
+size and alignment. Hosted programs use `malloc`/`free` when no allocator is
+provided; `#[no_std]` programs use a static 64 KiB bump arena instead. This is
+what lets `Vec<T>` and `Box<T>` work on bare metal without libc.
+
+`Vec<T>` is a growable 0-based buffer. Literals use the array syntax and grow
+geometrically (4, 8, 16, ...):
+
+```lusa
+local values: Vec<i32> = [4, 8, 15]
+values:push(16)
+print(values:len(), values:capacity())   -- 4 8
+print(values[0], values:pop())           -- 4 16
+values:reserve(32)
+values:clear()
+print(values:len(), values:is_empty())   -- 0 true
+```
+
+`Box<T>` is an owned pointer. It can be initialized implicitly from a value or
+explicitly with `Box(value)`; `*b` reads and writes the pointee without the raw
+pointer `unsafe` gate:
+
+```lusa
+local answer: Box<i32> = 41
+*answer = *answer + 1
+print(*answer)                            -- 42
+
+local message = Box("automatic")
+print(*message)
+```
+
+Owned elements (`Vec<string>`, `Box<string>`, nested structs) are released by
+the generated per-element drop helpers at scope exit, on `clear`, and when the
+program ends. `Vec<T>` values cannot yet be passed or returned by value; use a
+raw pointer for that boundary (`E0312`).
+
+```sh
+lusalang run examples/dynamic_heap.lusa
+lusalang run examples/dynamic_heap.lusa --vm
+lusalang run examples/dynamic_heap.lusa --native
+lusalang build examples/dynamic_heap.lusa --emit-c
+```
+
+`tests/module20.rs` covers heap growth, custom allocator dispatch, freestanding
+arena emission, `Vec<string>`/`Box<string>` RAII, allocator diagnostics, and
+native + dynamic parity.
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -873,7 +947,10 @@ input diagnostics, shared lowering with `unsafe_asm`, dynamic control-flow
 parity, and a native build-and-run. `tests/module19.rs` adds freestanding
 `#[no_std]` emission, entry-wrapper ordering, section placement, promoted
 locals, `E0101`/`E0325` diagnostics, dynamic parity, and native hosted and
-no_std build-and-run checks. See
+no_std build-and-run checks. `tests/module20.rs` adds `Vec<T>` growth and
+method semantics, `Box<T>` dereference/write, `#[global_allocator]` dispatch,
+freestanding arena emission, owned-element drops, allocator diagnostics, and
+three-engine parity. See
 [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
 [`docs/LANGUAGE.md`](docs/LANGUAGE.md) section 9 for details.
 
@@ -941,6 +1018,9 @@ Near-term milestones:
 - **v1.5.0 (shipped):** custom `#[entry]` startup symbols, freestanding
   `#[no_std]` translation units, and `#[link_section = "..."]` placement for
   functions, globals, and promoted top-level locals.
+- **v1.6.0 (shipped):** `#[global_allocator]` heap dispatch, freestanding bump
+  arena fallback, and RAII-managed `Vec<T>`/`Box<T>` collections usable on
+  hosted and bare-metal targets.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

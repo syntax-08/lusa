@@ -28,6 +28,69 @@ fn one(v: Value) -> LResult<Vec<Value>> {
     Ok(vec![v])
 }
 
+/// Marker key used by the dynamic engines to tag a table as a `Box<T>`
+/// wrapper.  A leading control character keeps user tables from colliding
+/// with it by accident.
+pub const BOX_MARKER: &str = "\u{1}lusa_box";
+const BOX_VALUE_KEY: &str = "value";
+
+fn box_marker() -> Value {
+    Value::Str(Arc::from(BOX_MARKER))
+}
+
+fn box_value_key() -> Value {
+    Value::Str(Arc::from(BOX_VALUE_KEY))
+}
+
+/// Wraps `value` in a box table.  Wrapping an existing box is a no-op so
+/// implicit annotation wrapping and an explicit `Box(x)` never nest.
+pub fn box_value(value: Value) -> Value {
+    if box_inner(&value).is_some() {
+        return value;
+    }
+    let table = TableObj::new();
+    table.set(box_marker(), Value::Bool(true)).expect("box marker key");
+    table.set(box_value_key(), value).expect("box value key");
+    Value::Table(Rc::new(table))
+}
+
+/// Returns the table behind a boxed value, or `None` for ordinary values.
+pub fn box_table(value: &Value) -> Option<Rc<TableObj>> {
+    let table = match value.base_value() {
+        Value::Table(table) => table,
+        _ => return None,
+    };
+    match table.get(&box_marker()) {
+        Some(Value::Bool(true)) => Some(Rc::clone(table)),
+        _ => None,
+    }
+}
+
+/// Reads the pointee of a boxed value.  `Some(Value::Nil)` is a valid boxed
+/// result, so callers must use `box_table` when they need to distinguish an
+/// empty box from an ordinary value.
+pub fn box_inner(value: &Value) -> Option<Value> {
+    let table = box_table(value)?;
+    Some(table.get(&box_value_key()).unwrap_or(Value::Nil))
+}
+
+/// Writes a new pointee into an already-resolved box table.
+pub fn box_set_table(table: &TableObj, new_value: Value) {
+    table
+        .set(box_value_key(), new_value)
+        .expect("box value key");
+}
+
+/// Writes a new pointee into an existing box.  Returns `false` when `value`
+/// is not a box.
+pub fn box_set_inner(value: &Value, new_value: Value) -> bool {
+    let Some(table) = box_table(value) else {
+        return false;
+    };
+    box_set_table(&table, new_value);
+    true
+}
+
 fn get<'a>(args: &'a [Value], i: usize, what: &str, span: Span) -> LResult<&'a Value> {
     args.get(i)
         .ok_or_else(|| LusaError::new(E_INDEX, Some(span), format!("missing argument `{}`", what)))
@@ -162,6 +225,41 @@ fn b_unsafe_read_mem(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Ve
     let addr = mem_addr(&args, span)?;
     let value = i.unsafe_mem.get(&addr).copied().unwrap_or(0.0);
     one(Value::Number(value))
+}
+
+/// `Box(value)`: allocate an owned pointee in the dynamic engines.  The native
+/// backend lowers this to a heap allocation; the sandbox uses a tagged table
+/// so `*b` can read and write the pointee without the raw-pointer gate.
+fn b_box(_i: &mut Interp, args: Vec<Value>, _span: Span) -> LResult<Vec<Value>> {
+    one(box_value(args.first().cloned().unwrap_or(Value::Nil)))
+}
+
+/// Dynamic lowering of unary `*`: boxes dereference safely, while ordinary
+/// numeric addresses keep the raw-memory sandbox rules.
+fn b_box_read(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    let target = get(&args, 0, "value", span)?;
+    if let Some(inner) = box_inner(target) {
+        return one(inner);
+    }
+    require_unsafe(i, "raw pointer dereference", span)?;
+    let addr = mem_addr(&args, span)?;
+    let value = i.unsafe_mem.get(&addr).copied().unwrap_or(0.0);
+    one(Value::Number(value))
+}
+
+/// Dynamic lowering of `*place = value`: box writes mutate the pointee;
+/// numeric targets fall back to the simulated raw-memory space.
+fn b_box_write(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    let target = get(&args, 0, "value", span)?;
+    let value = get(&args, 1, "value", span)?;
+    if box_set_inner(target, value.clone()) {
+        return Ok(Vec::new());
+    }
+    require_unsafe(i, "raw pointer dereference", span)?;
+    let addr = mem_addr(&args, span)?;
+    let value = need_num(value, "value", span)?;
+    i.unsafe_mem.insert(addr, value);
+    Ok(Vec::new())
 }
 
 /// Accepts the scalar spellings supported by volatile hardware access.  The
@@ -667,6 +765,9 @@ pub fn all() -> Vec<(&'static str, BF)> {
         ("pcall", Box::new(b_pcall)),
         ("pairs", Box::new(b_pairs)),
         ("ipairs", Box::new(b_ipairs)),
+        ("Box", Box::new(b_box)),
+        ("box_read", Box::new(b_box_read)),
+        ("box_write", Box::new(b_box_write)),
         ("unsafe_ptr_cast", Box::new(b_unsafe_ptr_cast)),
         ("unsafe_write_mem", Box::new(b_unsafe_write_mem)),
         ("unsafe_read_mem", Box::new(b_unsafe_read_mem)),

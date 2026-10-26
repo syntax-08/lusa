@@ -52,6 +52,10 @@ pub struct Interp {
     /// checks treat scalar-only structs as copyable values, matching the
     /// native backend.
     pub struct_tables: RefCell<HashMap<u64, String>>,
+    /// simulated capacities for `Vec<T>` tables.  Native vectors keep their
+    /// capacity across pop/clear semantics; tables have no header, so the
+    /// sandbox records the capacity out of band.
+    pub vec_caps: RefCell<HashMap<u64, u32>>,
     /// next simulated base address handed out by `unsafe_alloc`
     pub unsafe_alloc_next: u64,
     /// next simulated address handed out by `&place`
@@ -103,6 +107,7 @@ impl Interp {
             unsafe_depth: 0,
             struct_defs: HashMap::new(),
             struct_tables: RefCell::new(HashMap::new()),
+            vec_caps: RefCell::new(HashMap::new()),
             unsafe_alloc_next: 0x1000,
             addr_next: 0x8000_0000,
             active_coroutines: Vec::new(),
@@ -803,6 +808,14 @@ impl Interp {
         for i in 0..targets.len() {
             let is_nil = matches!(vals[i], Value::Nil);
             if !is_nil {
+                // Implicit `Box<T>` construction mirrors the checker: a plain
+                // value assigned to a Box-typed local becomes an owned box.
+                if let Some(ann) = annotations.get(i).and_then(|a| a.as_deref()) {
+                    if box_annotation(ann).is_some() {
+                        let current = vals[i].clone();
+                        vals[i] = crate::builtins::box_value(current);
+                    }
+                }
                 continue;
             }
             if let Some(ann) = annotations.get(i).and_then(|a| a.as_deref()) {
@@ -827,6 +840,9 @@ impl Interp {
                         tbl.set(Value::Number(index as f64), zero.clone()).ok();
                     }
                     vals[i] = Value::Table(Rc::new(tbl));
+                } else if vec_annotation(ann).is_some() {
+                    // growable vector: an empty 0-based table (capacity 0)
+                    vals[i] = Value::Table(Rc::new(TableObj::new()));
                 } else if self.struct_defs.contains_key(ann) {
                     // static struct: a fixed-field simulated buffer
                     if let Some(v) = self.default_struct_value(ann) {
@@ -867,7 +883,12 @@ impl Interp {
                 continue;
             };
             for (_, ty) in &def.fields {
-                if ty == "string" || ty == "table" || ty.starts_with("table<") {
+                if ty == "string"
+                    || ty == "table"
+                    || ty.starts_with("table<")
+                    || vec_annotation(ty).is_some()
+                    || box_annotation(ty).is_some()
+                {
                     return true;
                 }
                 if self.struct_defs.contains_key(ty) {
@@ -896,7 +917,30 @@ impl Interp {
         let copy = value.deep_clone();
         let mut visited = HashSet::new();
         self.tag_cloned_structs(value, &copy, &mut visited);
+        let mut vecs = HashSet::new();
+        self.copy_cloned_vec_capacities(value, &copy, &mut vecs);
         copy
+    }
+
+    fn copy_cloned_vec_capacities(
+        &self,
+        src: &Value,
+        copy: &Value,
+        visited: &mut HashSet<u64>,
+    ) {
+        if let (Value::Alias(src_alias), Value::Alias(copy_alias)) = (src, copy) {
+            self.copy_cloned_vec_capacities(&src_alias.base, &copy_alias.base, visited);
+            return;
+        }
+        let (Value::Table(src_t), Value::Table(copy_t)) = (src, copy) else {
+            return;
+        };
+        if !visited.insert(src_t.vid) {
+            return;
+        }
+        if let Some(capacity) = self.vec_caps.borrow().get(&src_t.vid).copied() {
+            self.vec_caps.borrow_mut().insert(copy_t.vid, capacity);
+        }
     }
 
     fn tag_cloned_structs(&self, src: &Value, copy: &Value, visited: &mut HashSet<u64>) {
@@ -934,6 +978,117 @@ impl Interp {
         }
     }
 
+    /// The `Vec<T>` method surface shared by both dynamic engines.  A table
+    /// with a real field of the same name wins; otherwise these fallbacks make
+    /// the 0-based table behave like a growable vector.
+    pub fn is_vec_method(name: &str) -> bool {
+        matches!(
+            name,
+            "push" | "pop" | "len" | "capacity" | "is_empty" | "reserve" | "clear"
+        )
+    }
+
+    fn vec_capacity_for_len(len: usize) -> u32 {
+        if len == 0 {
+            return 0;
+        }
+        let mut capacity = 4usize;
+        while capacity < len {
+            capacity = capacity.saturating_mul(2);
+        }
+        capacity as u32
+    }
+
+    pub(crate) fn vec_capacity(&self, table: &TableObj) -> u32 {
+        let stored = self.vec_caps.borrow().get(&table.vid).copied().unwrap_or(0);
+        stored.max(Self::vec_capacity_for_len(table.len()))
+    }
+
+    pub(crate) fn vec_reserve_capacity(&self, table: &TableObj, needed: usize) {
+        let current = self.vec_capacity(table);
+        if needed <= current as usize {
+            if current != 0 && !self.vec_caps.borrow().contains_key(&table.vid) {
+                self.vec_caps.borrow_mut().insert(table.vid, current);
+            }
+            return;
+        }
+        let mut capacity = if current == 0 { 4usize } else { current as usize };
+        while capacity < needed {
+            let doubled = capacity.saturating_mul(2);
+            if doubled == capacity {
+                capacity = needed;
+                break;
+            }
+            capacity = doubled;
+        }
+        self.vec_caps.borrow_mut().insert(table.vid, capacity as u32);
+    }
+
+    /// Executes a `Vec<T>` fallback method.  Arguments have already been read
+    /// with moving semantics by the caller.
+    pub(crate) fn vec_method_call(
+        &mut self,
+        table: &Rc<TableObj>,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> LResult<Vec<Value>> {
+        match name {
+            "push" => {
+                let value = args.first().cloned().unwrap_or(Value::Nil);
+                let index = table.len();
+                table.set(Value::Number(index as f64), value)?;
+                self.vec_reserve_capacity(table, index + 1);
+                Ok(Vec::new())
+            }
+            "pop" => {
+                let len = table.len();
+                if len == 0 {
+                    return Ok(vec![Value::Nil]);
+                }
+                let key = Value::Number((len - 1) as f64);
+                let note = MoveNote { to: "Vec:pop".to_string(), span };
+                match table.move_out(&key, note) {
+                    Some(value) => {
+                        if let Some(vid) = value.vid() {
+                            value::with_reg(|r| r.rename(vid, "Vec:pop", span));
+                        }
+                        Ok(vec![value])
+                    }
+                    None => Ok(vec![Value::Nil]),
+                }
+            }
+            "len" => Ok(vec![Value::Number(table.len() as f64)]),
+            "capacity" => Ok(vec![Value::Number(self.vec_capacity(table) as f64)]),
+            "is_empty" => Ok(vec![Value::Bool(table.len() == 0)]),
+            "reserve" => {
+                let needed = match args.first().map(|v| v.base_value()) {
+                    Some(Value::Number(n)) if n.is_finite() && *n >= 0.0 => *n as usize,
+                    _ => {
+                        return Err(LusaError::new(
+                            crate::error::E_NUM,
+                            Some(span),
+                            "`Vec:reserve` expects a non-negative number",
+                        ))
+                    }
+                };
+                self.vec_reserve_capacity(table, needed);
+                Ok(Vec::new())
+            }
+            "clear" => {
+                // `Vec:clear` drops the elements but keeps the allocation,
+                // matching the native `lusa_vec_clear_*` helper.
+                table.clear();
+                Ok(Vec::new())
+            }
+            other => Err(LusaError::new(
+                crate::error::E_CALL,
+                Some(span),
+                format!("unknown Vec method `:{other}`"),
+            )),
+        }
+    }
+
     fn default_struct_value_at(&self, name: &str, depth: usize) -> Option<Value> {
         let def = self.struct_defs.get(name)?;
         let table = TableObj::new();
@@ -943,7 +1098,10 @@ impl Interp {
         for (fname, ty) in &def.fields {
             let zero = if ty == "bool" {
                 Value::Bool(false)
+            } else if vec_annotation(ty).is_some() {
+                Value::Table(Rc::new(TableObj::new()))
             } else if ty == "string" || ty == "table" || ty.starts_with("table<")
+                || box_annotation(ty).is_some()
                 || ty.starts_with('*') || ty == "nil"
             {
                 Value::Nil
@@ -988,7 +1146,7 @@ impl Interp {
         enum Dst {
             Var(String),
             Field { obj: Value, key: Value, desc: String, span: Span },
-            Deref { addr: u64, desc: String, span: Span },
+            Deref { place: eval::DerefPlace, desc: String, span: Span },
         }
         let mut dsts: Vec<Dst> = Vec::with_capacity(targets.len());
         for t in targets {
@@ -1005,8 +1163,8 @@ impl Interp {
                     dsts.push(Dst::Field { obj: o, key: k, desc: label_of(t), span: t.span });
                 }
                 ExprKind::Un { op: UnOp::Deref, e } => {
-                    let addr = crate::eval::eval_deref_addr(self, frame, e, t.span)?;
-                    dsts.push(Dst::Deref { addr, desc: label_of(t), span: t.span });
+                    let place = crate::eval::eval_deref_place(self, frame, e, t.span)?;
+                    dsts.push(Dst::Deref { place, desc: label_of(t), span: t.span });
                 }
                 _ => unreachable!("parser validates assignment targets"),
             }
@@ -1044,32 +1202,41 @@ impl Interp {
                 Dst::Field { obj, key, desc, span } => {
                     self.write_table_slot(obj, key, v, &desc, span)?;
                 }
-                Dst::Deref { addr, desc, span } => {
-                    if self.unsafe_depth == 0 {
-                        return Err(LusaError::new(
-                            crate::error::E_PTR_DEREF,
-                            Some(span),
-                            "raw pointer dereference requires an `unsafe` block",
-                        )
-                        .note(
-                            format!("wrap the write to `{desc}` in `unsafe do ... end`"),
-                            None,
-                        ));
-                    }
-                    let value = match v.base_value() {
-                        Value::Number(n) => *n,
-                        other => {
-                            return Err(LusaError::new(
-                                crate::error::E_RUNTIME,
-                                Some(span),
-                                format!(
-                                    "cannot store a {} value through a raw pointer",
-                                    other.type_name()
-                                ),
-                            ))
+                Dst::Deref { place, desc, span } => {
+                    match place {
+                        eval::DerefPlace::Box(table) => {
+                            let _ = desc;
+                            let stored = v.base_value().clone();
+                            crate::builtins::box_set_table(&table, stored);
                         }
-                    };
-                    self.unsafe_mem.insert(addr, value);
+                        eval::DerefPlace::Address(addr) => {
+                            if self.unsafe_depth == 0 {
+                                return Err(LusaError::new(
+                                    crate::error::E_PTR_DEREF,
+                                    Some(span),
+                                    "raw pointer dereference requires an `unsafe` block",
+                                )
+                                .note(
+                                    format!("wrap the write to `{desc}` in `unsafe do ... end`"),
+                                    None,
+                                ));
+                            }
+                            let value = match v.base_value() {
+                                Value::Number(n) => *n,
+                                other => {
+                                    return Err(LusaError::new(
+                                        crate::error::E_RUNTIME,
+                                        Some(span),
+                                        format!(
+                                            "cannot store a {} value through a raw pointer",
+                                            other.type_name()
+                                        ),
+                                    ))
+                                }
+                            };
+                            self.unsafe_mem.insert(addr, value);
+                        }
+                    }
                 }
             }
         }

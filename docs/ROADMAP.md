@@ -563,6 +563,71 @@ registry.
 - Section names are ASCII-only and never escaped; the validation exists to
   keep the emitted C string literal and attribute well-formed.
 
+## Module 20 - Heap allocator and dynamic collections (shipped in v1.6.0)
+
+### 20.1 The global allocator contract
+
+- `#[global_allocator]` marks one allocator and/or one deallocator function.
+  The allocator signature is `(size: u32, align: u32): *mut u32`; the
+  deallocator signature is `(ptr: *mut u32, size: u32, align: u32): void`.
+- Hosted programs without a user allocator dispatch to `malloc`/`free`.
+  `#[no_std]` programs without one use a static 64 KiB `LusaHeapArena` bump
+  allocator with a no-op deallocator, so collections work without libc.
+- Allocator dispatch is emitted after the function prototypes, so a custom
+  allocator may call other user functions (for example a bump arena helper).
+- Duplicate allocators/deallocators, a wrong signature, a method receiver, or
+  combining `#[global_allocator]` with `#[entry]` is `E0325`.
+
+### 20.2 `Vec<T>`
+
+- `Vec<T>` lowers to `LusaVec { void *data; u32 len; u32 capacity; }` with
+  per-element-type push/pop helpers and a deep drop helper.
+- Capacity starts at 0, grows from 4, and doubles as needed. `reserve(n)`
+  grows to at least `n`; `clear()` drops elements but keeps the allocation.
+- Methods: `push`, `pop`, `len`, `capacity`, `is_empty`, `reserve`, `clear`.
+  Indexing (`v[i]`) and index assignment are 0-based and bounds-checked.
+- Elements of `string`, struct, and nested collection types are owned and
+  release through the generated `lusa_drop_vec_<tag>` helper.
+- `Vec<T>` cannot yet be passed or returned by value; that boundary is
+  `E0312` with a raw-pointer hint.
+- The interpreter and bytecode VM simulate a vector as a 0-based table with
+  the same method fallbacks; fields with the same names shadow the fallback.
+  Capacity is tracked out of band so `pop`/`clear` match native behavior.
+
+### 20.3 `Box<T>`
+
+- Native `Box<T>` lowers to `T *` and allocates through `lusa_heap_alloc`.
+- Implicit initialization (`local b: Box<i32> = 5`) and explicit
+  `Box(value)` both allocate; `nil` clears the box without allocating.
+- `*b` reads and `*b = value` writes the pointee without the raw-pointer
+  `unsafe` gate, because the box owns it.
+- Boxed strings and structs release through `lusa_drop_box_<tag>`.
+- The dynamic engines use a tagged table (marker `\u{1}lusa_box`) so implicit
+  annotation wrapping, explicit `Box(...)`, and `MakeBox` are idempotent;
+  numeric raw pointers still require `unsafe`.
+
+**Acceptance criteria**
+
+- `tests/module20.rs` covers vector growth/capacity/pop/clear/reserve,
+  `Box<T>` dereference and writes, `Vec<string>`/`Box<string>` RAII, custom
+  allocator dispatch, freestanding arena emission, allocator diagnostics, and
+  native + interpreter + VM parity.
+- `examples/dynamic_heap.lusa` runs in `run`, `--vm`, and `--native`.
+- Hosted native builds use `malloc`/`free` by default and freestanding builds
+  emit no libc includes, `malloc`, or `free`.
+- The full suite passes on Windows, Linux, and macOS.
+
+**Risks**
+
+- `Vec<T>` remains a value-type restriction: no by-value parameter/return
+  boundary yet, and no growth-failure recovery beyond process abort.
+- The freestanding arena is a fixed 64 KiB bump allocator with no reuse; it is
+  intended for firmware-scale programs, not general allocation workloads.
+- MSVC accepts the generated helpers but GCC/Clang remain the reference
+  compilers for section placement and inline assembly.
+- The dynamic simulations are behavioral, not byte-for-byte: capacity is
+  tracked out of band and raw pointer dereferences remain sandboxed.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -592,6 +657,7 @@ registry.
 | v1.3.0 | Volatile MMIO and struct representation (shipped) | typed volatile lowering, scalar-element gate, packed/align portability macros, three-engine parity |
 | v1.4.0 | Inline assembly and hardware controls (shipped) | `asm!` parsing in both front ends, GNU volatile lowering, strict `unsafe` gate, three-engine parity |
 | v1.5.0 | Custom entries, `#[no_std]`, and linker sections (shipped) | freestanding preamble, entry-wrapper ordering, section lowering and promotion, `E0101`/`E0325` diagnostics, three-engine parity, native builds |
+| v1.6.0 | Heap allocator, `Vec<T>`, and `Box<T>` (shipped) | allocator dispatch and validation, freestanding bump arena, geometric vector growth, Box deref safety, owned-element RAII, three-engine parity, native builds |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

@@ -63,13 +63,13 @@ Download `lusa-setup.zip` or the platform tarball.
 
 ## Current release
 
-The v1.5.0 body is [`.github/release-notes/v1.5.0.md`](../.github/release-notes/v1.5.0.md).
-It follows this structure and documents `#[entry]` startup symbols,
-freestanding `#[no_std]` translation units, `#[link_section]` placement,
-promoted top-level locals, and the `E0101`/`E0325` diagnostics.
+The v1.6.0 body is [`.github/release-notes/v1.6.0.md`](../.github/release-notes/v1.6.0.md).
+It follows this structure and documents the `#[global_allocator]` contract,
+the hosted/`#[no_std]` heap defaults, `Vec<T>` growth and methods, `Box<T>`
+owned pointers, RAII drops, and the `E0312`/`E0325` diagnostics.
 
-The previous v1.4.0 body remains at
-[`.github/release-notes/v1.4.0.md`](../.github/release-notes/v1.4.0.md).
+The previous v1.5.0 body remains at
+[`.github/release-notes/v1.5.0.md`](../.github/release-notes/v1.5.0.md).
 
 Every verified release must also publish a GitHub Release (with the annotated
 tag and curated notes), not only push the commit and tag to `origin/main`.

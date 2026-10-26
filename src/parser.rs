@@ -46,6 +46,7 @@ struct Attributes {
     align: Option<u32>,
     no_std: bool,
     entry: bool,
+    global_allocator: bool,
     link_section: Option<String>,
 }
 
@@ -438,6 +439,16 @@ impl Parser {
             self.expect(TK::Gt, "`>` to close the table type")?;
             return Ok(format!("table<{inner}>"));
         }
+        if matches!(name.as_str(), "Vec" | "vec" | "Box" | "box") && self.eat(TK::Lt) {
+            let inner = self.parse_type_annotation()?;
+            self.expect(TK::Gt, "`>` to close the generic type")?;
+            let tag = if matches!(name.as_str(), "Vec" | "vec") {
+                "vec"
+            } else {
+                "box"
+            };
+            return Ok(format!("{tag}<{inner}>"));
+        }
         Ok(name)
     }
 
@@ -473,9 +484,10 @@ impl Parser {
     /// Parses zero or more `#[...]` attributes.
     ///
     /// Supported attributes are `#[packed]`, `#[repr(align(N))]`,
-    /// `#[no_std]`, `#[entry]`, and `#[link_section = "..."]`.  The values
-    /// are validated here, before the AST reaches either backend, so the
-    /// dynamic engines and the C emitter agree on what is legal.
+    /// `#[no_std]`, `#[entry]`, `#[global_allocator]`, and
+    /// `#[link_section = "..."]`.  The values are validated here, before the
+    /// AST reaches either backend, so the dynamic engines and the C emitter
+    /// agree on what is legal.
     fn parse_attributes(&mut self) -> LResult<Attributes> {
         const MAX_ALIGN: u32 = 4096;
         let mut attrs = Attributes::default();
@@ -517,6 +529,16 @@ impl Parser {
                         ));
                     }
                     attrs.entry = true;
+                }
+                "global_allocator" => {
+                    if attrs.global_allocator {
+                        return Err(LusaError::new(
+                            E_PARSE,
+                            Some(attr_span),
+                            "duplicate `#[global_allocator]` attribute",
+                        ));
+                    }
+                    attrs.global_allocator = true;
                 }
                 "link_section" => {
                     if attrs.link_section.is_some() {
@@ -632,7 +654,8 @@ impl Parser {
                     )
                     .help(
                         "supported attributes are `#[packed]`, `#[repr(align(N))]`, \
-                         `#[no_std]`, `#[entry]`, and `#[link_section = \"...\"]`",
+                         `#[no_std]`, `#[entry]`, `#[global_allocator]`, and \
+                         `#[link_section = \"...\"]`",
                     ));
                 }
             }
@@ -656,6 +679,7 @@ impl Parser {
             if attrs.packed
                 || attrs.align.is_some()
                 || attrs.entry
+                || attrs.global_allocator
                 || attrs.link_section.is_some()
             {
                 return Err(LusaError::new(
@@ -669,11 +693,11 @@ impl Parser {
         }
 
         if self.at(TK::Struct) {
-            if attrs.entry || attrs.link_section.is_some() {
+            if attrs.entry || attrs.link_section.is_some() || attrs.global_allocator {
                 return Err(LusaError::new(
                     E_PARSE,
                     Some(start),
-                    "`#[entry]` and `#[link_section]` are only supported on functions or globals",
+                    "`#[entry]` and `#[link_section]` are only supported on functions or globals; `#[global_allocator]` is only supported on functions",
                 ));
             }
             return self.parse_struct_st(attrs.packed, attrs.align);
@@ -688,30 +712,39 @@ impl Parser {
                 ));
             }
             let mut st = self.parse_func_st()?;
-            if let StKind::FuncSt { entry, link_section, .. } = &mut st.kind {
+            if let StKind::FuncSt {
+                entry,
+                global_allocator,
+                link_section,
+                ..
+            } = &mut st.kind
+            {
                 *entry = attrs.entry;
+                *global_allocator = attrs.global_allocator;
                 *link_section = attrs.link_section;
             }
             return Ok(st);
         }
 
         if self.at(TK::Local) {
-            if attrs.packed || attrs.align.is_some() || attrs.entry {
+            if attrs.packed || attrs.align.is_some() || attrs.entry || attrs.global_allocator
+            {
                 return Err(LusaError::new(
                     E_PARSE,
                     Some(start),
-                    "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate a local",
+                    "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate a local; `#[global_allocator]` is only supported on functions",
                 ));
             }
             return self.parse_local_st(attrs.link_section);
         }
 
         if matches!(self.peek().kind, TK::Name(_) | TK::Star | TK::StarLine) {
-            if attrs.packed || attrs.align.is_some() || attrs.entry {
+            if attrs.packed || attrs.align.is_some() || attrs.entry || attrs.global_allocator
+            {
                 return Err(LusaError::new(
                     E_PARSE,
                     Some(start),
-                    "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate an assignment",
+                    "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate an assignment; `#[global_allocator]` is only supported on functions",
                 ));
             }
             let mut st = self.parse_assign_or_expr()?;
@@ -1074,7 +1107,7 @@ impl Parser {
         }
         func.span_body = merge(kw.span, func.span_body);
         Ok(St {
-            kind: StKind::FuncSt { target, func, entry: false, link_section: None },
+            kind: StKind::FuncSt { target, func, entry: false, global_allocator: false, link_section: None },
             span: kw.span,
         })
     }

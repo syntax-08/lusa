@@ -1,0 +1,46 @@
+-- Module 20 example: growable vectors and owned boxes.
+--
+-- Runs in the interpreter, bytecode VM, and C11 backend:
+--   lusalang run examples/dynamic_heap.lusa
+--   lusalang run examples/dynamic_heap.lusa --vm
+--   lusalang run examples/dynamic_heap.lusa --native
+--   lusalang build examples/dynamic_heap.lusa
+
+struct TaskList
+    title: string,
+    pending: Vec<i32>,
+    owner: Box<string>
+end
+
+local tasks: TaskList
+tasks.title = "release"
+tasks.pending:push(100)
+tasks.pending:push(200)
+tasks.pending:push(300)
+tasks.owner = Box("core team")
+
+print(tasks.title, *tasks.owner, tasks.pending:len(), tasks.pending[1])
+
+-- Vectors grow geometrically; capacity survives pop and clear.
+local values: Vec<i32> = [4, 8, 15]
+values:push(16)
+values:push(23)
+print(values:len(), values:capacity(), values:is_empty())
+print(values[0], values:pop(), values:len())
+values:reserve(32)
+print(values:capacity())
+
+-- Owned strings are dropped by the vector's RAII helper.
+local names: Vec<string> = ["alpha", "beta"]
+names:push("gamma")
+print(names:len(), names[2])
+names:clear()
+print(names:len(), names:is_empty())
+
+-- Boxes behave like owned pointers: read and write through `*`.
+local answer: Box<i32> = 41
+*answer = *answer + 1
+print(*answer)
+
+local message = Box("heap allocation is automatic")
+print(*message)

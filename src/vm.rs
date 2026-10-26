@@ -1080,6 +1080,12 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             interp.vm.last_ret = 1;
             StepOutcome::Continue
         }
+        Instr::MakeBox => {
+            let v = pop1(interp);
+            interp.vm.stack.push(crate::builtins::box_value(v));
+            interp.vm.last_ret = 1;
+            StepOutcome::Continue
+        }
         Instr::BorrowErr => {
             return Err(err(
                 E_RUNTIME,
@@ -1670,6 +1676,32 @@ fn call_method(
         .get(obj_pos)
         .cloned()
         .unwrap_or(Value::Nil);
+    // Dynamic `Vec<T>` fallbacks: a table with no real field of that name
+    // behaves like a growable 0-based vector.
+    if let (Value::Table(table), Value::Str(name)) = (obj_value.base_value(), &key) {
+        if table.get(&key).is_none() && Interp::is_vec_method(name) {
+            if n_takes != 0 {
+                finalize_args(interp, false, n_takes)?;
+            }
+            let start = obj_pos.min(interp.vm.stack.len());
+            let mut values: Vec<Value> = interp.vm.stack.drain(start..).collect();
+            if !values.is_empty() {
+                values.remove(0); // receiver
+            }
+            let results =
+                interp.vec_method_call(&Rc::clone(table), name, values, span)?;
+            let n = results.len();
+            interp.vm.stack.reserve(n);
+            for value in results {
+                interp.vm.stack.push(value);
+            }
+            interp.vm.last_ret = n;
+            if want_one && n > 1 {
+                truncate_results_to_one(interp, n);
+            }
+            return Ok(StepOutcome::Continue);
+        }
+    }
     // Strings expose the `string` library as pseudo-methods, matching the
     // tree-walking interpreter (`s:match(pat)` == `string.match(s, pat)`).
     let f = match obj_value.base_value() {

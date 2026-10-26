@@ -64,9 +64,9 @@ pub fn key_eq_loose(a: &Value, b: &Value) -> bool {
 
 // ===== helpers =====
 
-fn as_table(v: &Value) -> Option<&TableObj> {
+fn as_table(v: &Value) -> Option<Rc<TableObj>> {
     match v.base_value() {
-        Value::Table(t) => Some(t.as_ref()),
+        Value::Table(t) => Some(Rc::clone(t)),
         _ => None,
     }
 }
@@ -243,7 +243,12 @@ pub fn eval_expr(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr
                 }
                 seen.push(field.name.as_str());
                 let label = format!("field `{}` of `{name}`", field.name);
-                let value = eval_take_single(interp, frame, &field.value, &label, field.span)?;
+                let mut value = eval_take_single(interp, frame, &field.value, &label, field.span)?;
+                if let Some((_, ty)) = def.fields.iter().find(|(fname, _)| fname == &field.name) {
+                    if box_annotation(ty).is_some() && !value.is_nil() {
+                        value = crate::builtins::box_value(value);
+                    }
+                }
                 let key = Value::Str(Arc::from(field.name.as_str()));
                 tbl.set(key, value)?;
             }
@@ -365,6 +370,12 @@ fn eval_un(interp: &mut Interp, op: UnOp, v: Value, span: Span) -> LResult<Value
             )),
         },
         UnOp::Deref => {
+            // Boxes are owned pointers: dereferencing one is always safe and
+            // yields the pointee directly.  Numeric addresses keep the raw
+            // pointer sandbox rules below.
+            if let Some(inner) = crate::builtins::box_inner(&v) {
+                return Ok(inner);
+            }
             if interp.unsafe_depth == 0 {
                 return Err(LusaError::new(
                     crate::error::E_PTR_DEREF,
@@ -392,14 +403,25 @@ fn eval_un(interp: &mut Interp, op: UnOp, v: Value, span: Span) -> LResult<Value
     }
 }
 
-/// Evaluates a pointer expression to a simulated address for `*ptr = value`,
-/// enforcing the `unsafe` rule on the write itself.
-pub fn eval_deref_addr(
+/// A resolved `*place` assignment target: either a boxed pointee or a
+/// simulated raw address.
+pub enum DerefPlace {
+    Address(u64),
+    Box(Rc<TableObj>),
+}
+
+/// Resolves `*ptr = value` / `*box = value`, enforcing the `unsafe` rule only
+/// for raw addresses.
+pub fn eval_deref_place(
     interp: &mut Interp,
     frame: &mut crate::interp::Frame,
     e: &Expr,
     span: Span,
-) -> LResult<u64> {
+) -> LResult<DerefPlace> {
+    let v = eval_expr(interp, frame, e)?;
+    if let Some(table) = crate::builtins::box_table(&v) {
+        return Ok(DerefPlace::Box(table));
+    }
     if interp.unsafe_depth == 0 {
         return Err(LusaError::new(
             crate::error::E_PTR_DEREF,
@@ -408,9 +430,8 @@ pub fn eval_deref_addr(
         )
         .note("wrap the write in `unsafe do ... end`", None));
     }
-    let v = eval_expr(interp, frame, e)?;
     match v.base_value() {
-        Value::Number(n) if !n.is_nan() && *n >= 0.0 => Ok(*n as u64),
+        Value::Number(n) if !n.is_nan() && *n >= 0.0 => Ok(DerefPlace::Address(*n as u64)),
         other => Err(LusaError::new(
             crate::error::E_RUNTIME,
             Some(span),
@@ -661,8 +682,26 @@ pub fn eval_method(
         }
         _ => {
             let t = as_table(&o).ok_or_else(|| index_err(&o, span))?;
-            t.get(&key).ok_or_else(|| {
-                LusaError::new(
+            if let Some(method) = t.get(&key) {
+                method
+            } else if Interp::is_vec_method(name) {
+                // `Vec<T>` is a 0-based table in the dynamic engines; the
+                // vector surface is a fallback when no real field shadows it.
+                let mut argv = Vec::new();
+                let n = args.len();
+                for (i, e) in args.iter().enumerate() {
+                    let is_last = i + 1 == n;
+                    if is_last && is_expansion(e) {
+                        argv.extend(eval_expand(interp, frame, e)?);
+                    } else {
+                        let label = format!("(argument {} of :{})", i + 1, name);
+                        let v = eval_take_single(interp, frame, e, &label, e.span)?;
+                        argv.push(v);
+                    }
+                }
+                return interp.vec_method_call(&t, name, argv, span);
+            } else {
+                return Err(LusaError::new(
                     E_CALL,
                     Some(span),
                     format!(
@@ -670,8 +709,8 @@ pub fn eval_method(
                         name,
                         o.fmt_value()
                     ),
-                )
-            })?
+                ));
+            }
         }
     };
 
@@ -784,7 +823,7 @@ fn take_table_slot(
     span: Span,
 ) -> LResult<Value> {
     let t = as_table(&obj).ok_or_else(|| index_err(&obj, span))?;
-    interp.take_field_from_table(t, key, src_desc, label, span)
+    interp.take_field_from_table(&t, key, src_desc, label, span)
 }
 
 pub fn eval_discard(

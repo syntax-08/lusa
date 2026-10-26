@@ -436,6 +436,19 @@ parse_type = function()
     end
     local name = peek_value()
     advance()
+    -- Module 20: `Vec<T>` and `Box<T>` are the two heap-backed generic
+    -- types.  The parser lowers them to the same `vec<T>` / `box<T>`
+    -- spelling the semantic checker canonicalises.
+    if (name == "Vec" or name == "vec" or name == "Box" or name == "box")
+        and at_value("<") then
+        advance()
+        local element = parse_type()
+        expect_value(">", "`>` to close the generic type")
+        if name == "Vec" or name == "vec" then
+            return "vec<" .. element .. ">"
+        end
+        return "box<" .. element .. ">"
+    end
     return name
 end
 
@@ -483,7 +496,7 @@ parse_local = function(link_section)
     }
 end
 
-parse_function = function(entry, link_section)
+parse_function = function(entry, link_section, global_allocator)
     local line = peek_line()
     local column = peek_column()
     advance() -- function
@@ -538,6 +551,7 @@ parse_function = function(entry, link_section)
         return_type = return_type,
         body = body,
         entry = entry == true,
+        global_allocator = global_allocator == true,
         link_section = link_section,
         line = line,
         column = column
@@ -687,9 +701,9 @@ parse_unsafe = function()
     }
 end
 
--- Parses `#[packed]`, `#[repr(align(N))]`, `#[no_std]`, `#[entry]`, and
--- `#[link_section = "..."]` prefixes.  Returns a table of attribute values;
--- `align` and `link_section` are nil when absent.
+-- Parses `#[packed]`, `#[repr(align(N))]`, `#[no_std]`, `#[entry]`,
+-- `#[global_allocator]`, and `#[link_section = "..."]` prefixes.  Returns a
+-- table of attribute values; `align` and `link_section` are nil when absent.
 local function section_name_char(code)
     if code >= 48 and code <= 57 then return true end    -- 0-9
     if code >= 65 and code <= 90 then return true end    -- A-Z
@@ -724,6 +738,7 @@ local function parse_attributes()
         align = nil,
         no_std = false,
         entry = false,
+        global_allocator = false,
         link_section = nil
     }
     local stop_after = false
@@ -751,6 +766,12 @@ local function parse_attributes()
                 fail_at(attr_line, attr_column, "duplicate `#[entry]` attribute")
             end
             attrs.entry = true
+        elseif attr == "global_allocator" then
+            if attrs.global_allocator then
+                fail_at(attr_line, attr_column,
+                    "duplicate `#[global_allocator]` attribute")
+            end
+            attrs.global_allocator = true
         elseif attr == "link_section" then
             if attrs.link_section ~= nil then
                 fail_at(attr_line, attr_column,
@@ -819,7 +840,8 @@ local function parse_attributes()
             fail_at(attr_line, attr_column,
                 "unsupported attribute `#" .. attr
                 .. "`; supported attributes are `#[packed]`, `#[repr(align(N))]`, "
-                .. '`#[no_std]`, `#[entry]`, and `#[link_section = "..."]`')
+                .. '`#[no_std]`, `#[entry]`, `#[global_allocator]`, and '
+                .. '`#[link_section = "..."]`')
         end
         expect_value("]", "`]` to close the attribute")
         if stop_after then
@@ -1150,7 +1172,7 @@ parse_attributed_stmt = function()
 
     if attrs.no_std then
         if attrs.packed or attrs.align ~= nil or attrs.entry
-            or attrs.link_section ~= nil then
+            or attrs.global_allocator or attrs.link_section ~= nil then
             fail_at(attr_line, attr_column,
                 "`#[no_std]` must be written on its own")
         end
@@ -1162,9 +1184,9 @@ parse_attributed_stmt = function()
     end
 
     if at_keyword("struct") then
-        if attrs.entry or attrs.link_section ~= nil then
+        if attrs.entry or attrs.link_section ~= nil or attrs.global_allocator then
             fail_at(attr_line, attr_column,
-                "`#[entry]` and `#[link_section]` are only supported on functions or globals")
+                "`#[entry]` and `#[link_section]` are only supported on functions or globals; `#[global_allocator]` is only supported on functions")
         end
         return parse_struct(attrs.packed, attrs.align)
     end
@@ -1174,13 +1196,15 @@ parse_attributed_stmt = function()
             fail_at(attr_line, attr_column,
                 "`#[packed]` and `#[repr(align(N))]` are only supported on structs")
         end
-        return parse_function(attrs.entry, attrs.link_section)
+        return parse_function(attrs.entry, attrs.link_section,
+            attrs.global_allocator)
     end
 
     if at_keyword("local") then
-        if attrs.packed or attrs.align ~= nil or attrs.entry then
+        if attrs.packed or attrs.align ~= nil or attrs.entry
+            or attrs.global_allocator then
             fail_at(attr_line, attr_column,
-                "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate a local")
+                "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate a local; `#[global_allocator]` is only supported on functions")
         end
         return parse_local(attrs.link_section)
     end
@@ -1189,9 +1213,10 @@ parse_attributed_stmt = function()
     local value = peek_value()
     if kind == "name"
         or (kind == "operator" and (value == "*" or value == "&")) then
-        if attrs.packed or attrs.align ~= nil or attrs.entry then
+        if attrs.packed or attrs.align ~= nil or attrs.entry
+            or attrs.global_allocator then
             fail_at(attr_line, attr_column,
-                "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate an assignment")
+                "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate an assignment; `#[global_allocator]` is only supported on functions")
         end
         return parse_assign_or_call(attrs.link_section)
     end

@@ -344,6 +344,7 @@ opt_stmt = function(stmt)
             return_type = stmt.return_type,
             body = opt_block(stmt.body),
             entry = stmt.entry,
+            global_allocator = stmt.global_allocator,
             link_section = stmt.link_section,
             line = line, column = column
         }
@@ -507,12 +508,70 @@ local function table_element(type_name)
     return nil
 end
 
+-- ---- heap collections (module 20) ----------------------------------------
+
+-- `Vec<T>` and `Box<T>` are lowered to the canonical `vec<T>` / `box<T>`
+-- spellings by both parsers.  Their element types are registered while the
+-- checker canonicalises annotations so the C emitter can generate one helper
+-- family per concrete element type.
+local function vec_element(type_name)
+    if type_name == nil then
+        return nil
+    end
+    if string.sub(type_name, 1, 4) == "vec<"
+        and string.sub(type_name, #type_name, #type_name) == ">" then
+        return string.sub(type_name, 5, #type_name - 1)
+    end
+    return nil
+end
+
+local function box_element(type_name)
+    if type_name == nil then
+        return nil
+    end
+    if string.sub(type_name, 1, 4) == "box<"
+        and string.sub(type_name, #type_name, #type_name) == ">" then
+        return string.sub(type_name, 5, #type_name - 1)
+    end
+    return nil
+end
+
+local function is_vec_type(type_name)
+    return vec_element(type_name) ~= nil
+end
+
+local function is_box_type(type_name)
+    return box_element(type_name) ~= nil
+end
+
+
 -- ---- raw pointer and struct types (module 11) ----------------------------
 
 -- Struct layouts are populated while checking top-level declarations.  The
 -- table must exist before `is_struct_type` is defined so every helper closes
 -- over the same local.
 local check_structs = {}
+
+-- Element types that need generated Vec/Box helper functions.  The arrays
+-- preserve first-seen order so generated C stays deterministic.
+local check_vec_order = {}
+local check_vec_seen = {}
+local check_box_order = {}
+local check_box_seen = {}
+
+local function register_collection_element(kind, element)
+    if kind == "vec" then
+        if check_vec_seen[element] ~= true then
+            check_vec_seen[element] = true
+            check_vec_order[#check_vec_order + 1] = element
+        end
+        return
+    end
+    if check_box_seen[element] ~= true then
+        check_box_seen[element] = true
+        check_box_order[#check_box_order + 1] = element
+    end
+end
 
 local function pointer_element(type_name)
     if type_name == nil then
@@ -603,6 +662,34 @@ local function canonical_type(name, line, column)
         end
         return "table<" .. canonical .. ">"
     end
+    local heap_element = vec_element(name)
+    if heap_element ~= nil then
+        local canonical = canonical_type(heap_element, line, column)
+        if canonical == "void" or canonical == "nil" or canonical == "auto" then
+            type_fail("E0301", line, column,
+                "invalid Vec element type `" .. tostring(canonical) .. "`")
+        end
+        if is_array_type(canonical) then
+            type_fail("E0301", line, column,
+                "fixed arrays cannot be Vec elements; store a pointer or use a struct")
+        end
+        register_collection_element("vec", canonical)
+        return "vec<" .. canonical .. ">"
+    end
+    local boxed = box_element(name)
+    if boxed ~= nil then
+        local canonical = canonical_type(boxed, line, column)
+        if canonical == "void" or canonical == "nil" or canonical == "auto" then
+            type_fail("E0301", line, column,
+                "invalid Box element type `" .. tostring(canonical) .. "`")
+        end
+        if is_array_type(canonical) then
+            type_fail("E0301", line, column,
+                "fixed arrays cannot be boxed; box a pointer or a struct instead")
+        end
+        register_collection_element("box", canonical)
+        return "box<" .. canonical .. ">"
+    end
     if is_pointer_type(name) then
         local element = pointer_element(name)
         local canonical = canonical_type(element, line, column)
@@ -653,7 +740,9 @@ local function struct_owns_heap(type_name)
                     end
                     local field_type = field_slot.type
                     if field_type == "string" or field_type == "table"
-                        or table_element(field_type) ~= nil then
+                        or table_element(field_type) ~= nil
+                        or vec_element(field_type) ~= nil
+                        or box_element(field_type) ~= nil then
                         return true
                     end
                     if check_structs[field_type] ~= nil
@@ -671,7 +760,9 @@ end
 local function is_heap_type(type_name)
     if type_name == "string" or type_name == "table"
         or type_name == "coroutine" or type_name == "gmatch"
-        or table_element(type_name) ~= nil then
+        or table_element(type_name) ~= nil
+        or vec_element(type_name) ~= nil
+        or box_element(type_name) ~= nil then
         return true
     end
     local array_element = array_info(type_name)
@@ -857,6 +948,10 @@ local check_current_function = nil
 local check_no_std = false
 local check_entry_key = nil
 local check_entry_name = nil
+local check_alloc_key = nil
+local check_alloc_name = nil
+local check_dealloc_key = nil
+local check_dealloc_name = nil
 
 -- Section names are validated by both parsers before they reach the emitter;
 -- repeat the check here so `Compiler.emit_c` also rejects hand-built ASTs.
@@ -1688,6 +1783,35 @@ local function check_call(expr)
     local args = expr.args
     local i = 1
 
+    if name == "Box" then
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`Box` takes exactly one value, found " .. tostring(#args))
+        end
+        local checked_value, value_type = check_expr(args[1])
+        if value_type == "void" or value_type == "nil"
+            or value_type == "auto" then
+            type_fail("E0308", checked_value.line, checked_value.column,
+                "cannot box a `" .. tostring(value_type) .. "` value")
+        end
+        if is_array_type(value_type) then
+            type_fail("E0301", checked_value.line, checked_value.column,
+                "fixed arrays cannot be boxed; box a pointer or a struct instead")
+        end
+        local box_type = canonical_type("box<" .. value_type .. ">",
+            expr.line, expr.column)
+        if checked_value.tag ~= "Clone" and checked_value.tag ~= "Borrow"
+            and checked_value.tag ~= "Move" then
+            consume_expr(clone checked_value, checked_value.line,
+                checked_value.column)
+        end
+        expr.builtin = "box_new"
+        expr.ctype = box_type
+        expr.own = true
+        expr.args = { checked_value }
+        return expr, box_type
+    end
+
     if name == "unsafe_ptr_cast" or name == "unsafe_read_mem"
         or name == "unsafe_write_mem"
         or name == "unsafe_alloc"
@@ -1960,6 +2084,83 @@ local function check_call(expr)
     return expr, signature.ret
 end
 
+local function check_vec_method(expr, receiver, vec_type)
+    local element = vec_element(vec_type)
+    local name = expr.name
+    local args = expr.args or {}
+    local method_args = {}
+    local result = nil
+    local own = false
+    if name == "push" then
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`Vec:push` takes one value, found " .. tostring(#args))
+        end
+        local checked, actual = check_expr(args[1])
+        if not assignable(element, actual, clone checked) then
+            check_mismatch(checked.line, checked.column,
+                "Vec:push value", element, actual)
+        end
+        checked = coerce_literal(checked, element)
+        if checked.tag ~= "Clone" and checked.tag ~= "Borrow"
+            and checked.tag ~= "Move" then
+            consume_expr(clone checked, checked.line, checked.column)
+        end
+        method_args[1] = checked
+        result = "void"
+    elseif name == "pop" then
+        if #args ~= 0 then
+            type_fail("E0311", expr.line, expr.column,
+                "`Vec:pop` takes no arguments, found " .. tostring(#args))
+        end
+        result = element
+        own = true
+    elseif name == "len" or name == "capacity" then
+        if #args ~= 0 then
+            type_fail("E0311", expr.line, expr.column,
+                "`Vec:" .. name .. "` takes no arguments, found "
+                .. tostring(#args))
+        end
+        result = "i32"
+    elseif name == "is_empty" then
+        if #args ~= 0 then
+            type_fail("E0311", expr.line, expr.column,
+                "`Vec:is_empty` takes no arguments, found "
+                .. tostring(#args))
+        end
+        result = "bool"
+    elseif name == "reserve" then
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`Vec:reserve` takes one capacity, found "
+                .. tostring(#args))
+        end
+        local checked, actual = check_expr(args[1])
+        if not is_integer_type(actual) then
+            check_mismatch(checked.line, checked.column,
+                "Vec:reserve capacity", "integer", actual)
+        end
+        method_args[1] = checked
+        result = "void"
+    elseif name == "clear" then
+        if #args ~= 0 then
+            type_fail("E0311", expr.line, expr.column,
+                "`Vec:clear` takes no arguments, found " .. tostring(#args))
+        end
+        result = "void"
+    else
+        type_fail("E0318", expr.line, expr.column,
+            "unknown Vec method `" .. tostring(name)
+            .. "`; use push, pop, len, capacity, is_empty, reserve, or clear")
+    end
+    expr.obj = receiver
+    expr.args = method_args
+    expr.ctype = result
+    expr.own = own
+    expr.vec_method = name
+    return expr, result
+end
+
 check_method_call = function(expr)
     local checked_obj, obj_type = check_expr(expr.obj)
     local receiver_tag = checked_obj.tag
@@ -1974,6 +2175,9 @@ check_method_call = function(expr)
         local method_args = clone expr.args
         return check_string_operation(expr, checked_obj, obj_type,
             method_args, method_name, "expression")
+    end
+    if is_vec_type(obj_type) then
+        return check_vec_method(expr, checked_obj, obj_type)
     end
     if not is_table_type(obj_type) then
         check_mismatch(expr.line, expr.column, "method receiver",
@@ -2029,6 +2233,69 @@ check_method_call = function(expr)
     expr.fn_key = key
     expr.args = args
     return expr, signature.ret
+end
+
+-- `Vec<T>` literals reuse the array-literal syntax.  The target annotation
+-- supplies the element type, so `[]` is meaningful in a typed local even
+-- though a bare fixed-array literal cannot infer it.
+local function check_vec_literal(expr, vec_type)
+    local element = vec_element(vec_type)
+    if element == nil then
+        return nil
+    end
+    local items = expr.items or {}
+    local checked_items = {}
+    local i = 1
+    while i <= #items do
+        local checked, actual = check_expr(items[i])
+        if actual == "void" or actual == "nil" or actual == "auto" then
+            type_fail("E0308", checked.line, checked.column,
+                "Vec elements cannot have type `" .. tostring(actual) .. "`")
+        end
+        if not assignable(element, actual, clone checked) then
+            check_mismatch(checked.line, checked.column,
+                "Vec literal element", element, actual)
+        end
+        checked = coerce_literal(checked, element)
+        if checked.tag ~= "Clone" and checked.tag ~= "Borrow"
+            and checked.tag ~= "Move" then
+            consume_expr(clone checked, checked.line, checked.column)
+        end
+        checked_items[i] = checked
+        i = i + 1
+    end
+    expr.tag = "VecLit"
+    expr.items = checked_items
+    expr.ctype = vec_type
+    expr.own = true
+    return expr, vec_type
+end
+
+-- Implicit `Box<T>` construction: `local b: Box<i32> = 5`.  The checker wraps
+-- the source once the target is known, while `Box(value)` is handled by
+-- `check_call` as an explicit constructor.
+local function check_box_value(checked, actual, box_type, line, column)
+    local element = box_element(box_type)
+    if element == nil or actual == box_type then
+        return checked, actual
+    end
+    -- A Box is a pointer in the generated C, so `nil` clears it without
+    -- allocating an owned pointee.
+    if actual == "nil" then
+        return checked, box_type
+    end
+    if not assignable(element, actual, clone checked) then
+        check_mismatch(line, column, "boxed value", element, actual)
+    end
+    local wrapped = {
+        tag = "BoxNew",
+        value = checked,
+        ctype = box_type,
+        own = true,
+        line = line,
+        column = column
+    }
+    return wrapped, box_type
 end
 
 local function check_table(expr)
@@ -2124,7 +2391,19 @@ local function check_struct_lit(expr)
                 .. "` in struct literal")
         end
         seen[field.name] = true
-        local checked, actual = check_expr(field.value)
+        local checked = nil
+        local actual = nil
+        if is_vec_type(slot.type) and field.value.tag == "Array" then
+            checked, actual = check_vec_literal(field.value, slot.type)
+        else
+            checked, actual = check_expr(field.value)
+        end
+        if is_box_type(slot.type) then
+            local field_line = checked.line
+            local field_column = checked.column
+            checked, actual = check_box_value(checked, actual, slot.type,
+                field_line, field_column)
+        end
         if not assignable(slot.type, actual, clone checked) then
             check_mismatch(checked.line, checked.column,
                 "field `" .. field.name .. "` of `" .. expr.name .. "`",
@@ -2245,10 +2524,10 @@ check_expr = function(expr)
         end
         if op == "#" then
             if operand ~= "string" and table_element(operand) == nil
-                and not is_array_type(operand) then
+                and not is_array_type(operand) and not is_vec_type(operand) then
                 type_fail("E0308", line, column,
-                    "the length operator requires a string, table, or fixed array",
-                    "string | table | array<T,N>", operand)
+                    "the length operator requires a string, table, vector, or fixed array",
+                    "string | table | vec<T> | array<T,N>", operand)
             end
             result.ctype = "i32"
             return result, "i32"
@@ -2561,6 +2840,18 @@ check_expr = function(expr)
         if element == nil and table_type == "table" then
             element = table_elem_type
         end
+        local vec_type = vec_element(table_type)
+        if vec_type ~= nil then
+            if not is_integer_type(index_type) then
+                check_mismatch(line, column, "Vec index", "integer",
+                    index_type)
+            end
+            expr.ctype = vec_type
+            expr.elem_type = vec_type
+            expr.vec_access = true
+            expr.own = false
+            return expr, vec_type
+        end
         local array_element, array_length = array_info(table_type)
         if array_element ~= nil then
             if not is_integer_type(index_type) then
@@ -2629,8 +2920,16 @@ check_expr = function(expr)
         expr.value = checked_inner
         local element = pointer_element(inner_type)
         if element == nil then
-            check_mismatch(line, column, "pointer dereference",
-                "raw pointer", inner_type)
+            element = box_element(inner_type)
+            if element == nil then
+                check_mismatch(line, column, "pointer dereference",
+                    "raw pointer or Box<T>", inner_type)
+            end
+            expr.ctype = element
+            expr.deref = true
+            expr.box_deref = true
+            expr.own = false
+            return expr, element
         end
         if check_unsafe_depth == 0 then
             type_fail("E0321", line, column,
@@ -2943,7 +3242,11 @@ local function check_local(stmt)
         local actual = nil
         local checked = nil
         if value ~= nil then
-            checked, actual = check_expr(value)
+            if is_vec_type(declared) and value.tag == "Array" then
+                checked, actual = check_vec_literal(value, declared)
+            else
+                checked, actual = check_expr(value)
+            end
         end
 
         local final_type = declared
@@ -2958,6 +3261,12 @@ local function check_local(stmt)
                 final_type = actual
             end
         elseif actual ~= nil then
+            if is_box_type(final_type) then
+                local value_line = checked.line
+                local value_column = checked.column
+                checked, actual = check_box_value(checked, actual, final_type,
+                    value_line, value_column)
+            end
             if not assignable(final_type, actual, clone checked) then
                 check_mismatch(checked.line, checked.column,
                     "local `" .. names[i] .. "`", final_type, actual)
@@ -3088,37 +3397,59 @@ local function check_assign(stmt)
             target.value = checked_inner
             local element = pointer_element(inner_type)
             if element == nil then
-                check_mismatch(target.line, target.column,
-                    "pointer dereference assignment", "raw pointer", inner_type)
+                element = box_element(inner_type)
+                if element == nil then
+                    check_mismatch(target.line, target.column,
+                        "pointer dereference assignment", "raw pointer or Box<T>",
+                        inner_type)
+                end
+                expected = element
+                target.box_deref = true
+            else
+                if check_unsafe_depth == 0 then
+                    type_fail("E0321", target.line, target.column,
+                        "raw pointer dereference requires an `unsafe` block")
+                end
+                if not is_mut_pointer(inner_type) then
+                    type_fail("E0322", target.line, target.column,
+                        "cannot write through a `*const` pointer")
+                end
+                expected = element
+                target.deref_target = true
             end
-            if check_unsafe_depth == 0 then
-                type_fail("E0321", target.line, target.column,
-                    "raw pointer dereference requires an `unsafe` block")
-            end
-            if not is_mut_pointer(inner_type) then
-                type_fail("E0322", target.line, target.column,
-                    "cannot write through a `*const` pointer")
-            end
-            expected = element
-            target.deref_target = true
         elseif target.tag == "Index" then
             local checked_table, table_type = check_expr(target.table)
             local array_element = array_info(table_type)
             if array_element == nil then
-                type_fail("E0312", target.line, target.column,
-                    "indexed assignment supports fixed-size arrays only",
-                    "array<T,N>", table_type)
+                local vec_elem = vec_element(table_type)
+                if vec_elem ~= nil then
+                    local checked_index, index_type = check_expr(target.index)
+                    if not is_integer_type(index_type) then
+                        check_mismatch(target.line, target.column,
+                            "Vec index", "integer", index_type)
+                    end
+                    target.table = checked_table
+                    target.index = checked_index
+                    target.vec_access = true
+                    expected = vec_elem
+                    target.own = false
+                else
+                    type_fail("E0312", target.line, target.column,
+                        "indexed assignment supports fixed-size arrays and Vec<T> only",
+                        "array<T,N> | vec<T>", table_type)
+                end
+            else
+                local checked_index, index_type = check_expr(target.index)
+                if not is_integer_type(index_type) then
+                    check_mismatch(target.line, target.column, "array index",
+                        "integer", index_type)
+                end
+                target.table = checked_table
+                target.index = checked_index
+                target.array_access = true
+                expected = array_element
+                target.own = false
             end
-            local checked_index, index_type = check_expr(target.index)
-            if not is_integer_type(index_type) then
-                check_mismatch(target.line, target.column, "array index",
-                    "integer", index_type)
-            end
-            target.table = checked_table
-            target.index = checked_index
-            target.array_access = true
-            expected = array_element
-            target.own = false
         else
             local checked_table, table_type = check_expr(target.table)
             local table_schema = checked_table.schema
@@ -3170,7 +3501,17 @@ local function check_assign(stmt)
                 "array element assignment", expected)
         end
         if i <= #values then
-            checked, actual = check_expr(values[i])
+            if is_vec_type(expected) and values[i].tag == "Array" then
+                checked, actual = check_vec_literal(values[i], expected)
+            else
+                checked, actual = check_expr(values[i])
+            end
+            if is_box_type(expected) then
+                local value_line = checked.line
+                local value_column = checked.column
+                checked, actual = check_box_value(checked, actual, expected,
+                    value_line, value_column)
+            end
             if not assignable(expected, actual, clone checked) then
                 check_mismatch(target.line, target.column,
                     "assignment to `" .. tostring(target.name or target.field_name)
@@ -3285,11 +3626,12 @@ local function check_struct_decl(stmt)
             or field_type == "i128" or field_type == "f32"
             or field_type == "bool" or field_type == "string"
             or is_table_type(field_type) or is_array_type(field_type)
+            or is_vec_type(field_type) or is_box_type(field_type)
         if not valid and not is_pointer_type(field_type)
             and not is_struct_type(field_type) then
             type_fail("E0312", field.line, field.column,
                 "unsupported struct field type `" .. tostring(field_type)
-                .. "`; use a scalar, string, table, raw pointer, or a previously declared struct")
+                .. "`; use a scalar, string, table, Vec, Box, raw pointer, or a previously declared struct")
         end
         if layout[field.name] ~= nil then
             type_fail("E0302", field.line, field.column,
@@ -3379,6 +3721,10 @@ local function scan_functions(body)
                     type_fail("E0312", param.line, param.column,
                         "fixed arrays cannot be passed by value; use a raw pointer or index the array in the callee")
                 end
+                if is_vec_type(param_type) then
+                    type_fail("E0312", param.line, param.column,
+                        "`Vec<T>` cannot be passed by value yet; keep the vector in the caller or use a raw pointer")
+                end
                 params[#params + 1] = {
                     name = param.name,
                     type = param_type,
@@ -3401,6 +3747,10 @@ local function scan_functions(body)
                 type_fail("E0312", fline, fcolumn,
                     "fixed arrays cannot be returned by value; use a raw pointer")
             end
+            if is_vec_type(ret) then
+                type_fail("E0312", fline, fcolumn,
+                    "`Vec<T>` cannot be returned by value yet; return a raw pointer instead")
+            end
             local link_section = stmt.link_section
             if link_section ~= nil then
                 validate_link_section(link_section, fline, fcolumn)
@@ -3421,6 +3771,47 @@ local function scan_functions(body)
                 end
                 check_entry_key = key
                 check_entry_name = fname
+            end
+            if stmt.global_allocator == true then
+                if receiver ~= nil then
+                    type_fail("E0325", fline, fcolumn,
+                        "`#[global_allocator]` cannot annotate a method")
+                end
+                if stmt.entry == true then
+                    type_fail("E0325", fline, fcolumn,
+                        "`#[entry]` and `#[global_allocator]` cannot annotate the same function")
+                end
+                local is_alloc = #params == 2
+                    and params[1].type == "u32" and params[2].type == "u32"
+                    and ret == "*mut u32"
+                local is_dealloc = #params == 3
+                    and params[1].type == "*mut u32"
+                    and params[2].type == "u32" and params[3].type == "u32"
+                    and ret == "void"
+                if is_alloc then
+                    if check_alloc_key ~= nil then
+                        type_fail("E0325", fline, fcolumn,
+                            "duplicate global allocator (already defined by `"
+                            .. tostring(check_alloc_name) .. "`)")
+                    end
+                    check_alloc_key = key
+                    check_alloc_name = fname
+                    stmt.allocator_role = "alloc"
+                elseif is_dealloc then
+                    if check_dealloc_key ~= nil then
+                        type_fail("E0325", fline, fcolumn,
+                            "duplicate global deallocator (already defined by `"
+                            .. tostring(check_dealloc_name) .. "`)")
+                    end
+                    check_dealloc_key = key
+                    check_dealloc_name = fname
+                    stmt.allocator_role = "dealloc"
+                else
+                    type_fail("E0325", fline, fcolumn,
+                        "`#[global_allocator]` requires either "
+                        .. "`function alloc(size: u32, align: u32): *mut u32` or "
+                        .. "`function dealloc(ptr: *mut u32, size: u32, align: u32): void`")
+                end
             end
             local signature = {
                 name = fname,
@@ -3688,6 +4079,12 @@ check_stmt = function(stmt, top_level)
                 "function must return a value of type `" .. check_return_type .. "`")
         end
         local checked_value, actual = check_expr(stmt.values[1])
+        if is_box_type(check_return_type) then
+            local value_line = checked_value.line
+            local value_column = checked_value.column
+            checked_value, actual = check_box_value(checked_value, actual,
+                check_return_type, value_line, value_column)
+        end
         if not assignable(check_return_type, actual, clone checked_value) then
             check_mismatch(checked_value.line, checked_value.column,
                 "return value", check_return_type, actual)
@@ -3826,6 +4223,14 @@ local function check_program(ast)
     check_no_std = false
     check_entry_key = nil
     check_entry_name = nil
+    check_alloc_key = nil
+    check_alloc_name = nil
+    check_dealloc_key = nil
+    check_dealloc_name = nil
+    check_vec_order = {}
+    check_vec_seen = {}
+    check_box_order = {}
+    check_box_seen = {}
 
     ast.body = scan_structs(ast.body)
     check_no_std = program_no_std(clone ast.body)
@@ -3877,6 +4282,14 @@ local function check_program(ast)
     ast.entry_key = check_entry_key
     ast.entry_name = check_entry_name
     ast.has_entry = check_entry_key ~= nil
+    ast.global_alloc_key = check_alloc_key
+    ast.global_alloc_name = check_alloc_name
+    ast.global_dealloc_key = check_dealloc_key
+    ast.global_dealloc_name = check_dealloc_name
+    ast.has_global_allocator = check_alloc_key ~= nil
+    ast.has_global_deallocator = check_dealloc_key ~= nil
+    ast.vec_elements = check_vec_order
+    ast.box_elements = check_box_order
     return ast
 end
 
@@ -3960,6 +4373,13 @@ local function fresh(prefix)
     return prefix .. tostring(emit_temp)
 end
 
+-- Generated collection helpers are suffixed with a C-safe spelling of the
+-- element type.  Only checker-canonical spellings reach this point, so the
+-- replacement is deterministic across runs.
+local function collection_tag(type_name)
+    return (string.gsub(type_name, "[^%w]", "_"))
+end
+
 local function c_type(type_name)
     local array_element = array_info(type_name)
     if array_element ~= nil then
@@ -3979,6 +4399,10 @@ local function c_type(type_name)
         return "LusaTable *"
     end
     if type_name == "value" then return "LusaValue" end
+    if is_vec_type(type_name) then return "LusaVec" end
+    if is_box_type(type_name) then
+        return c_type(box_element(type_name)) .. " *"
+    end
     if pointer_element(type_name) ~= nil then
         local element = pointer_element(type_name)
         local base = c_type(element)
@@ -4020,6 +4444,12 @@ local function default_c(type_name)
     if type_name == "value" then
         return "(LusaValue){LUSA_ELEM_UNKNOWN, 0u}"
     end
+    if is_vec_type(type_name) then
+        return "(LusaVec){0}"
+    end
+    if is_box_type(type_name) then
+        return "NULL"
+    end
     if pointer_element(type_name) ~= nil then
         return "NULL"
     end
@@ -4033,7 +4463,8 @@ end
 -- such as `(BootState){0}` is rejected by MSVC at file scope, but `{0}` is a
 -- valid static aggregate initializer on every supported compiler.
 local function global_default_c(type_name)
-    if is_struct_type(type_name) or is_array_type(type_name) then
+    if is_struct_type(type_name) or is_array_type(type_name)
+        or is_vec_type(type_name) then
         return "{0}"
     end
     return default_c(type_name)
@@ -4172,6 +4603,12 @@ local function emit_clone_place(type_name, access)
         line(access .. " = lusa_string_clone(" .. access .. ");")
     elseif is_table_type(type_name) then
         line(access .. " = lusa_table_clone(" .. access .. ");")
+    elseif is_vec_type(type_name) then
+        line(access .. " = lusa_vec_clone_" .. collection_tag(vec_element(type_name))
+            .. "(&" .. access .. ");")
+    elseif is_box_type(type_name) then
+        line(access .. " = lusa_box_clone_" .. collection_tag(box_element(type_name))
+            .. "(" .. access .. ");")
     elseif is_struct_type(type_name) and is_heap_type(type_name) then
         line(access .. " = lusa_clone_" .. type_name .. "(" .. access .. ");")
     end
@@ -4182,6 +4619,12 @@ local function emit_drop_place(type_name, access)
         line("lusa_drop_string(&" .. access .. ");")
     elseif type_name == "table" or table_element(type_name) ~= nil then
         line("lusa_drop_table(&" .. access .. ");")
+    elseif is_vec_type(type_name) then
+        line("lusa_drop_vec_" .. collection_tag(vec_element(type_name)) .. "(&"
+            .. access .. ");")
+    elseif is_box_type(type_name) then
+        line("lusa_drop_box_" .. collection_tag(box_element(type_name)) .. "(&"
+            .. access .. ");")
     elseif type_name == "coroutine" then
         line("lusa_drop_coroutine(&" .. access .. ");")
     elseif type_name == "gmatch" then
@@ -4352,7 +4795,7 @@ local function collect_move_entries(expr, out, seen)
         end
         return out, seen
     end
-    if value.tag == "Table" then
+    if value.tag == "Table" or value.tag == "VecLit" then
         local i = 1
         while i <= #value.items do
             out, seen = collect_move_entries(value.items[i], out, seen)
@@ -4371,10 +4814,10 @@ local function null_moved_source(expr, skip)
         return
     end
     emit_mark_moved(entry.name)
-    if is_struct_type(entry.type) then
-        -- A moved struct is a value, not a pointer.  There is no NULL to
-        -- store; the persisted moved flag alone prevents the scope drop from
-        -- touching the aliased fields.
+    if is_struct_type(entry.type) or is_vec_type(entry.type) then
+        -- A moved struct or Vec is a value, not a pointer.  There is no NULL
+        -- to store; the persisted moved flag alone prevents the scope drop
+        -- from touching the aliased fields.
         entry.moved = true
         return
     end
@@ -5263,6 +5706,75 @@ local NO_STD_RUNTIME = {
     ""
 }
 
+-- ---- heap collections (Vec/Box) -----------------------------------------
+
+-- The allocator dispatch functions are defined after the user function
+-- prototypes: that lets a `#[global_allocator]` function call other user
+-- helpers without relying on implicit C declarations.  The generic helpers
+-- below therefore only need forward declarations here.
+local HEAP_RUNTIME = {
+    "#if defined(_MSC_VER)",
+    "#define LUSA_ALIGNOF(type) __alignof(type)",
+    "#else",
+    "#define LUSA_ALIGNOF(type) _Alignof(type)",
+    "#endif",
+    "",
+    "typedef struct LusaVec {",
+    "    void *data;",
+    "    uint32_t len;",
+    "    uint32_t capacity;",
+    "} LusaVec;",
+    "",
+    "static void *lusa_heap_alloc(uint32_t size, uint32_t align);",
+    "static void lusa_heap_dealloc(void *ptr, uint32_t size, uint32_t align);",
+    "",
+    "static void lusa_vec_copy_bytes(void *dst, const void *src, size_t count) {",
+    "    unsigned char *out = (unsigned char *)dst;",
+    "    const unsigned char *in = (const unsigned char *)src;",
+    "    size_t i;",
+    "    if (out == NULL || in == NULL) return;",
+    "    i = 0u;",
+    "    while (i < count) {",
+    "        out[i] = in[i];",
+    "        i = i + 1u;",
+    "    }",
+    "}",
+    "",
+    "static bool lusa_vec_reserve(LusaVec *vec, uint32_t elem_size,",
+    "                             uint32_t align, uint32_t needed) {",
+    "    uint32_t new_capacity;",
+    "    void *data;",
+    "    if (vec == NULL) return false;",
+    "    if (needed <= vec->capacity) return true;",
+    "    new_capacity = vec->capacity == 0u ? 4u : vec->capacity;",
+    "    while (new_capacity < needed) {",
+    "        if (new_capacity > 0x7FFFFFFFu) { new_capacity = needed; break; }",
+    "        new_capacity = new_capacity * 2u;",
+    "    }",
+    "    if (elem_size != 0u && new_capacity > 0xFFFFFFFFu / elem_size) {",
+    "        return false;",
+    "    }",
+    "    data = lusa_heap_alloc(new_capacity * elem_size, align);",
+    "    if (data == NULL) return false;",
+    "    lusa_vec_copy_bytes(data, vec->data,",
+    "        (size_t)vec->len * (size_t)elem_size);",
+    "    if (vec->data != NULL) {",
+    "        lusa_heap_dealloc(vec->data, vec->capacity * elem_size, align);",
+    "    }",
+    "    vec->data = data;",
+    "    vec->capacity = new_capacity;",
+    "    return true;",
+    "}",
+    "",
+    "static void *lusa_vec_slot(LusaVec *vec, uint32_t elem_size,",
+    "                           uint32_t index) {",
+    "    if (vec == NULL || vec->data == NULL) return NULL;",
+    "    return (void *)((unsigned char *)vec->data",
+    "        + (size_t)index * (size_t)elem_size);",
+    "}",
+    ""
+}
+
 -- ---- coroutine runtime ---------------------------------------------------
 
 -- Native coroutines use platform-supported stacks: Windows fibers and
@@ -5541,12 +6053,16 @@ collect_strings_expr = function(expr)
         collect_strings_expr(expr.value)
         return
     end
-    if tag == "Array" then
+    if tag == "Array" or tag == "VecLit" then
         local i = 1
         while i <= #expr.items do
             collect_strings_expr(expr.items[i])
             i = i + 1
         end
+        return
+    end
+    if tag == "BoxNew" then
+        collect_strings_expr(expr.value)
         return
     end
     if tag == "Binary" or tag == "Logical" then
@@ -5791,11 +6307,320 @@ local function emit_clone_heap(type_name, value)
     if is_table_type(type_name) then
         return "lusa_table_clone(" .. value .. ")"
     end
+    if is_vec_type(type_name) then
+        return "lusa_vec_clone_" .. collection_tag(vec_element(type_name))
+            .. "(&(" .. value .. "))"
+    end
+    if is_box_type(type_name) then
+        return "lusa_box_clone_" .. collection_tag(box_element(type_name))
+            .. "(" .. value .. ")"
+    end
     if is_struct_type(type_name) then
         return "lusa_clone_" .. type_name .. "(" .. value .. ")"
     end
     return value
 end
+
+-- Generated collection helpers.  One family per concrete element type keeps
+-- element size, alignment, deep clone, and RAII drop statically typed without
+-- boxing every element behind a tagged union.
+local function emit_collection_prototypes(ast)
+    local vecs = ast.vec_elements or {}
+    local boxes = ast.box_elements or {}
+    local i = 1
+    while i <= #vecs do
+        local element = clone vecs[i]
+        local tag_name = collection_tag(element)
+        local c_element = c_type(element)
+        line("static void lusa_drop_vec_" .. tag_name .. "(LusaVec *vec);")
+        line("static LusaVec lusa_vec_clone_" .. tag_name
+            .. "(LusaVec *source);")
+        line("static void lusa_vec_push_" .. tag_name .. "(LusaVec *vec, "
+            .. c_element .. " value);")
+        line("static " .. c_element .. " lusa_vec_pop_" .. tag_name
+            .. "(LusaVec *vec);")
+        line("static void lusa_vec_clear_" .. tag_name .. "(LusaVec *vec);")
+        i = i + 1
+    end
+    i = 1
+    while i <= #boxes do
+        local element = clone boxes[i]
+        local tag_name = collection_tag(element)
+        local c_element = c_type(element)
+        line("static " .. c_element .. " *lusa_box_new_" .. tag_name .. "("
+            .. c_element .. " value);")
+        line("static void lusa_drop_box_" .. tag_name .. "(" .. c_element
+            .. " **value);")
+        line("static " .. c_element .. " *lusa_box_clone_" .. tag_name .. "("
+            .. c_element .. " *source);")
+        i = i + 1
+    end
+    if #vecs > 0 or #boxes > 0 then
+        line("")
+    end
+end
+
+local function emit_collection_helpers(ast)
+    local vecs = ast.vec_elements or {}
+    local boxes = ast.box_elements or {}
+    local i = 1
+    while i <= #vecs do
+        local element = clone vecs[i]
+        local tag_name = collection_tag(element)
+        local c_element = c_type(element)
+        local element_size = "sizeof(" .. c_element .. ")"
+        local element_align = "LUSA_ALIGNOF(" .. c_element .. ")"
+
+        line("static void lusa_drop_vec_" .. tag_name .. "(LusaVec *vec) {")
+        emit_indent = emit_indent + 1
+        line("if (vec == NULL) return;")
+        if is_heap_type(element) then
+            line("uint32_t i;")
+            line("i = 0u;")
+            line("while (i < vec->len) {")
+            emit_indent = emit_indent + 1
+            line(c_element .. " item = ((" .. c_element
+                .. " *)vec->data)[i];")
+            emit_drop_place(element, "item")
+            line("i = i + 1u;")
+            emit_indent = emit_indent - 1
+            line("}")
+        end
+        line("if (vec->data != NULL) {")
+        emit_indent = emit_indent + 1
+        line("lusa_heap_dealloc(vec->data, vec->capacity * (uint32_t)"
+            .. element_size .. ", (uint32_t)" .. element_align .. ");")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("vec->data = NULL;")
+        line("vec->len = 0u;")
+        line("vec->capacity = 0u;")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("")
+
+        line("static LusaVec lusa_vec_clone_" .. tag_name
+            .. "(LusaVec *source) {")
+        emit_indent = emit_indent + 1
+        line("LusaVec out = (LusaVec){0};")
+        line("uint32_t i;")
+        line("if (source == NULL || source->len == 0u) return out;")
+        line("if (!lusa_vec_reserve(&out, (uint32_t)" .. element_size
+            .. ", (uint32_t)" .. element_align .. ", source->len)) {")
+        emit_indent = emit_indent + 1
+        line("return out;")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("i = 0u;")
+        line("while (i < source->len) {")
+        emit_indent = emit_indent + 1
+        line(c_element .. " item = ((" .. c_element
+            .. " *)source->data)[i];")
+        emit_clone_place(element, "item")
+        line("((" .. c_element .. " *)out.data)[i] = item;")
+        line("i = i + 1u;")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("out.len = source->len;")
+        line("return out;")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("")
+
+        line("static void lusa_vec_push_" .. tag_name .. "(LusaVec *vec, "
+            .. c_element .. " value) {")
+        emit_indent = emit_indent + 1
+        line("if (vec == NULL) return;")
+        line("if (!lusa_vec_reserve(vec, (uint32_t)" .. element_size
+            .. ", (uint32_t)" .. element_align .. ", vec->len + 1u)) {")
+        emit_indent = emit_indent + 1
+        line("return;")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("((" .. c_element .. " *)vec->data)[vec->len] = value;")
+        line("vec->len = vec->len + 1u;")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("")
+
+        line("static " .. c_element .. " lusa_vec_pop_" .. tag_name
+            .. "(LusaVec *vec) {")
+        emit_indent = emit_indent + 1
+        line("if (vec == NULL || vec->len == 0u) return "
+            .. default_c(element) .. ";")
+        line("vec->len = vec->len - 1u;")
+        line("return ((" .. c_element .. " *)vec->data)[vec->len];")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("")
+
+        line("static void lusa_vec_clear_" .. tag_name .. "(LusaVec *vec) {")
+        emit_indent = emit_indent + 1
+        line("if (vec == NULL) return;")
+        if is_heap_type(element) then
+            line("uint32_t i;")
+            line("i = 0u;")
+            line("while (i < vec->len) {")
+            emit_indent = emit_indent + 1
+            line(c_element .. " item = ((" .. c_element
+                .. " *)vec->data)[i];")
+            emit_drop_place(element, "item")
+            line("i = i + 1u;")
+            emit_indent = emit_indent - 1
+            line("}")
+        end
+        line("vec->len = 0u;")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("")
+        i = i + 1
+    end
+
+    i = 1
+    while i <= #boxes do
+        local element = clone boxes[i]
+        local tag_name = collection_tag(element)
+        local c_element = c_type(element)
+        local element_size = "sizeof(" .. c_element .. ")"
+        local element_align = "LUSA_ALIGNOF(" .. c_element .. ")"
+
+        line("static " .. c_element .. " *lusa_box_new_" .. tag_name .. "("
+            .. c_element .. " value) {")
+        emit_indent = emit_indent + 1
+        line(c_element .. " *box = (" .. c_element
+            .. " *)lusa_heap_alloc((uint32_t)" .. element_size
+            .. ", (uint32_t)" .. element_align .. ");")
+        line("if (box == NULL) return NULL;")
+        line("*box = value;")
+        line("return box;")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("")
+
+        line("static void lusa_drop_box_" .. tag_name .. "(" .. c_element
+            .. " **value) {")
+        emit_indent = emit_indent + 1
+        line("if (value == NULL || *value == NULL) return;")
+        line(c_element .. " item = **value;")
+        emit_drop_place(element, "item")
+        line("lusa_heap_dealloc(*value, (uint32_t)" .. element_size
+            .. ", (uint32_t)" .. element_align .. ");")
+        line("*value = NULL;")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("")
+
+        line("static " .. c_element .. " *lusa_box_clone_" .. tag_name
+            .. "(" .. c_element .. " *source) {")
+        emit_indent = emit_indent + 1
+        line("if (source == NULL) return NULL;")
+        line(c_element .. " item = *source;")
+        emit_clone_place(element, "item")
+        line("return lusa_box_new_" .. tag_name .. "(item);")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("")
+        i = i + 1
+    end
+end
+
+-- Allocator dispatch is emitted after function prototypes so a custom
+-- allocator may call other user functions.  A missing half of the pair falls
+-- back to the target's default strategy.
+local function emit_allocator_dispatch(ast)
+    local alloc_cname = nil
+    local dealloc_cname = nil
+    if ast.global_alloc_name ~= nil then
+        alloc_cname = emit_function_cnames[ast.global_alloc_name]
+    end
+    if ast.global_dealloc_name ~= nil then
+        dealloc_cname = emit_function_cnames[ast.global_dealloc_name]
+    end
+
+    if alloc_cname ~= nil then
+        line("static void *lusa_heap_alloc(uint32_t size, uint32_t align) {")
+        emit_indent = emit_indent + 1
+        line("return (void *)(uintptr_t)" .. alloc_cname
+            .. "(NULL, size, align);")
+        emit_indent = emit_indent - 1
+        line("}")
+    elseif ast.no_std then
+        line("typedef union LusaHeapArena {")
+        emit_indent = emit_indent + 1
+        line("long double align_long_double;")
+        line("void *align_pointer;")
+        line("uint64_t align_u64;")
+        line("unsigned char bytes[65536];")
+        emit_indent = emit_indent - 1
+        line("} LusaHeapArena;")
+        line("static LusaHeapArena lusa_heap_arena;")
+        line("static uint32_t lusa_heap_top = 0u;")
+        line("static void *lusa_heap_alloc(uint32_t size, uint32_t align) {")
+        emit_indent = emit_indent + 1
+        line("size_t base;")
+        line("size_t address;")
+        line("size_t offset;")
+        line("if (size == 0u) size = 1u;")
+        line("if (align == 0u) align = 1u;")
+        line("base = (size_t)(uintptr_t)lusa_heap_arena.bytes;")
+        line("address = base + (size_t)lusa_heap_top;")
+        line("if ((address % (size_t)align) != 0u) {")
+        emit_indent = emit_indent + 1
+        line("address = address + ((size_t)align"
+            .. " - (address % (size_t)align));")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("offset = address - base;")
+        line("if (offset > (size_t)65536u"
+            .. " || (size_t)size > (size_t)65536u - offset) {")
+        emit_indent = emit_indent + 1
+        line("return NULL;")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("lusa_heap_top = (uint32_t)(offset + (size_t)size);")
+        line("return (void *)address;")
+        emit_indent = emit_indent - 1
+        line("}")
+    else
+        line("static void *lusa_heap_alloc(uint32_t size, uint32_t align) {")
+        emit_indent = emit_indent + 1
+        line("(void)align;")
+        line("return malloc(size == 0u ? 1u : (size_t)size);")
+        emit_indent = emit_indent - 1
+        line("}")
+    end
+
+    if dealloc_cname ~= nil then
+        line("static void lusa_heap_dealloc(void *ptr, uint32_t size, "
+            .. "uint32_t align) {")
+        emit_indent = emit_indent + 1
+        line("if (ptr == NULL) return;")
+        line(dealloc_cname .. "(NULL, (volatile uint32_t *)(uintptr_t)ptr, size,"
+            .. " align);")
+        emit_indent = emit_indent - 1
+        line("}")
+    elseif ast.no_std then
+        line("static void lusa_heap_dealloc(void *ptr, uint32_t size, "
+            .. "uint32_t align) {")
+        emit_indent = emit_indent + 1
+        line("(void)ptr;")
+        line("(void)size;")
+        line("(void)align;")
+        emit_indent = emit_indent - 1
+        line("}")
+    else
+        line("static void lusa_heap_dealloc(void *ptr, uint32_t size, "
+            .. "uint32_t align) {")
+        emit_indent = emit_indent + 1
+        line("(void)size;")
+        line("(void)align;")
+        line("free(ptr);")
+        emit_indent = emit_indent - 1
+        line("}")
+    end
+    line("")
+end
+
 
 local function emit_cast_to(type_name, value)
     if is_pointer_type(type_name) then
@@ -6005,6 +6830,9 @@ emit_expr = function(expr)
                 return "((int32_t)" .. tostring(array_length) .. ")"
             end
             local inner = emit_expr(expr.value)
+            if is_vec_type(operand_type) then
+                return "((int32_t)((" .. inner .. ").len))"
+            end
             return "((int32_t)(((const LusaObj *)(" .. inner .. "))->length))"
         end
         if expr.op == "-" then
@@ -6099,6 +6927,11 @@ emit_expr = function(expr)
         if expr.builtin == "coroutine_isyieldable" then
             return "lusa_coro_isyieldable()"
         end
+        if expr.builtin == "box_new" then
+            local value = emit_expr(expr.args[1])
+            return "lusa_box_new_" .. collection_tag(box_element(expr.ctype))
+                .. "(" .. value .. ")"
+        end
         if expr.builtin == "print" then
             fail(expr.line, expr.column,
                 "internal: `print` must be used as a statement")
@@ -6133,22 +6966,27 @@ emit_expr = function(expr)
     end
     if tag == "Clone" then
         local inner = emit_expr(expr.value)
-        if expr.ctype == "string" then
-            return "lusa_string_clone(" .. inner .. ")"
-        end
-        if is_table_type(expr.ctype) then
-            return "lusa_table_clone(" .. inner .. ")"
-        end
-        if is_struct_type(expr.ctype) then
-            return "lusa_clone_" .. expr.ctype .. "(" .. inner .. ")"
-        end
-        return inner
+        return emit_clone_heap(expr.ctype, inner)
     end
     if tag == "Borrow" then
         return emit_expr(expr.value)
     end
     if tag == "Move" then
         return emit_expr(expr.value)
+    end
+    if tag == "BoxNew" then
+        local inner = expr.value
+        local value_type = box_element(expr.ctype)
+        local rendered = emit_expr(clone inner)
+        if inner.own == false and is_heap_type(value_type) then
+            rendered = emit_clone_heap(value_type, rendered)
+        end
+        local boxed = "lusa_box_new_" .. collection_tag(box_element(expr.ctype))
+            .. "(" .. rendered .. ")"
+        if inner.own ~= false then
+            null_moved_source(inner, nil)
+        end
+        return boxed
     end
     if tag == "StructLit" then
         local layout = borrow check_structs[expr.name]
@@ -6214,6 +7052,31 @@ emit_expr = function(expr)
         return "((" .. c_type(array_element) .. "["
             .. tostring(array_length) .. "]){ "
             .. table.concat(parts, ", ") .. " })"
+    end
+    if tag == "VecLit" then
+        local element = vec_element(expr.ctype)
+        local tag_name = collection_tag(element)
+        local vec_name = fresh("vec")
+        line("LusaVec " .. vec_name .. " = (LusaVec){0};")
+        local i = 1
+        while i <= #expr.items do
+            local item = expr.items[i]
+            local value = emit_expr(clone item)
+            if is_heap_type(element) and item.own == false
+                and item.tag ~= "Borrow" then
+                value = emit_clone_heap(element, value)
+            end
+            value = emit_cast_to(element, value)
+            local item_name = fresh("elem")
+            line(c_type(element) .. " " .. item_name .. " = " .. value .. ";")
+            line("lusa_vec_push_" .. tag_name .. "(&" .. vec_name .. ", "
+                .. item_name .. ");")
+            if item.own ~= false then
+                null_moved_source(item, nil)
+            end
+            i = i + 1
+        end
+        return vec_name
     end
     if tag == "AddrOf" then
         return "(&(" .. emit_expr(expr.value) .. "))"
@@ -6309,6 +7172,43 @@ emit_expr = function(expr)
         return "(*(" .. emit_expr(expr.value) .. "))"
     end
     if tag == "MethodCall" then
+        if expr.vec_method ~= nil then
+            -- Capture the receiver type first: `emit_expr` moves heap values.
+            local obj_type = expr.obj.ctype
+            local element = vec_element(obj_type)
+            local tag_name = collection_tag(element)
+            local method = expr.vec_method
+            local vec_value = emit_expr(expr.obj)
+            if method == "push" then
+                local value = emit_expr(expr.args[1])
+                return "(lusa_vec_push_" .. tag_name .. "(&(" .. vec_value
+                    .. "), " .. value .. "), (void)0)"
+            end
+            if method == "pop" then
+                return "lusa_vec_pop_" .. tag_name .. "(&(" .. vec_value .. "))"
+            end
+            if method == "len" then
+                return "((int32_t)((" .. vec_value .. ").len))"
+            end
+            if method == "capacity" then
+                return "((int32_t)((" .. vec_value .. ").capacity))"
+            end
+            if method == "is_empty" then
+                return "(((" .. vec_value .. ").len == 0u))"
+            end
+            if method == "reserve" then
+                local value = emit_expr(expr.args[1])
+                return "(lusa_vec_reserve(&(" .. vec_value
+                    .. "), (uint32_t)sizeof(" .. c_type(element)
+                    .. "), (uint32_t)LUSA_ALIGNOF("
+                    .. c_type(element) .. "), (uint32_t)("
+                    .. value .. ")), (void)0)"
+            end
+            if method == "clear" then
+                return "(lusa_vec_clear_" .. tag_name .. "(&(" .. vec_value
+                    .. ")), (void)0)"
+            end
+        end
         local string_value = emit_string_builtin(clone expr)
         if string_value ~= nil then
             return string_value
@@ -6327,6 +7227,15 @@ emit_expr = function(expr)
         return cname .. "(" .. table.concat(args, ", ") .. ")"
     end
     if tag == "Index" then
+        if expr.vec_access then
+            -- Read the element type before emitting the receiver: passing a
+            -- heap value to `emit_expr` moves it out of the AST node.
+            local element = vec_element(expr.table.ctype)
+            local vec_value = emit_expr(expr.table)
+            local index_value = emit_expr(expr.index)
+            return "(((" .. c_type(element) .. " *)(" .. vec_value
+                .. ").data)[(uint32_t)(" .. index_value .. ")])"
+        end
         if expr.array_access then
             local table_value = emit_expr(expr.table)
             local index_value = emit_expr(expr.index)
@@ -6617,7 +7526,8 @@ local function emit_local(stmt)
             local temp_name = fresh("init")
             if value ~= nil then
                 local rendered = emit_expr(clone value)
-                if (type_name == "string" or is_struct_type(type_name))
+                if (type_name == "string" or is_struct_type(type_name)
+                    or is_box_type(type_name) or is_vec_type(type_name))
                     and value.own == false and value.tag ~= "Borrow" then
                     -- Strings and structs are value types: reading a field/index
                     -- copies it, including nested heap fields.
@@ -6731,8 +7641,32 @@ local function emit_assign(stmt)
             line(entry.cname .. " = " .. assigned .. ";")
         elseif target.tag == "Deref" then
             local pointer_value = emit_expr(target.value)
-            local value_expr = emit_cast_to(target_types[i], temporaries[i])
+            local assigned = temporaries[i]
+            if i <= #values and values[i].own == false
+                and is_heap_type(target_types[i]) then
+                assigned = emit_clone_heap(target_types[i], assigned)
+            end
+            local value_expr = emit_cast_to(target_types[i], assigned)
+            if target.box_deref and is_heap_type(target_types[i]) then
+                emit_drop_place(target_types[i], "(*(" .. pointer_value .. "))")
+            end
             line("(*(" .. pointer_value .. ")) = " .. value_expr .. ";")
+        elseif target.tag == "Index" and target.vec_access then
+            local element = vec_element(target.table.ctype)
+            local vec_value = emit_expr(target.table)
+            local index_value = emit_expr(target.index)
+            local access = "(((" .. c_type(element) .. " *)(" .. vec_value
+                .. ").data)[(uint32_t)(" .. index_value .. ")])"
+            local assigned = temporaries[i]
+            if i <= #values and values[i].own == false
+                and is_heap_type(target_types[i]) then
+                assigned = emit_clone_heap(target_types[i], assigned)
+            end
+            assigned = emit_cast_to(target_types[i], assigned)
+            if is_heap_type(target_types[i]) then
+                emit_drop_place(target_types[i], access)
+            end
+            line(access .. " = " .. assigned .. ";")
         elseif target.tag == "Index" and target.array_access then
             local table_value = emit_expr(target.table)
             local index_value = emit_expr(target.index)
@@ -6758,14 +7692,7 @@ local function emit_assign(stmt)
             assigned = emit_cast_to(target_types[i], assigned)
             local access = "(" .. table_value .. ")." .. target.field_name
             if is_heap_type(target_types[i]) then
-                if target_types[i] == "string" then
-                    line("lusa_drop_string(&" .. access .. ");")
-                elseif is_table_type(target_types[i]) then
-                    line("lusa_drop_table(&" .. access .. ");")
-                elseif is_struct_type(target_types[i]) then
-                    line("lusa_drop_" .. target_types[i] .. "(&"
-                        .. access .. ");")
-                end
+                emit_drop_place(target_types[i], access)
             end
             line(access .. " = " .. assigned .. ";")
         else
@@ -7069,6 +7996,21 @@ local function emit_break(stmt)
     line("break;")
 end
 
+local function emit_vec_push(expr)
+    local element = vec_element(expr.obj.ctype)
+    local tag_name = collection_tag(element)
+    local vec_value = emit_expr(expr.obj)
+    local arg = expr.args[1]
+    local value = emit_expr(clone arg)
+    line("lusa_vec_push_" .. tag_name .. "(&(" .. vec_value .. "), "
+        .. value .. ");")
+    -- Ownership moved into the vector: cancel the source slot so its scope
+    -- drop cannot release the element a second time.
+    if arg.own ~= false then
+        null_moved_source(arg, nil)
+    end
+end
+
 emit_stmt = function(stmt)
     local tag = stmt.tag
     if tag == "Local" then
@@ -7082,6 +8024,9 @@ emit_stmt = function(stmt)
     if tag == "CallStmt" then
         if stmt.value.builtin == "print" then
             emit_print_call(stmt.value)
+        elseif stmt.value.tag == "MethodCall"
+            and stmt.value.vec_method == "push" then
+            emit_vec_push(stmt.value)
         else
             line("(void)(" .. emit_expr(stmt.value) .. ");")
         end
@@ -7196,6 +8141,7 @@ end
 local function emit_struct_declarations(ast)
     local names = ast.struct_names or {}
     if #names == 0 then
+        emit_collection_prototypes(ast)
         return
     end
     local i = 1
@@ -7233,6 +8179,11 @@ local function emit_struct_declarations(ast)
         line("")
         i = i + 1
     end
+
+    -- Collection helpers are referenced by struct drop/clone helpers, so their
+    -- prototypes must precede the struct bodies.  Definitions are emitted after
+    -- the user function prototypes.
+    emit_collection_prototypes(ast)
 
     -- Deep drop/clone helpers. Structs may only contain previously declared
     -- structs, so declaration order also defines helper dependency order.
@@ -7525,12 +8476,19 @@ local function emit_c_impl(ast)
             i = i + 1
         end
     end
+    i = 1
+    while i <= #HEAP_RUNTIME do
+        put(HEAP_RUNTIME[i])
+        i = i + 1
+    end
     put("")
     emit_static_strings()
     emit_static_ints()
     emit_struct_declarations(borrow ast)
     emit_globals_declarations()
     emit_function_prototypes()
+    emit_allocator_dispatch(borrow ast)
+    emit_collection_helpers(borrow ast)
 
     i = 1
     while i <= #emit_functions do

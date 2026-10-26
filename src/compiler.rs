@@ -146,6 +146,8 @@ pub enum Instr {
     /// pushes its address (the dynamic-engine analogue of a C `&`).
     AddrOf,
     CloneV,
+    /// Wraps TOS in a dynamic-engine `Box<T>` (idempotent for existing boxes).
+    MakeBox,
     BorrowErr, // borrow is rejected in bytecode mode
     // calls — `nt` = number of journaled argument takes finalized by this call
     // (builtins restore them, matching the interpreter's `is_builtin()` rules)
@@ -847,7 +849,7 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
                 // so the VM enforces the same `unsafe` sandbox as the
                 // interpreter (checked inside the builtin).
                 let callee = Expr {
-                    kind: ExprKind::Var(Box::new("unsafe_read_mem".to_string())),
+                    kind: ExprKind::Var(Box::new("box_read".to_string())),
                     span: e.span,
                 };
                 compile_expr(c, &callee)?;
@@ -1228,6 +1230,16 @@ fn compile_struct_lit(
         c.em(Instr::LoadConst(key));
         let dest = format!("field `{}` of `{name}`", field.name);
         let _ = compile_take_value(c, &field.value, &dest, false)?;
+        if !matches!(field.value.kind, ExprKind::Nil) {
+            let declared = def
+                .iter()
+                .find(|(fname, _)| fname == &field.name)
+                .map(|(_, ty)| ty.as_str());
+            if declared.and_then(box_annotation).is_some() {
+                c.set_line(field.span);
+                c.em(Instr::MakeBox);
+            }
+        }
         truncate_if_expansion(c, &field.value);
         c.set_line(field.span);
         c.em(Instr::SetIndex);
@@ -1268,6 +1280,14 @@ fn emit_struct_default_value(
     if ty == "bool" {
         let k = c.konst(&ConstKey::of(&Value::Bool(false)));
         c.em(Instr::LoadConst(k));
+        return Ok(());
+    }
+    if vec_annotation(ty).is_some() {
+        c.em(Instr::NewTable);
+        return Ok(());
+    }
+    if box_annotation(ty).is_some() {
+        c.em(Instr::LoadNil);
         return Ok(());
     }
     if let Some((element, length)) = array_annotation(ty) {
@@ -1466,6 +1486,14 @@ fn compile_local(
             }
         }
         let _ = compile_take_value(c, v, dest, false)?;
+        if !matches!(v.kind, ExprKind::Nil) {
+            if let Some(ann) = annotations.get(i).and_then(|a| a.as_deref()) {
+                if box_annotation(ann).is_some() {
+                    c.set_line(v.span);
+                    c.em(Instr::MakeBox);
+                }
+            }
+        }
         if i + 1 < n {
             truncate_if_expansion(c, v);
         }
@@ -1477,6 +1505,9 @@ fn compile_local(
             Some(ann) if ann.starts_with('*') => {
                 let k = c.konst(&ConstKey::Num(0.0f64.to_bits()));
                 let _ = c.em(Instr::LoadConst(k));
+            }
+            Some(ann) if vec_annotation(ann).is_some() => {
+                c.em(Instr::NewTable);
             }
             Some(ann) if array_annotation(ann).is_some() => {
                 let (element, length) = array_annotation(ann).unwrap();
@@ -1537,7 +1568,7 @@ fn compile_assign(c: &mut Compiler, targets: &[Expr], values: &[Expr], span: Spa
         if let ExprKind::Un { op: UnOp::Deref, e } = &targets[0].kind {
             // `*ptr = value` - a simulated-memory write through the builtin.
             let callee = Expr {
-                kind: ExprKind::Var(Box::new("unsafe_write_mem".to_string())),
+                kind: ExprKind::Var(Box::new("box_write".to_string())),
                 span: targets[0].span,
             };
             compile_expr(c, &callee)?;

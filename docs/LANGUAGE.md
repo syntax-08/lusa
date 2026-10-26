@@ -16,6 +16,8 @@ error-code table.
 | string   | Copy      | `"abc"`, `'abc'`   |
 | table    | **Move**  | `{1, 2, k = "v"}`  |
 | function | **Move**  | closures and builtins |
+| `Vec<T>` | **Move**  | `[1, 2, 3]`, `v:push(x)` |
+| `Box<T>` | **Move**  | `Box(42)`, `b = 5`, `*b` |
 | struct   | Copy when scalar-only, otherwise **Move** | `Point{x: 1, y: 2}` |
 | iterator | (internal)| result of `pairs`/`ipairs` |
 
@@ -56,6 +58,8 @@ local ratio: f32 = 0.5
 local active: bool = true
 local label: string = "sensor"
 local grid: [[i32]] = {{1, 2}, {3, 4}}
+local values: Vec<i32> = [4, 8, 15]   -- growable heap vector
+local answer: Box<i32> = 41           -- owned pointer to a heap value
 ```
 
 An `undefined global` reads `nil` (Lua-forgiving). Moved slots follow the
@@ -105,7 +109,7 @@ Operators (Lua precedence): `or < and < (== ~= < > <= >=) < .. (right) <
 
 1. Scalars (`nil bool number string`) are **Copy**: assigning, passing as
    an argument or returning copies the value.
-2. Heap values (`table function`, and structs that own `string`/`table`
+2. Heap values (`table function Vec<T> Box<T>`, and structs that own heap
    fields) **move by default** — a read in a
    *consuming context* (assignment, user-function argument, `return`,
    table literal) transfers ownership:
@@ -116,6 +120,8 @@ Operators (Lua precedence): `or < and < (== ~= < > <= >=) < .. (right) <
    ```
    The moved slot keeps a history (`note: moved to `u` here`) for the
    diagnostic. The C11 front end rejects the same use at compile time.
+   A `Vec<T>` owns its elements and a `Box<T>` owns its pointee; both release
+   them at scope exit, on `Vec:clear`, and when the program ends.
 3. `move x` — explicit ownership transfer. It is accepted in every compiler
    stage and has the same effect as a consuming read, but makes the intent
    visible:
@@ -418,7 +424,7 @@ Codes `E{category}{n}`, like rustc:
 | E0308  | static   | C11 backend: mismatched types (assignment, return, call, condition) |
 | E0309  | static   | C11 backend: struct/table has no such field |
 | E0311  | static   | C11 backend: wrong argument/initializer count |
-| E0312  | static   | C11 backend: unsupported construct (struct field type, whole-array value, invalid `&` place, array-by-value call, non-scalar volatile element, or invalid inline-assembly text) |
+| E0312  | static   | C11 backend: unsupported construct (struct field type, whole-array or `Vec<T>`-by-value call/return, invalid `&` place, non-scalar volatile element, or invalid inline-assembly text) |
 | E0313  | static   | C11 backend: zero or one return value only; void/value return mismatch |
 | E0316  | unsafe   | C11 backend: raw pointer, volatile, or inline-assembly intrinsic used outside `unsafe` |
 | E0317  | static   | C11 backend: `pcall`, `coroutine.resume`, or `string.gmatch` used outside its required local/loop form |
@@ -429,7 +435,7 @@ Codes `E{category}{n}`, like rustc:
 | E0322  | unsafe   | write through a `*const` pointer |
 | E0323  | static   | C11 backend: statically evaluable malformed string pattern or replacement |
 | E0324  | static   | C11 backend: replacement capture or `gmatch` binding exceeds the pattern's captures |
-| E0325  | static   | C11 backend: invalid `#[no_std]`/`#[entry]`/`#[link_section]` placement, duplicate entry or `#[no_std]`, sectioned existing global, or incomplete promoted-local initialization |
+| E0325  | static   | C11 backend: invalid `#[no_std]`/`#[entry]`/`#[global_allocator]`/`#[link_section]` placement, duplicate entry/allocator/`#[no_std]`, invalid allocator signature, sectioned existing global, or incomplete promoted-local initialization |
 | E9000  | runtime  | `error(msg)` |
 | E9100  | runtime  | `assert(false, msg)` |
 | E9999  | runtime  | internal error (umbrella; includes stack overflow for calls > 200 — catchable with `pcall`) |
@@ -1210,7 +1216,104 @@ subset supports scalars, structs, raw pointers, `asm!`, and control flow;
 strings, tables, `print`, coroutine APIs, and `unsafe_alloc` still require the
 hosted runtime.
 
-### 9.13 Native subset limits
+### 9.13 Heap allocation and dynamic collections (Module 20)
+
+The C11 backend routes every collection allocation through one heap contract.
+`#[global_allocator]` marks either half of the pair; a program may provide one
+or both halves:
+
+```lusa
+#[global_allocator]
+function my_alloc(size: u32, align: u32): *mut u32
+    unsafe do
+        return unsafe_alloc(size)
+    end
+end
+
+#[global_allocator]
+function my_dealloc(ptr: *mut u32, size: u32, align: u32): void
+end
+```
+
+- The allocator signature is `(size: u32, align: u32): *mut u32`; the
+  deallocator signature is `(ptr: *mut u32, size: u32, align: u32): void`.
+- Duplicate allocators or deallocators, a wrong signature, a method receiver,
+  or combining `#[global_allocator]` with `#[entry]` is `E0325`.
+- With no user allocator, hosted programs call `malloc`/`free`. In
+  `#[no_std]` mode the default is a static 64 KiB bump arena
+  (`LusaHeapArena`) with a no-op deallocator, so vectors and boxes work
+  without libc.
+- The dispatch is emitted after function prototypes, so a custom allocator may
+  call other user functions.
+
+`Vec<T>` is a growable, heap-backed, 0-based sequence. Array-literal syntax
+constructs a vector when the target type is `Vec<T>`:
+
+```lusa
+local values: Vec<i32> = [4, 8, 15]
+values:push(16)
+print(values:len(), values:capacity())   -- 4 8
+print(values[0], values:pop())           -- 4 16
+values:reserve(32)
+print(values:capacity())                 -- 32
+values:clear()
+print(values:len(), values:is_empty())   -- 0 true
+```
+
+- `push(value)` appends and transfers ownership of heap elements.
+- `pop()` returns the last element (the element type's default on an empty
+  vector) and decrements the length.
+- `len()`, `capacity()`, and `is_empty()` report vector state; `#values` is
+  also the length.
+- Capacity starts at 0 and grows geometrically from 4 (`4, 8, 16, ...`).
+  `reserve(n)` grows to at least `n`; `clear()` drops elements but keeps the
+  current allocation.
+- Indexing and index assignment use `values[i]` with `0 <= i < len`.
+- `Vec<T>` values cannot be passed or returned by value yet (`E0312`); pass a
+  raw pointer instead.
+- Owned elements (`Vec<string>`, structs, nested vectors) are released by the
+  generated per-element drop helper on scope exit, on `clear`, and at program
+  end.
+
+`Box<T>` is an owned pointer to one heap value. It is initialized implicitly
+from a value or explicitly with `Box(value)`; `nil` clears it without
+allocating:
+
+```lusa
+local answer: Box<i32> = 41
+print(*answer)              -- 41
+*answer = *answer + 1
+print(*answer)              -- 42
+
+local message = Box("lusa")
+print(*message)             -- lusa
+```
+
+Dereferencing or assigning through a Box does **not** require `unsafe`; the
+Box is the owner. Native `Box<T>` lowers to `T *`, so it stays layout-
+transparent and can appear in struct fields. Boxed strings and nested structs
+are dropped through `lusa_drop_box_<tag>`.
+
+The interpreter and bytecode VM simulate both collections without a real
+allocator. A `Vec<T>` is a 0-based table with fallback methods (`push`, `pop`,
+`len`, `capacity`, `is_empty`, `reserve`, `clear`); real fields shadow the
+fallback. A `Box<T>` is a tagged table, and annotation-driven construction wraps
+plain initializers so `local b: Box<i32> = 5; *b` behaves identically in all
+engines. Raw numeric pointers keep the `unsafe` dereference gate.
+
+```sh
+lusalang run examples/dynamic_heap.lusa
+lusalang run examples/dynamic_heap.lusa --vm
+lusalang run examples/dynamic_heap.lusa --native
+lusalang build examples/dynamic_heap.lusa --emit-c
+```
+
+`tests/module20.rs` covers vector growth, capacity, pop/clear/reserve, Box
+dereference and writes, `Vec<string>`/`Box<string>` RAII, custom allocator
+dispatch, freestanding arena emission, allocator diagnostics, and native +
+dynamic parity.
+
+### 9.14 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 table literals, fixed-size `[T; N]` arrays and array literals, nested keyed
@@ -1220,14 +1323,17 @@ tables, and arrays, `if`, `while`, `repeat`, `do`, `return`, `break`,
 assignments, globals, `print`, `clone`, `borrow`, `move`, the compile-time
 borrow checker, `unsafe` blocks, static `struct` declarations in brace and bare
 form, `#[packed]`/`#[repr(align(N))]` representation attributes,
-`#[no_std]`/`#[entry]`/`#[link_section = "..."]` (section 9.12), struct
+`#[no_std]`/`#[entry]`/`#[global_allocator]`/`#[link_section = "..."]`
+(sections 9.12 and 9.13), struct
 literals with defaults (scalar, `string`, `table`, pointer, and previously
 declared struct fields), `match`, compile-time `import`/`mod`, address-of
 (`&place`), raw pointer types (`*mut T`, `*const T`), pointer arithmetic and
 dereferences inside `unsafe`, the raw intrinsics above (`unsafe_ptr_cast`,
 `unsafe_read_mem`, `unsafe_write_mem`, `unsafe_alloc`, `volatile_read`,
 `volatile_write`, `unsafe_nop`, `unsafe_asm`, `asm!("...")`), native `pcall`,
-the
+`Vec<T>` (push/pop/len/capacity/is_empty/reserve/clear, indexing, and
+element assignment) and `Box<T>` (implicit and `Box(value)` construction,
+safe `*b` reads/writes, `nil` clearing) with their RAII drop helpers, the
 string-pattern surface in
 section 9.7, and the restricted
 `coroutine.create/resume/yield/status/close/isyieldable` surface described in
@@ -1236,8 +1342,9 @@ section 9.6.
 Not supported by the C emitter: numeric `for`, arbitrary dynamic key
 construction in table literals, assignment through a dynamic index, varargs,
 interpolated strings, closures/nested functions, forward struct references,
-whole-array assignment or arrays passed/returned by value, `&array`,
-namespaced or selectively exported imports, the rest of the dynamic string
+whole-array assignment or arrays passed/returned by value, `&array`, `Vec<T>`
+values passed or returned by value (`E0312`), namespaced or selectively
+exported imports, the rest of the dynamic string
 library, multiple function return values (`E0313`), dynamic `pcall`
 expressions, and general first-class coroutine operations. Native colon methods are static functions
 and are not stored as table fields, so `pairs(user)` does not enumerate method

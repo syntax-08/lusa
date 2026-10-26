@@ -14,6 +14,20 @@ pub fn array_annotation(ann: &str) -> Option<(&str, usize)> {
     Some((element, length))
 }
 
+/// Splits a canonical `vec<T>` annotation into its element spelling.  Vec is
+/// simulated as a 0-based table by the dynamic engines and lowered to a
+/// growable buffer by the C backend.
+pub fn vec_annotation(ann: &str) -> Option<&str> {
+    ann.strip_prefix("vec<")?.strip_suffix('>')
+}
+
+/// Splits a canonical `box<T>` annotation into its element spelling.  The
+/// dynamic engines tag boxed values so `*b` can read and write the pointee
+/// without the raw-pointer `unsafe` gate.
+pub fn box_annotation(ann: &str) -> Option<&str> {
+    ann.strip_prefix("box<")?.strip_suffix('>')
+}
+
 #[derive(Clone, Debug)]
 pub struct St {
     pub kind: StKind,
@@ -84,6 +98,9 @@ pub enum StKind {
         func: FuncLit,
         /// `#[entry]`: emit this function as the program entry symbol.
         entry: bool,
+        /// `#[global_allocator]`: use this function as the allocator or
+        /// deallocator half of the global heap contract.
+        global_allocator: bool,
         /// `#[link_section = "..."]` on the function.
         link_section: Option<String>,
     },
