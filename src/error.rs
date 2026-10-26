@@ -153,6 +153,9 @@ pub const E_PATTERN_COMPLEX: &str = "E2011"; // bounded matcher budget exhausted
 pub const E_ERROR: &str = "E9000"; // error()
 pub const E_ASSERT: &str = "E9100"; // assert()
 pub const E_RUNTIME: &str = "E9999"; // fallback
+/// Internal sentinel for `?` propagation in the interpreter.  It never
+/// escapes `Interp::call_value`; user code cannot catch it with `pcall`.
+pub const E_TRY: &str = "E9998";
 
 /// Render an error cargo-style against the source text.
 pub fn render(err: &LusaError, source: &str, filename: &str) -> String {

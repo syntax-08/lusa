@@ -628,6 +628,82 @@ registry.
 - The dynamic simulations are behavioral, not byte-for-byte: capacity is
   tracked out of band and raw pointer dereferences remain sandboxed.
 
+## Module 21 - Safe error handling with `Result`, `Option`, and `?` (shipped in v1.7.0)
+
+### 21.1 Built-in sum types
+
+- `Result<T, E>` and `Option<T>` are built into both parsers and canonicalize
+  to lowercase `result<T,E>`/`option<T>` annotations.
+- `Ok(value)`, `Err(error)`, `Some(value)`, and the bare `None` (also `None()`)
+  construct tagged values. Constructor payload types are inferred; `nil` on the
+  unpopulated side acts as a wildcard when assigned to a typed sum.
+- The dynamic engines represent sums as tagged tables with private marker keys
+  and clone payloads out of combinators, leaving the receiver usable.
+- The C11 backend lowers `Result` to
+  `LusaResult { bool is_ok; void *ok; void *err; }` and `Option` to
+  `LusaOption { bool is_some; void *value; }`, box the payloads through the
+  module 20 heap contract, and emit per-instantiation new/take/get/clone/drop
+  helpers.
+- Supported payloads are scalars, `string`, structs, `Vec<T>`, `Box<T>`, and
+  nested sums; fixed arrays are rejected with `E0301`.
+
+### 21.2 The `?` operator
+
+- `?` is parsed as a postfix expression in both front ends and lowers to
+  `Instr::Try` in the VM.
+- In a function returning `Result`, `Ok(value)?` evaluates to `value` and
+  `Err(error)?` returns `Err(error)` from the function. In a function returning
+  `Option`, `Some(value)?` evaluates to `value` and `None?` returns `None`.
+- Only the sum kind and error type must match; the operand's success payload
+  becomes the expression value and may differ from the function's success
+  payload.
+- `Ok(...)?` with a `nil` error payload is accepted; the failure branch is
+  dead code.
+- The C emitter clones place/non-owning operands and moves owned ones, takes
+  the success payload, drops the propagated sum, releases the live scopes, and
+  returns the new failure variant. The VM truncates to the frame base and
+  returns the propagated value.
+
+### 21.3 Combinators and matching
+
+- `Result` methods: `is_ok`, `is_err`, `unwrap`, `unwrap_err`, `unwrap_or`,
+  `expect`. `Option` methods: `is_some`, `is_none`, `unwrap`, `unwrap_or`,
+  `expect`.
+- Wrong-variant `unwrap`/`unwrap_err`/`expect` raise catchable `E9999` runtime
+  errors in the dynamic engines and `lusa_throw` in C11.
+- `unwrap_or` checks its fallback against the success payload and specializes
+  one-sided constructor receivers such as `Err("bad"):unwrap_or(9)` and
+  `None:unwrap_or(5)`.
+- `match` accepts `Ok(v)`, `Ok(_)`, `Err(e)`, `Err(_)`, `Some(v)`, `Some(_)`,
+  and `None`, lowered to hidden-temp checks plus `unwrap`/`unwrap_err` binds.
+  The scrutinee is not moved.
+- Printing formats sums as `Ok(value)`, `Err(error)`, `Some(value)`, and
+  `None`.
+
+**Acceptance criteria**
+
+- `tests/module21.rs` covers constructors and combinators, `?` through branches
+  and loops, struct/`Vec`/`Box`/nested-sum payloads, sum parameters, struct
+  fields and vector elements, `match` binding and returns, freestanding scalar
+  sums without print helpers, typed diagnostics, runtime wrong-variant errors,
+  and native + interpreter + VM parity.
+- `examples/error_handling.lusa` runs in `run`, `--vm`, and `--native`.
+- `#[no_std]` builds emit no libc, `malloc`, `free`, or sum print helpers while
+  keeping `?` and scalar/struct payloads working.
+- The full suite passes on Windows, Linux, and macOS.
+
+**Risks**
+
+- Sum payloads allocate through the module 20 heap. In freestanding builds the
+  fixed bump arena bounds the number of live boxed payloads.
+- `string` payloads and sum printing require the hosted runtime; freestanding
+  programs are limited to scalar and struct payloads.
+- `?` is only a propagation primitive: there is no `From`-style error
+  conversion yet, so error types must be identical or assignable.
+- The dynamic engines and C11 differ in ownership mechanics: dynamic sums clone
+  payloads, while C moves owned operands. Programs that rely on using a moved
+  sum after `?` are rejected statically by the C checker.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -658,6 +734,7 @@ registry.
 | v1.4.0 | Inline assembly and hardware controls (shipped) | `asm!` parsing in both front ends, GNU volatile lowering, strict `unsafe` gate, three-engine parity |
 | v1.5.0 | Custom entries, `#[no_std]`, and linker sections (shipped) | freestanding preamble, entry-wrapper ordering, section lowering and promotion, `E0101`/`E0325` diagnostics, three-engine parity, native builds |
 | v1.6.0 | Heap allocator, `Vec<T>`, and `Box<T>` (shipped) | allocator dispatch and validation, freestanding bump arena, geometric vector growth, Box deref safety, owned-element RAII, three-engine parity, native builds |
+| v1.7.0 | Safe error handling, `Result`/`Option`, `?` (shipped) | built-in sums in both parsers, combinators, constructor match patterns, `?` lowering in all engines, sum ownership and drop helpers, freestanding scalar sums, three-engine parity, native builds |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

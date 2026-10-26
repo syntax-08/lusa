@@ -146,6 +146,8 @@ pub enum Instr {
     /// pushes its address (the dynamic-engine analogue of a C `&`).
     AddrOf,
     CloneV,
+    /// `expr?`: unwraps `Ok`/`Some` or returns `Err`/`None` from this frame.
+    Try,
     /// Wraps TOS in a dynamic-engine `Box<T>` (idempotent for existing boxes).
     MakeBox,
     BorrowErr, // borrow is rejected in bytecode mode
@@ -880,6 +882,12 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
             truncate_if_expansion(c, inner);
             c.set_line(e.span);
             c.em(Instr::CloneV);
+        }
+        ExprKind::Try { value: inner } => {
+            compile_expr(c, inner)?;
+            truncate_if_expansion(c, inner);
+            c.set_line(e.span);
+            c.em(Instr::Try);
         }
         ExprKind::Move { e: inner } => {
             let dest = crate::eval::label_of(inner);

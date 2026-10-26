@@ -28,6 +28,35 @@ pub fn box_annotation(ann: &str) -> Option<&str> {
     ann.strip_prefix("box<")?.strip_suffix('>')
 }
 
+/// Splits a canonical `result<T,E>` annotation into its success and error
+/// spellings.  The payload is separated by the first top-level comma so nested
+/// generic types such as `result<box<i32>,string>` stay intact.
+pub fn result_annotation(ann: &str) -> Option<(&str, &str)> {
+    let rest = ann.strip_prefix("result<")?.strip_suffix('>')?;
+    let mut depth = 0usize;
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let ok = &rest[..i];
+                let err = &rest[i + 1..];
+                if ok.is_empty() || err.is_empty() {
+                    return None;
+                }
+                return Some((ok, err));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Splits a canonical `option<T>` annotation into its payload spelling.
+pub fn option_annotation(ann: &str) -> Option<&str> {
+    ann.strip_prefix("option<")?.strip_suffix('>')
+}
+
 #[derive(Clone, Debug)]
 pub struct St {
     pub kind: StKind,
@@ -180,6 +209,8 @@ pub enum ExprKind {
     Vararg,
     /// (expr) — truncates multiple returns to one
     Paren(Box<Expr>),
+    /// `expr?` — propagates `Err`/`None` from the current function.
+    Try { value: Box<Expr> },
 }
 
 #[derive(Clone, Debug)]

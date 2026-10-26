@@ -544,6 +544,79 @@ local function is_box_type(type_name)
     return box_element(type_name) ~= nil
 end
 
+-- ---- built-in Result / Option sums (module 21) ---------------------------
+
+-- Both parsers canonicalise the annotations to `result<OK,ERR>` and
+-- `option<T>`.  The C ABI boxes payloads behind a uniform tagged struct, so
+-- one helper family per concrete instantiation carries the payload's drop,
+-- clone, and unwrap logic with full static typing.
+local function split_generic_body(body, separator)
+    local depth = 0
+    local i = 1
+    while i <= #body do
+        local ch = string.sub(body, i, i)
+        if ch == "<" then
+            depth = depth + 1
+        elseif ch == ">" then
+            depth = depth - 1
+        elseif ch == separator and depth == 0 then
+            return string.sub(body, 1, i - 1), string.sub(body, i + 1)
+        end
+        i = i + 1
+    end
+    return nil
+end
+
+local function result_info(type_name)
+    if type_name == nil or string.sub(type_name, 1, 7) ~= "result<"
+        or string.sub(type_name, #type_name, #type_name) ~= ">" then
+        return nil
+    end
+    local body = string.sub(type_name, 8, #type_name - 1)
+    local ok_type, err_type = split_generic_body(body, ",")
+    if ok_type == nil or err_type == nil or ok_type == "" or err_type == "" then
+        return nil
+    end
+    return ok_type, err_type
+end
+
+local function option_info(type_name)
+    if type_name == nil or string.sub(type_name, 1, 7) ~= "option<"
+        or string.sub(type_name, #type_name, #type_name) ~= ">" then
+        return nil
+    end
+    local inner = string.sub(type_name, 8, #type_name - 1)
+    if inner == "" then
+        return nil
+    end
+    return inner
+end
+
+local function is_result_type(type_name)
+    return result_info(type_name) ~= nil
+end
+
+local function is_option_type(type_name)
+    return option_info(type_name) ~= nil
+end
+
+local function is_sum_type(type_name)
+    return is_result_type(type_name) or is_option_type(type_name)
+end
+
+-- Returns the payload type that an `Ok`/`Some` constructor carries, or the
+-- error payload type for `Err`/`None`.
+local function sum_payloads(type_name)
+    if is_result_type(type_name) then
+        local ok_type, err_type = result_info(type_name)
+        return "result", ok_type, err_type
+    end
+    if is_option_type(type_name) then
+        return "option", option_info(type_name), nil
+    end
+    return nil
+end
+
 
 -- ---- raw pointer and struct types (module 11) ----------------------------
 
@@ -558,6 +631,8 @@ local check_vec_order = {}
 local check_vec_seen = {}
 local check_box_order = {}
 local check_box_seen = {}
+local check_sum_order = {}
+local check_sum_seen = {}
 
 local function register_collection_element(kind, element)
     if kind == "vec" then
@@ -570,6 +645,13 @@ local function register_collection_element(kind, element)
     if check_box_seen[element] ~= true then
         check_box_seen[element] = true
         check_box_order[#check_box_order + 1] = element
+    end
+end
+
+local function register_sum_type(type_name)
+    if check_sum_seen[type_name] ~= true then
+        check_sum_seen[type_name] = true
+        check_sum_order[#check_sum_order + 1] = type_name
     end
 end
 
@@ -690,6 +772,43 @@ local function canonical_type(name, line, column)
         register_collection_element("box", canonical)
         return "box<" .. canonical .. ">"
     end
+    local result_ok, result_err = result_info(name)
+    if result_ok ~= nil then
+        local ok_type = canonical_type(result_ok, line, column)
+        local err_type = canonical_type(result_err, line, column)
+        local function valid_payload(payload, label)
+            if payload == "void" or payload == "auto" then
+                type_fail("E0301", line, column,
+                    "invalid " .. label .. " payload type `"
+                    .. tostring(payload) .. "`")
+            end
+            if is_array_type(payload) then
+                type_fail("E0301", line, column,
+                    "fixed arrays cannot be " .. label
+                    .. " payloads; use a Vec, a pointer, or a struct")
+            end
+        end
+        valid_payload(ok_type, "Result success")
+        valid_payload(err_type, "Result error")
+        local canonical = "result<" .. ok_type .. "," .. err_type .. ">"
+        register_sum_type(canonical)
+        return canonical
+    end
+    local option_inner = option_info(name)
+    if option_inner ~= nil then
+        local inner = canonical_type(option_inner, line, column)
+        if inner == "void" or inner == "auto" then
+            type_fail("E0301", line, column,
+                "invalid Option payload type `" .. tostring(inner) .. "`")
+        end
+        if is_array_type(inner) then
+            type_fail("E0301", line, column,
+                "fixed arrays cannot be Option payloads; use a Vec, a pointer, or a struct")
+        end
+        local canonical = "option<" .. inner .. ">"
+        register_sum_type(canonical)
+        return canonical
+    end
     if is_pointer_type(name) then
         local element = pointer_element(name)
         local canonical = canonical_type(element, line, column)
@@ -742,7 +861,8 @@ local function struct_owns_heap(type_name)
                     if field_type == "string" or field_type == "table"
                         or table_element(field_type) ~= nil
                         or vec_element(field_type) ~= nil
-                        or box_element(field_type) ~= nil then
+                        or box_element(field_type) ~= nil
+                        or is_sum_type(field_type) then
                         return true
                     end
                     if check_structs[field_type] ~= nil
@@ -762,7 +882,8 @@ local function is_heap_type(type_name)
         or type_name == "coroutine" or type_name == "gmatch"
         or table_element(type_name) ~= nil
         or vec_element(type_name) ~= nil
-        or box_element(type_name) ~= nil then
+        or box_element(type_name) ~= nil
+        or is_sum_type(type_name) then
         return true
     end
     local array_element = array_info(type_name)
@@ -826,6 +947,54 @@ end
 local function assignable(target, source, expr)
     if target == source then
         return true
+    end
+    if is_sum_type(target) then
+        local target_kind, target_ok, target_err = sum_payloads(target)
+        local source_kind, source_ok, source_err = sum_payloads(source)
+        if target_kind == nil or source_kind == nil
+            or target_kind ~= source_kind then
+            return false
+        end
+        local ctor = expr
+        while ctor ~= nil and ctor.tag == "Paren" do
+            ctor = ctor.value
+        end
+        if ctor ~= nil and ctor.tag == "Call"
+            and ctor.builtin == "sum_ctor" then
+            -- The inferred constructor type uses `nil` for the variant that
+            -- was not built; compare the populated variant against its actual
+            -- argument so integer literals keep their polymorphic behavior.
+            local argument = ctor.args and ctor.args[1] or nil
+            local actual = argument ~= nil and argument.ctype or "nil"
+            if ctor.sum_kind == "none" then
+                return target_kind == "option"
+            end
+            if target_kind == "result" then
+                if ctor.sum_kind == "ok" then
+                    return assignable(target_ok, actual, argument)
+                elseif ctor.sum_kind == "err" then
+                    return assignable(target_err, actual, argument)
+                end
+                return true
+            end
+            return assignable(target_ok, actual, argument)
+        end
+        if target_kind == "result" then
+            if target_ok ~= source_ok and source_ok ~= "nil" then
+                return false
+            end
+            if target_err ~= source_err and source_err ~= "nil" then
+                return false
+            end
+            return true
+        end
+        if target_ok ~= source_ok and source_ok ~= "nil" then
+            return false
+        end
+        return true
+    end
+    if is_sum_type(source) then
+        return false
     end
     local target_elem, target_len = array_info(target)
     if target_elem ~= nil then
@@ -929,6 +1098,67 @@ local function coerce_literal(expr, target)
         end
     end
     return expr
+end
+
+-- Re-tag a compatible Result/Option expression with the target spelling.
+-- The C ABI is uniform (`LusaResult` / `LusaOption`), so adapt the helper
+-- family and the payload literals that the emitter will reference.
+local function coerce_sum(expr, target)
+    if expr == nil or expr.ctype == target then
+        return expr
+    end
+    local line = expr.line
+    local column = expr.column
+    if not is_sum_type(target) or not is_sum_type(expr.ctype) then
+        check_mismatch(line, column, "sum value", target, tostring(expr.ctype))
+    end
+    if not assignable(target, expr.ctype, clone expr) then
+        check_mismatch(line, column, "sum value", target, expr.ctype)
+    end
+    if expr.tag == "Paren" then
+        expr.value = coerce_sum(expr.value, target)
+        expr.ctype = target
+        return expr
+    end
+    local target_kind, target_ok, target_err = sum_payloads(target)
+    if expr.tag == "Call" and expr.builtin == "sum_ctor" then
+        local payload = nil
+        if target_kind == "option" or expr.sum_kind == "ok"
+            or expr.sum_kind == "some" then
+            payload = target_ok
+        else
+            payload = target_err
+        end
+        expr.ctype = target
+        if expr.sum_kind ~= "none" and expr.args[1] ~= nil then
+            if is_sum_type(payload) then
+                expr.args[1] = coerce_sum(expr.args[1], payload)
+            else
+                expr.args[1] = coerce_literal(expr.args[1], payload)
+            end
+        end
+    end
+    expr.ctype = target
+    return expr
+end
+
+-- Payloads are stored behind a uniform box; consume or clone the source like
+-- any other owning aggregate so the sum becomes the single owner.
+local function ensure_owned_value(checked, type_name)
+    if checked == nil or not is_heap_type(type_name) then
+        return checked
+    end
+    if checked.own == false then
+        return {
+            tag = "Clone",
+            value = checked,
+            ctype = type_name,
+            own = true,
+            line = checked.line,
+            column = checked.column
+        }
+    end
+    return checked
 end
 
 local check_scopes = {}
@@ -1745,6 +1975,252 @@ local function check_string_operation(expr, checked_source, source_type,
     return expr, "gmatch"
 end
 
+-- Built-in sum constructors.  `Ok`/`Err`/`Some` infer their concrete type from
+-- the payload; `None` starts as `option<nil>` and is specialised by the
+-- surrounding annotation (or rejected when a payload is actually needed).
+local function check_sum_constructor(expr, name, args)
+    if args == nil then
+        args = expr.args or {}
+    end
+    local line = expr.line
+    local column = expr.column
+    if name == "None" then
+        if #args ~= 0 then
+            type_fail("E0311", line, column,
+                "`None` takes no arguments, found " .. tostring(#args))
+        end
+        local none_type = canonical_type("option<nil>", line, column)
+        expr.builtin = "sum_ctor"
+        expr.sum_kind = "none"
+        expr.ctype = none_type
+        expr.own = true
+        expr.args = {}
+        return expr, none_type
+    end
+    if #args ~= 1 then
+        type_fail("E0311", line, column,
+            "`" .. name .. "` takes exactly one value, found "
+            .. tostring(#args))
+    end
+    local checked, actual = check_expr(args[1])
+    if actual == "void" or actual == "auto" then
+        type_fail("E0308", checked.line, checked.column,
+            "cannot store a `" .. tostring(actual) .. "` value in a sum type")
+    end
+    if actual == "nil" then
+        type_fail("E0308", checked.line, checked.column,
+            "cannot infer a sum payload from `nil`; pass a typed value")
+    end
+    if is_array_type(actual) then
+        type_fail("E0301", checked.line, checked.column,
+            "fixed arrays cannot be Result/Option payloads; use a Vec, a pointer, or a struct")
+    end
+    local sum_type = nil
+    if name == "Ok" then
+        sum_type = canonical_type("result<" .. actual .. ",nil>", line, column)
+        expr.sum_kind = "ok"
+    elseif name == "Err" then
+        sum_type = canonical_type("result<nil," .. actual .. ">", line, column)
+        expr.sum_kind = "err"
+    else
+        sum_type = canonical_type("option<" .. actual .. ">", line, column)
+        expr.sum_kind = "some"
+    end
+    if checked.tag ~= "Clone" and checked.tag ~= "Borrow"
+        and checked.tag ~= "Move" then
+        consume_expr(clone checked, checked.line, checked.column)
+    end
+    expr.builtin = "sum_ctor"
+    expr.ctype = sum_type
+    expr.own = true
+    expr.args = { checked }
+    return expr, sum_type
+end
+
+-- Result/Option combinators.  `unwrap`/`unwrap_err`/`unwrap_or`/`expect`
+-- produce owned payloads; predicates leave the receiver untouched.
+local function check_sum_method(expr, receiver, sum_type)
+    local kind, ok_type, err_type = sum_payloads(sum_type)
+    local name = expr.name
+    local args = expr.args or {}
+    local method_args = {}
+    local result = nil
+    local own = false
+    local final_receiver = receiver
+    local final_sum_type = sum_type
+
+    local function no_arguments(label)
+        if #args ~= 0 then
+            type_fail("E0311", expr.line, expr.column,
+                "`" .. label .. "` takes no arguments, found "
+                .. tostring(#args))
+        end
+    end
+
+    local function fallback_argument(label)
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`" .. label .. "` takes one fallback value, found "
+                .. tostring(#args))
+        end
+        return check_expr(args[1])
+    end
+
+    local function finish_fallback(checked, actual, payload, label)
+        if not assignable(payload, actual, clone checked) then
+            check_mismatch(checked.line, checked.column,
+                label .. " fallback", payload, actual)
+        end
+        checked = coerce_literal(checked, payload)
+        checked = ensure_owned_value(checked, payload)
+        if checked.tag ~= "Clone" and checked.tag ~= "Borrow"
+            and checked.tag ~= "Move" then
+            consume_expr(clone checked, checked.line, checked.column)
+        end
+        return checked
+    end
+
+    local function fallback_sum_type(actual)
+        if kind == "result" then
+            return canonical_type("result<" .. actual .. "," .. err_type .. ">",
+                expr.line, expr.column)
+        end
+        return canonical_type("option<" .. actual .. ">", expr.line, expr.column)
+    end
+
+    local function constructor_receiver()
+        local node = clone final_receiver
+        while node ~= nil and node.tag == "Paren" do
+            node = node.value
+        end
+        return node ~= nil and node.tag == "Call"
+            and node.builtin == "sum_ctor"
+    end
+
+    local function specialize_fallback(actual)
+        if not constructor_receiver() then
+            type_fail("E0308", expr.line, expr.column,
+                "cannot infer the payload type of `" .. tostring(sum_type)
+                .. "`; add an explicit Result/Option annotation")
+        end
+        local specialized = fallback_sum_type(actual)
+        local adapted = coerce_sum(clone final_receiver, specialized)
+        final_receiver = adapted
+        final_sum_type = specialized
+        local new_kind, new_ok, new_err = sum_payloads(specialized)
+        kind, ok_type, err_type = new_kind, new_ok, new_err
+    end
+
+    local function check_message()
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`expect` takes one message, found " .. tostring(#args))
+        end
+        local checked, actual = check_expr(args[1])
+        if actual ~= "string" then
+            check_mismatch(checked.line, checked.column,
+                "expect message", "string", actual)
+        end
+        method_args[1] = checked
+        own = true
+    end
+
+    if kind == "result" then
+        if name == "is_ok" or name == "is_err" then
+            no_arguments("Result::" .. name)
+            result = "bool"
+        elseif name == "unwrap" then
+            no_arguments("Result::unwrap")
+            result = ok_type
+            own = true
+        elseif name == "unwrap_err" then
+            no_arguments("Result::unwrap_err")
+            result = err_type
+            own = true
+        elseif name == "unwrap_or" then
+            local checked, actual = fallback_argument("Result::unwrap_or")
+            if ok_type == "nil" then
+                specialize_fallback(actual)
+            end
+            method_args[1] = finish_fallback(checked, actual, ok_type,
+                "Result::unwrap_or")
+            own = true
+            result = ok_type
+        elseif name == "expect" then
+            check_message()
+            result = ok_type
+        else
+            type_fail("E0318", expr.line, expr.column,
+                "unknown Result method `" .. tostring(name)
+                .. "`; use is_ok, is_err, unwrap, unwrap_err, unwrap_or, or expect")
+        end
+    else
+        if name == "is_some" or name == "is_none" then
+            no_arguments("Option::" .. name)
+            result = "bool"
+        elseif name == "unwrap" then
+            no_arguments("Option::unwrap")
+            result = ok_type
+            own = true
+        elseif name == "unwrap_or" then
+            local checked, actual = fallback_argument("Option::unwrap_or")
+            if ok_type == "nil" then
+                specialize_fallback(actual)
+            end
+            method_args[1] = finish_fallback(checked, actual, ok_type,
+                "Option::unwrap_or")
+            own = true
+            result = ok_type
+        elseif name == "expect" then
+            check_message()
+            result = ok_type
+        else
+            type_fail("E0318", expr.line, expr.column,
+                "unknown Option method `" .. tostring(name)
+                .. "`; use is_some, is_none, unwrap, unwrap_or, or expect")
+        end
+    end
+    if result == "nil" then
+        type_fail("E0308", expr.line, expr.column,
+            "cannot infer the payload type of `" .. tostring(sum_type)
+            .. "`; add an explicit Result/Option annotation")
+    end
+    expr.obj = final_receiver
+    expr.args = method_args
+    expr.ctype = result
+    expr.own = own
+    expr.sum_method = name
+    expr.sum_type = final_sum_type
+    return expr, result
+end
+
+-- Printing a sum mirrors the runtime engine output: `Ok(...)`, `Err(...)`,
+-- `Some(...)`, or `None`.  Payloads that have no native printer are rejected
+-- here instead of failing while the helper is generated.
+local function sum_printable_payload(type_name)
+    if type_name == "nil" or type_name == "i32" or type_name == "u32"
+        or type_name == "i128" or type_name == "f32"
+        or type_name == "bool" or type_name == "string"
+        or type_name == "table" or type_name == "value"
+        or table_element(type_name) ~= nil then
+        return true
+    end
+    if pointer_element(type_name) ~= nil then
+        return true
+    end
+    if is_sum_type(type_name) then
+        local kind, ok_type, err_type = sum_payloads(type_name)
+        if sum_printable_payload(ok_type) then
+            if kind == "option" then
+                return true
+            end
+            return sum_printable_payload(err_type)
+        end
+        return false
+    end
+    return false
+end
+
 local function check_call(expr)
     local callee = borrow expr.callee
     if callee.tag == "Field" then
@@ -1810,6 +2286,10 @@ local function check_call(expr)
         expr.own = true
         expr.args = { checked_value }
         return expr, box_type
+    end
+
+    if name == "Ok" or name == "Err" or name == "Some" or name == "None" then
+        return check_sum_constructor(expr, name, args)
     end
 
     if name == "unsafe_ptr_cast" or name == "unsafe_read_mem"
@@ -2035,6 +2515,11 @@ local function check_call(expr)
                 type_fail("E0308", checked_arg.line, checked_arg.column,
                     "`print` cannot print a struct value")
             end
+            if is_sum_type(arg_type) and not sum_printable_payload(arg_type) then
+                type_fail("E0308", checked_arg.line, checked_arg.column,
+                    "`print` cannot print `" .. arg_type
+                    .. "`; its payload has no native printer")
+            end
             args[i] = checked_arg
             i = i + 1
         end
@@ -2062,15 +2547,20 @@ local function check_call(expr)
             .. " argument(s) but " .. tostring(#args) .. " were supplied")
     end
     i = 1
+    local param_types = {}
     while i <= #args do
         local checked_arg, arg_type = check_expr(args[i])
         local param_type = signature.params[i].type
+        param_types[i] = param_type
         if not assignable(param_type, arg_type, clone checked_arg) then
             check_mismatch(checked_arg.line, checked_arg.column,
                 "argument " .. tostring(i) .. " of `" .. name .. "`",
                 param_type, arg_type)
         end
         checked_arg = coerce_literal(checked_arg, param_type)
+        if is_sum_type(param_type) then
+            checked_arg = coerce_sum(checked_arg, param_type)
+        end
         if checked_arg.tag ~= "Clone" and checked_arg.tag ~= "Borrow"
             and checked_arg.tag ~= "Move" then
             consume_expr(clone checked_arg, checked_arg.line, checked_arg.column)
@@ -2081,6 +2571,7 @@ local function check_call(expr)
     expr.ctype = signature.ret
     expr.fn_name = name
     expr.args = args
+    expr.param_types = param_types
     return expr, signature.ret
 end
 
@@ -2102,6 +2593,9 @@ local function check_vec_method(expr, receiver, vec_type)
                 "Vec:push value", element, actual)
         end
         checked = coerce_literal(checked, element)
+        if is_sum_type(element) then
+            checked = coerce_sum(checked, element)
+        end
         if checked.tag ~= "Clone" and checked.tag ~= "Borrow"
             and checked.tag ~= "Move" then
             consume_expr(clone checked, checked.line, checked.column)
@@ -2179,6 +2673,9 @@ check_method_call = function(expr)
     if is_vec_type(obj_type) then
         return check_vec_method(expr, checked_obj, obj_type)
     end
+    if is_sum_type(obj_type) then
+        return check_sum_method(expr, checked_obj, obj_type)
+    end
     if not is_table_type(obj_type) then
         check_mismatch(expr.line, expr.column, "method receiver",
             "table", obj_type)
@@ -2212,15 +2709,20 @@ check_method_call = function(expr)
         borrow_id = begin_mutable_borrow(checked_obj, expr.line, expr.column)
     end
     local i = 1
+    local param_types = {}
     while i <= #args do
         local checked_arg, arg_type = check_expr(args[i])
         local param = borrow signature.params[i + 1]
+        param_types[i] = param.type
         if not assignable(param.type, arg_type, clone checked_arg) then
             check_mismatch(checked_arg.line, checked_arg.column,
                 "argument " .. tostring(i) .. " of method `" .. expr.name .. "`",
                 param.type, arg_type)
         end
         checked_arg = coerce_literal(checked_arg, param.type)
+        if is_sum_type(param.type) then
+            checked_arg = coerce_sum(checked_arg, param.type)
+        end
         if checked_arg.tag ~= "Clone" and checked_arg.tag ~= "Borrow"
             and checked_arg.tag ~= "Move" then
             consume_expr(clone checked_arg, checked_arg.line, checked_arg.column)
@@ -2232,6 +2734,7 @@ check_method_call = function(expr)
     expr.ctype = signature.ret
     expr.fn_key = key
     expr.args = args
+    expr.param_types = param_types
     return expr, signature.ret
 end
 
@@ -2257,6 +2760,9 @@ local function check_vec_literal(expr, vec_type)
                 "Vec literal element", element, actual)
         end
         checked = coerce_literal(checked, element)
+        if is_sum_type(element) then
+            checked = coerce_sum(checked, element)
+        end
         if checked.tag ~= "Clone" and checked.tag ~= "Borrow"
             and checked.tag ~= "Move" then
             consume_expr(clone checked, checked.line, checked.column)
@@ -2410,6 +2916,9 @@ local function check_struct_lit(expr)
                 slot.type, actual)
         end
         checked = coerce_literal(checked, slot.type)
+        if is_sum_type(slot.type) then
+            checked = coerce_sum(checked, slot.type)
+        end
         if checked.tag ~= "Clone" and checked.tag ~= "Borrow"
             and checked.tag ~= "Move" then
             consume_expr(clone checked, checked.line, checked.column)
@@ -2422,6 +2931,68 @@ local function check_struct_lit(expr)
     local struct_name = clone expr.name
     expr.ctype = clone struct_name
     return expr, struct_name
+end
+
+-- `?` short-circuits a function returning a compatible Result/Option.  The
+-- C emitter needs the propagated sum and the function's declared return type,
+-- so resolve both while the checker still knows the enclosing signature.
+local function check_try(expr)
+    local checked, operand = check_expr(expr.value)
+    if not is_sum_type(operand) then
+        type_fail("E0312", expr.line, expr.column,
+            "`?` requires a Result or Option value, found `"
+            .. tostring(operand) .. "`")
+    end
+    if not check_in_function or check_current_function == nil then
+        type_fail("E0312", expr.line, expr.column,
+            "`?` can only be used inside a function returning Result or Option")
+    end
+    local return_type = check_return_type
+    local return_kind, return_ok, return_err = sum_payloads(return_type)
+    local operand_kind, operand_ok, operand_err = sum_payloads(operand)
+    if not is_sum_type(return_type) or return_kind ~= operand_kind then
+        type_fail("E0312", expr.line, expr.column,
+            "`?` in a function returning `" .. tostring(return_type)
+            .. "` requires a compatible Result or Option operand, found `"
+            .. tostring(operand) .. "`")
+    end
+    -- `?` only propagates the failure variant.  The success payload becomes the
+    -- expression value and need not match the function's success payload.
+    if operand_kind == "result" and return_err ~= operand_err
+        and operand_err ~= "nil" then
+        if not assignable(return_err, operand_err, clone checked) then
+            type_fail("E0312", expr.line, expr.column,
+                "`?` propagates error type `" .. tostring(operand_err)
+                .. "` but the function returns `" .. tostring(return_err)
+                .. "`")
+        end
+    end
+    local payload = operand_ok
+    if payload == nil or payload == "nil" then
+        type_fail("E0308", expr.line, expr.column,
+            "cannot infer the payload type produced by `?`; the operand "
+            .. "carries no success value")
+    end
+    expr.value = checked
+    expr.ctype = payload
+    expr.own = true
+    expr.try_sum_type = operand
+    return expr, payload
+end
+
+local function expr_has_try(expr)
+    if type(expr) ~= "table" then
+        return false
+    end
+    if expr.tag == "Try" then
+        return true
+    end
+    for _, value in pairs(expr) do
+        if type(value) == "table" and expr_has_try(value) then
+            return true
+        end
+    end
+    return false
 end
 
 check_expr = function(expr)
@@ -2660,6 +3231,10 @@ check_expr = function(expr)
     end
 
     if tag == "Logical" then
+        if expr_has_try(expr.lhs) or expr_has_try(expr.rhs) then
+            type_fail("E0312", line, column,
+                "`?` cannot be used inside `and` or `or`; bind the value first")
+        end
         local checked_lhs, lhs_type = check_expr(expr.lhs)
         local checked_rhs, rhs_type = check_expr(expr.rhs)
         expr.lhs = checked_lhs
@@ -2670,6 +3245,10 @@ check_expr = function(expr)
         end
         expr.ctype = "bool"
         return expr, "bool"
+    end
+
+    if tag == "Try" then
+        return check_try(expr)
     end
 
     if tag == "Call" then
@@ -3272,6 +3851,9 @@ local function check_local(stmt)
                     "local `" .. names[i] .. "`", final_type, actual)
             end
             checked = coerce_literal(checked, final_type)
+            if is_sum_type(final_type) then
+                checked = coerce_sum(checked, final_type)
+            end
         end
 
         if final_type == "void" then
@@ -3518,6 +4100,9 @@ local function check_assign(stmt)
                     .. "`", expected, actual)
             end
             checked = coerce_literal(checked, expected)
+            if is_sum_type(expected) then
+                checked = coerce_sum(checked, expected)
+            end
             if checked.tag ~= "Clone" and checked.tag ~= "Borrow"
                 and checked.tag ~= "Move" then
                 consume_expr(clone checked, checked.line, checked.column)
@@ -3568,8 +4153,9 @@ local function check_function(signature)
     while i <= #signature.params do
         local param = borrow signature.params[i]
         local is_self = signature.receiver ~= nil and i == 1
-        scope_declare(param.name, param.type, false, true, param.schema,
-            is_self, param.elem_type)
+        local owned_sum = is_sum_type(param.type)
+        scope_declare(param.name, param.type, owned_sum, not owned_sum,
+            param.schema, is_self, param.elem_type)
         local node_index = i
         if signature.receiver ~= nil then
             node_index = i - 1
@@ -3627,6 +4213,7 @@ local function check_struct_decl(stmt)
             or field_type == "bool" or field_type == "string"
             or is_table_type(field_type) or is_array_type(field_type)
             or is_vec_type(field_type) or is_box_type(field_type)
+            or is_sum_type(field_type)
         if not valid and not is_pointer_type(field_type)
             and not is_struct_type(field_type) then
             type_fail("E0312", field.line, field.column,
@@ -4090,6 +4677,9 @@ check_stmt = function(stmt, top_level)
                 "return value", check_return_type, actual)
         end
         checked_value = coerce_literal(checked_value, check_return_type)
+        if is_sum_type(check_return_type) then
+            checked_value = coerce_sum(checked_value, check_return_type)
+        end
         if checked_value.tag ~= "Clone" and checked_value.tag ~= "Borrow"
             and checked_value.tag ~= "Move" then
             consume_expr(clone checked_value, checked_value.line, checked_value.column)
@@ -4231,6 +4821,8 @@ local function check_program(ast)
     check_vec_seen = {}
     check_box_order = {}
     check_box_seen = {}
+    check_sum_order = {}
+    check_sum_seen = {}
 
     ast.body = scan_structs(ast.body)
     check_no_std = program_no_std(clone ast.body)
@@ -4290,6 +4882,7 @@ local function check_program(ast)
     ast.has_global_deallocator = check_dealloc_key ~= nil
     ast.vec_elements = check_vec_order
     ast.box_elements = check_box_order
+    ast.sum_types = check_sum_order
     return ast
 end
 
@@ -4400,6 +4993,8 @@ local function c_type(type_name)
     end
     if type_name == "value" then return "LusaValue" end
     if is_vec_type(type_name) then return "LusaVec" end
+    if is_result_type(type_name) then return "LusaResult" end
+    if is_option_type(type_name) then return "LusaOption" end
     if is_box_type(type_name) then
         return c_type(box_element(type_name)) .. " *"
     end
@@ -4447,6 +5042,12 @@ local function default_c(type_name)
     if is_vec_type(type_name) then
         return "(LusaVec){0}"
     end
+    if is_result_type(type_name) then
+        return "(LusaResult){false, NULL, NULL}"
+    end
+    if is_option_type(type_name) then
+        return "(LusaOption){false, NULL}"
+    end
     if is_box_type(type_name) then
         return "NULL"
     end
@@ -4464,7 +5065,7 @@ end
 -- valid static aggregate initializer on every supported compiler.
 local function global_default_c(type_name)
     if is_struct_type(type_name) or is_array_type(type_name)
-        or is_vec_type(type_name) then
+        or is_vec_type(type_name) or is_sum_type(type_name) then
         return "{0}"
     end
     return default_c(type_name)
@@ -4606,6 +5207,12 @@ local function emit_clone_place(type_name, access)
     elseif is_vec_type(type_name) then
         line(access .. " = lusa_vec_clone_" .. collection_tag(vec_element(type_name))
             .. "(&" .. access .. ");")
+    elseif is_result_type(type_name) then
+        line(access .. " = lusa_clone_result_" .. collection_tag(type_name)
+            .. "(" .. access .. ");")
+    elseif is_option_type(type_name) then
+        line(access .. " = lusa_clone_option_" .. collection_tag(type_name)
+            .. "(" .. access .. ");")
     elseif is_box_type(type_name) then
         line(access .. " = lusa_box_clone_" .. collection_tag(box_element(type_name))
             .. "(" .. access .. ");")
@@ -4621,6 +5228,12 @@ local function emit_drop_place(type_name, access)
         line("lusa_drop_table(&" .. access .. ");")
     elseif is_vec_type(type_name) then
         line("lusa_drop_vec_" .. collection_tag(vec_element(type_name)) .. "(&"
+            .. access .. ");")
+    elseif is_result_type(type_name) then
+        line("lusa_drop_result_" .. collection_tag(type_name) .. "(&"
+            .. access .. ");")
+    elseif is_option_type(type_name) then
+        line("lusa_drop_option_" .. collection_tag(type_name) .. "(&"
             .. access .. ");")
     elseif is_box_type(type_name) then
         line("lusa_drop_box_" .. collection_tag(box_element(type_name)) .. "(&"
@@ -4814,10 +5427,11 @@ local function null_moved_source(expr, skip)
         return
     end
     emit_mark_moved(entry.name)
-    if is_struct_type(entry.type) or is_vec_type(entry.type) then
-        -- A moved struct or Vec is a value, not a pointer.  There is no NULL
-        -- to store; the persisted moved flag alone prevents the scope drop
-        -- from touching the aliased fields.
+    if is_struct_type(entry.type) or is_vec_type(entry.type)
+        or is_sum_type(entry.type) then
+        -- A moved struct, Vec, or sum is a value, not a pointer.  There is no
+        -- NULL to store; the persisted moved flag alone prevents the scope
+        -- drop from touching the aliased fields.
         entry.moved = true
         return
     end
@@ -5725,6 +6339,19 @@ local HEAP_RUNTIME = {
     "    uint32_t capacity;",
     "} LusaVec;",
     "",
+    "/* Built-in Result/Option sums.  Payloads are heap-boxed so the same",
+    "   uniform ABI can carry scalars, strings, structs, and nested sums. */",
+    "typedef struct LusaResult {",
+    "    bool is_ok;",
+    "    void *ok;",
+    "    void *err;",
+    "} LusaResult;",
+    "",
+    "typedef struct LusaOption {",
+    "    bool is_some;",
+    "    void *value;",
+    "} LusaOption;",
+    "",
     "static void *lusa_heap_alloc(uint32_t size, uint32_t align);",
     "static void lusa_heap_dealloc(void *ptr, uint32_t size, uint32_t align);",
     "",
@@ -6311,6 +6938,14 @@ local function emit_clone_heap(type_name, value)
         return "lusa_vec_clone_" .. collection_tag(vec_element(type_name))
             .. "(&(" .. value .. "))"
     end
+    if is_result_type(type_name) then
+        return "lusa_clone_result_" .. collection_tag(type_name)
+            .. "(" .. value .. ")"
+    end
+    if is_option_type(type_name) then
+        return "lusa_clone_option_" .. collection_tag(type_name)
+            .. "(" .. value .. ")"
+    end
     if is_box_type(type_name) then
         return "lusa_box_clone_" .. collection_tag(box_element(type_name))
             .. "(" .. value .. ")"
@@ -6357,6 +6992,107 @@ local function emit_collection_prototypes(ast)
     end
     if #vecs > 0 or #boxes > 0 then
         line("")
+    end
+    local sums = ast.sum_types or {}
+    i = 1
+    while i <= #sums do
+        local sum_type = clone sums[i]
+        local tag_name = collection_tag(sum_type)
+        if is_result_type(sum_type) then
+            local ok_type, err_type = result_info(sum_type)
+            local c_ok = c_type(ok_type)
+            local c_err = c_type(err_type)
+            line("static LusaResult lusa_result_new_ok_" .. tag_name
+                .. "(" .. c_ok .. " value);")
+            line("static LusaResult lusa_result_new_err_" .. tag_name
+                .. "(" .. c_err .. " value);")
+            line("static bool lusa_result_is_ok_" .. tag_name
+                .. "(LusaResult value);")
+            line("static bool lusa_result_is_err_" .. tag_name
+                .. "(LusaResult value);")
+            line("static " .. c_ok .. " lusa_result_get_" .. tag_name
+                .. "(LusaResult value);")
+            line("static " .. c_err .. " lusa_result_get_err_" .. tag_name
+                .. "(LusaResult value);")
+            line("static " .. c_ok .. " lusa_result_take_" .. tag_name
+                .. "(LusaResult *value);")
+            line("static " .. c_err .. " lusa_result_take_err_" .. tag_name
+                .. "(LusaResult *value);")
+            line("static " .. c_ok .. " lusa_result_unwrap_or_" .. tag_name
+                .. "(LusaResult value, " .. c_ok .. " fallback);")
+            line("static " .. c_ok .. " lusa_result_expect_" .. tag_name
+                .. "(LusaResult value, const char *message);")
+            line("static LusaResult lusa_clone_result_" .. tag_name
+                .. "(LusaResult value);")
+            line("static void lusa_drop_result_" .. tag_name
+                .. "(LusaResult *value);")
+            if not emit_no_std then
+                line("static void lusa_print_result_" .. tag_name
+                    .. "(LusaResult value);")
+            end
+        else
+            local inner = option_info(sum_type)
+            local c_inner = c_type(inner)
+            line("static LusaOption lusa_option_new_some_" .. tag_name
+                .. "(" .. c_inner .. " value);")
+            line("static LusaOption lusa_option_none_" .. tag_name
+                .. "(void);")
+            line("static bool lusa_option_is_some_" .. tag_name
+                .. "(LusaOption value);")
+            line("static bool lusa_option_is_none_" .. tag_name
+                .. "(LusaOption value);")
+            line("static " .. c_inner .. " lusa_option_get_" .. tag_name
+                .. "(LusaOption value);")
+            line("static " .. c_inner .. " lusa_option_take_" .. tag_name
+                .. "(LusaOption *value);")
+            line("static " .. c_inner .. " lusa_option_unwrap_or_" .. tag_name
+                .. "(LusaOption value, " .. c_inner .. " fallback);")
+            line("static " .. c_inner .. " lusa_option_expect_" .. tag_name
+                .. "(LusaOption value, const char *message);")
+            line("static LusaOption lusa_clone_option_" .. tag_name
+                .. "(LusaOption value);")
+            line("static void lusa_drop_option_" .. tag_name
+                .. "(LusaOption *value);")
+            if not emit_no_std then
+                line("static void lusa_print_option_" .. tag_name
+                    .. "(LusaOption value);")
+            end
+        end
+        line("")
+        i = i + 1
+    end
+end
+
+local function emit_sum_print_payload(type_name, access)
+    if type_name == "nil" then
+        line("lusa_print_nil();")
+    elseif type_name == "i32" then
+        line("lusa_print_i32(" .. access .. ");")
+    elseif type_name == "u32" then
+        line("lusa_print_u32(" .. access .. ");")
+    elseif type_name == "i128" then
+        line("lusa_print_i128(" .. access .. ");")
+    elseif type_name == "f32" then
+        line("lusa_print_f32(" .. access .. ");")
+    elseif type_name == "bool" then
+        line("lusa_print_bool(" .. access .. ");")
+    elseif type_name == "string" then
+        line("lusa_print_string(" .. access .. ");")
+    elseif type_name == "table" or table_element(type_name) ~= nil then
+        line("lusa_print_table(" .. access .. ");")
+    elseif type_name == "value" then
+        line("lusa_print_value(" .. access .. ");")
+    elseif is_result_type(type_name) then
+        line("lusa_print_result_" .. collection_tag(type_name)
+            .. "(" .. access .. ");")
+    elseif is_option_type(type_name) then
+        line("lusa_print_option_" .. collection_tag(type_name)
+            .. "(" .. access .. ");")
+    elseif pointer_element(type_name) ~= nil then
+        line("lusa_print_u32((uint32_t)(uintptr_t)(" .. access .. "));")
+    else
+        fail(0, 0, "internal: no native printer for `"
+            .. tostring(type_name) .. "`")
     end
 end
 
@@ -6522,8 +7258,492 @@ local function emit_collection_helpers(ast)
         line("")
         i = i + 1
     end
-end
 
+    local sums = ast.sum_types or {}
+    i = 1
+    while i <= #sums do
+        local sum_type = clone sums[i]
+        local tag_name = collection_tag(sum_type)
+        if is_result_type(sum_type) then
+            local ok_type, err_type = result_info(sum_type)
+            local c_ok = c_type(ok_type)
+            local c_err = c_type(err_type)
+            local ok_default = default_c(ok_type)
+            local err_default = default_c(err_type)
+
+            line("static LusaResult lusa_result_new_ok_" .. tag_name .. "("
+                .. c_ok .. " value) {")
+            emit_indent = emit_indent + 1
+            line("LusaResult out;")
+            line("out.is_ok = true;")
+            line("out.err = NULL;")
+            line("out.ok = lusa_heap_alloc((uint32_t)sizeof(" .. c_ok
+                .. "), (uint32_t)LUSA_ALIGNOF(" .. c_ok .. "));")
+            line("if (out.ok == NULL) {")
+            emit_indent = emit_indent + 1
+            line('lusa_throw("E9999", "out of memory");')
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("*(((" .. c_ok .. " *)out.ok)) = value;")
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static LusaResult lusa_result_new_err_" .. tag_name .. "("
+                .. c_err .. " value) {")
+            emit_indent = emit_indent + 1
+            line("LusaResult out;")
+            line("out.is_ok = false;")
+            line("out.ok = NULL;")
+            line("out.err = lusa_heap_alloc((uint32_t)sizeof(" .. c_err
+                .. "), (uint32_t)LUSA_ALIGNOF(" .. c_err .. "));")
+            line("if (out.err == NULL) {")
+            emit_indent = emit_indent + 1
+            line('lusa_throw("E9999", "out of memory");')
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("*(((" .. c_err .. " *)out.err)) = value;")
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static bool lusa_result_is_ok_" .. tag_name
+                .. "(LusaResult value) {")
+            emit_indent = emit_indent + 1
+            line("return value.is_ok;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+            line("static bool lusa_result_is_err_" .. tag_name
+                .. "(LusaResult value) {")
+            emit_indent = emit_indent + 1
+            line("return !value.is_ok;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static void lusa_drop_result_" .. tag_name
+                .. "(LusaResult *value) {")
+            emit_indent = emit_indent + 1
+            line("if (value == NULL) return;")
+            line("if (value->is_ok) {")
+            emit_indent = emit_indent + 1
+            line("if (value->ok != NULL) {")
+            emit_indent = emit_indent + 1
+            line(c_ok .. " item = *(((" .. c_ok .. " *)value->ok));")
+            emit_drop_place(ok_type, "item")
+            line("lusa_heap_dealloc(value->ok, (uint32_t)sizeof(" .. c_ok
+                .. "), (uint32_t)LUSA_ALIGNOF(" .. c_ok .. "));")
+            line("value->ok = NULL;")
+            emit_indent = emit_indent - 1
+            line("}")
+            emit_indent = emit_indent - 1
+            line("} else {")
+            emit_indent = emit_indent + 1
+            line("if (value->err != NULL) {")
+            emit_indent = emit_indent + 1
+            line(c_err .. " item = *(((" .. c_err .. " *)value->err));")
+            emit_drop_place(err_type, "item")
+            line("lusa_heap_dealloc(value->err, (uint32_t)sizeof(" .. c_err
+                .. "), (uint32_t)LUSA_ALIGNOF(" .. c_err .. "));")
+            line("value->err = NULL;")
+            emit_indent = emit_indent - 1
+            line("}")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("value->is_ok = false;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static LusaResult lusa_clone_result_" .. tag_name
+                .. "(LusaResult value) {")
+            emit_indent = emit_indent + 1
+            line("LusaResult out;")
+            line("out.is_ok = value.is_ok;")
+            line("out.ok = NULL;")
+            line("out.err = NULL;")
+            line("if (value.is_ok) {")
+            emit_indent = emit_indent + 1
+            line("if (value.ok != NULL) {")
+            emit_indent = emit_indent + 1
+            line(c_ok .. " item = *(((" .. c_ok .. " *)value.ok));")
+            emit_clone_place(ok_type, "item")
+            line("out.ok = lusa_heap_alloc((uint32_t)sizeof(" .. c_ok
+                .. "), (uint32_t)LUSA_ALIGNOF(" .. c_ok .. "));")
+            line("if (out.ok == NULL) {")
+            emit_indent = emit_indent + 1
+            line('lusa_throw("E9999", "out of memory");')
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("*(((" .. c_ok .. " *)out.ok)) = item;")
+            emit_indent = emit_indent - 1
+            line("}")
+            emit_indent = emit_indent - 1
+            line("} else {")
+            emit_indent = emit_indent + 1
+            line("if (value.err != NULL) {")
+            emit_indent = emit_indent + 1
+            line(c_err .. " item = *(((" .. c_err .. " *)value.err));")
+            emit_clone_place(err_type, "item")
+            line("out.err = lusa_heap_alloc((uint32_t)sizeof(" .. c_err
+                .. "), (uint32_t)LUSA_ALIGNOF(" .. c_err .. "));")
+            line("if (out.err == NULL) {")
+            emit_indent = emit_indent + 1
+            line('lusa_throw("E9999", "out of memory");')
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("*(((" .. c_err .. " *)out.err)) = item;")
+            emit_indent = emit_indent - 1
+            line("}")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static " .. c_ok .. " lusa_result_get_" .. tag_name
+                .. "(LusaResult value) {")
+            emit_indent = emit_indent + 1
+            line(c_ok .. " out = " .. ok_default .. ";")
+            line("if (!value.is_ok) {")
+            emit_indent = emit_indent + 1
+            line('lusa_throw("E9999", "called `Result::unwrap()` on an `Err` value");')
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("if (value.ok != NULL) {")
+            emit_indent = emit_indent + 1
+            line("out = *(((" .. c_ok .. " *)value.ok));")
+            emit_clone_place(ok_type, "out")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static " .. c_err .. " lusa_result_get_err_" .. tag_name
+                .. "(LusaResult value) {")
+            emit_indent = emit_indent + 1
+            line(c_err .. " out = " .. err_default .. ";")
+            line("if (value.is_ok) {")
+            emit_indent = emit_indent + 1
+            line('lusa_throw("E9999", "called `Result::unwrap_err()` on an `Ok` value");')
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("if (value.err != NULL) {")
+            emit_indent = emit_indent + 1
+            line("out = *(((" .. c_err .. " *)value.err));")
+            emit_clone_place(err_type, "out")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static " .. c_ok .. " lusa_result_take_" .. tag_name
+                .. "(LusaResult *value) {")
+            emit_indent = emit_indent + 1
+            line(c_ok .. " out = " .. ok_default .. ";")
+            line("if (value == NULL || !value->is_ok || value->ok == NULL) return out;")
+            line("out = *(((" .. c_ok .. " *)value->ok));")
+            line("lusa_heap_dealloc(value->ok, (uint32_t)sizeof(" .. c_ok
+                .. "), (uint32_t)LUSA_ALIGNOF(" .. c_ok .. "));")
+            line("value->ok = NULL;")
+            line("value->is_ok = false;")
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static " .. c_err .. " lusa_result_take_err_" .. tag_name
+                .. "(LusaResult *value) {")
+            emit_indent = emit_indent + 1
+            line(c_err .. " out = " .. err_default .. ";")
+            line("if (value == NULL || value->is_ok || value->err == NULL) return out;")
+            line("out = *(((" .. c_err .. " *)value->err));")
+            line("lusa_heap_dealloc(value->err, (uint32_t)sizeof(" .. c_err
+                .. "), (uint32_t)LUSA_ALIGNOF(" .. c_err .. "));")
+            line("value->err = NULL;")
+            line("value->is_ok = true;")
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static " .. c_ok .. " lusa_result_unwrap_or_" .. tag_name
+                .. "(LusaResult value, " .. c_ok .. " fallback) {")
+            emit_indent = emit_indent + 1
+            line("if (value.is_ok) {")
+            emit_indent = emit_indent + 1
+            if is_heap_type(ok_type) then
+                emit_drop_place(ok_type, "fallback")
+            end
+            line("return lusa_result_get_" .. tag_name .. "(value);")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("return fallback;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static " .. c_ok .. " lusa_result_expect_" .. tag_name
+                .. "(LusaResult value, const char *message) {")
+            emit_indent = emit_indent + 1
+            line("if (!value.is_ok) {")
+            emit_indent = emit_indent + 1
+            line('lusa_throw("E9999", message == NULL ? "expect failed" : message);')
+            line("return " .. ok_default .. ";")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("return lusa_result_get_" .. tag_name .. "(value);")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            if not emit_no_std and sum_printable_payload(sum_type) then
+                line("static void lusa_print_result_" .. tag_name
+                    .. "(LusaResult value) {")
+                emit_indent = emit_indent + 1
+                line("if (value.is_ok) {")
+                emit_indent = emit_indent + 1
+                line('fputs("Ok(", stdout);')
+                line("if (value.ok != NULL) {")
+                emit_indent = emit_indent + 1
+                emit_sum_print_payload(ok_type,
+                    "(*(((" .. c_ok .. " *)value.ok)))")
+                emit_indent = emit_indent - 1
+                line("} else {")
+                emit_indent = emit_indent + 1
+                line("lusa_print_nil();")
+                emit_indent = emit_indent - 1
+                line("}")
+                line('fputs(")", stdout);')
+                emit_indent = emit_indent - 1
+                line("} else {")
+                emit_indent = emit_indent + 1
+                line('fputs("Err(", stdout);')
+                line("if (value.err != NULL) {")
+                emit_indent = emit_indent + 1
+                emit_sum_print_payload(err_type,
+                    "(*(((" .. c_err .. " *)value.err)))")
+                emit_indent = emit_indent - 1
+                line("} else {")
+                emit_indent = emit_indent + 1
+                line("lusa_print_nil();")
+                emit_indent = emit_indent - 1
+                line("}")
+                line('fputs(")", stdout);')
+                emit_indent = emit_indent - 1
+                line("}")
+                emit_indent = emit_indent - 1
+                line("}")
+                line("")
+            end
+        end
+
+        if is_option_type(sum_type) then
+            local inner = option_info(sum_type)
+            local c_inner = c_type(inner)
+            local inner_default = default_c(inner)
+
+            line("static LusaOption lusa_option_new_some_" .. tag_name .. "("
+                .. c_inner .. " value) {")
+            emit_indent = emit_indent + 1
+            line("LusaOption out;")
+            line("out.is_some = true;")
+            line("out.value = lusa_heap_alloc((uint32_t)sizeof(" .. c_inner
+                .. "), (uint32_t)LUSA_ALIGNOF(" .. c_inner .. "));")
+            line("if (out.value == NULL) {")
+            emit_indent = emit_indent + 1
+            line('lusa_throw("E9999", "out of memory");')
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("*(((" .. c_inner .. " *)out.value)) = value;")
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static LusaOption lusa_option_none_" .. tag_name
+                .. "(void) {")
+            emit_indent = emit_indent + 1
+            line("LusaOption out;")
+            line("out.is_some = false;")
+            line("out.value = NULL;")
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static bool lusa_option_is_some_" .. tag_name
+                .. "(LusaOption value) {")
+            emit_indent = emit_indent + 1
+            line("return value.is_some;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+            line("static bool lusa_option_is_none_" .. tag_name
+                .. "(LusaOption value) {")
+            emit_indent = emit_indent + 1
+            line("return !value.is_some;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static void lusa_drop_option_" .. tag_name
+                .. "(LusaOption *value) {")
+            emit_indent = emit_indent + 1
+            line("if (value == NULL) return;")
+            line("if (value->is_some && value->value != NULL) {")
+            emit_indent = emit_indent + 1
+            line(c_inner .. " item = *(((" .. c_inner .. " *)value->value));")
+            emit_drop_place(inner, "item")
+            line("lusa_heap_dealloc(value->value, (uint32_t)sizeof(" .. c_inner
+                .. "), (uint32_t)LUSA_ALIGNOF(" .. c_inner .. "));")
+            line("value->value = NULL;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("value->is_some = false;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static LusaOption lusa_clone_option_" .. tag_name
+                .. "(LusaOption value) {")
+            emit_indent = emit_indent + 1
+            line("LusaOption out;")
+            line("out.is_some = value.is_some;")
+            line("out.value = NULL;")
+            line("if (value.is_some && value.value != NULL) {")
+            emit_indent = emit_indent + 1
+            line(c_inner .. " item = *(((" .. c_inner .. " *)value.value));")
+            emit_clone_place(inner, "item")
+            line("out.value = lusa_heap_alloc((uint32_t)sizeof(" .. c_inner
+                .. "), (uint32_t)LUSA_ALIGNOF(" .. c_inner .. "));")
+            line("if (out.value == NULL) {")
+            emit_indent = emit_indent + 1
+            line('lusa_throw("E9999", "out of memory");')
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("*(((" .. c_inner .. " *)out.value)) = item;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static " .. c_inner .. " lusa_option_get_" .. tag_name
+                .. "(LusaOption value) {")
+            emit_indent = emit_indent + 1
+            line(c_inner .. " out = " .. inner_default .. ";")
+            line("if (!value.is_some) {")
+            emit_indent = emit_indent + 1
+            line('lusa_throw("E9999", "called `Option::unwrap()` on a `None` value");')
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("if (value.value != NULL) {")
+            emit_indent = emit_indent + 1
+            line("out = *(((" .. c_inner .. " *)value.value));")
+            emit_clone_place(inner, "out")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static " .. c_inner .. " lusa_option_take_" .. tag_name
+                .. "(LusaOption *value) {")
+            emit_indent = emit_indent + 1
+            line(c_inner .. " out = " .. inner_default .. ";")
+            line("if (value == NULL || !value->is_some || value->value == NULL) return out;")
+            line("out = *(((" .. c_inner .. " *)value->value));")
+            line("lusa_heap_dealloc(value->value, (uint32_t)sizeof(" .. c_inner
+                .. "), (uint32_t)LUSA_ALIGNOF(" .. c_inner .. "));")
+            line("value->value = NULL;")
+            line("value->is_some = false;")
+            line("return out;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static " .. c_inner .. " lusa_option_unwrap_or_" .. tag_name
+                .. "(LusaOption value, " .. c_inner .. " fallback) {")
+            emit_indent = emit_indent + 1
+            line("if (value.is_some) {")
+            emit_indent = emit_indent + 1
+            if is_heap_type(inner) then
+                emit_drop_place(inner, "fallback")
+            end
+            line("return lusa_option_get_" .. tag_name .. "(value);")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("return fallback;")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            line("static " .. c_inner .. " lusa_option_expect_" .. tag_name
+                .. "(LusaOption value, const char *message) {")
+            emit_indent = emit_indent + 1
+            line("if (!value.is_some) {")
+            emit_indent = emit_indent + 1
+            line('lusa_throw("E9999", message == NULL ? "expect failed" : message);')
+            line("return " .. inner_default .. ";")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("return lusa_option_get_" .. tag_name .. "(value);")
+            emit_indent = emit_indent - 1
+            line("}")
+            line("")
+
+            if not emit_no_std and sum_printable_payload(sum_type) then
+                line("static void lusa_print_option_" .. tag_name
+                    .. "(LusaOption value) {")
+                emit_indent = emit_indent + 1
+                line("if (value.is_some) {")
+                emit_indent = emit_indent + 1
+                line('fputs("Some(", stdout);')
+                line("if (value.value != NULL) {")
+                emit_indent = emit_indent + 1
+                emit_sum_print_payload(inner,
+                    "(*(((" .. c_inner .. " *)value.value)))")
+                emit_indent = emit_indent - 1
+                line("} else {")
+                emit_indent = emit_indent + 1
+                line("lusa_print_nil();")
+                emit_indent = emit_indent - 1
+                line("}")
+                line('fputs(")", stdout);')
+                emit_indent = emit_indent - 1
+                line("} else {")
+                emit_indent = emit_indent + 1
+                line('fputs("None", stdout);')
+                emit_indent = emit_indent - 1
+                line("}")
+                emit_indent = emit_indent - 1
+                line("}")
+                line("")
+            end
+        end
+        i = i + 1
+    end
+end
 -- Allocator dispatch is emitted after function prototypes so a custom
 -- allocator may call other user functions.  A missing half of the pair falls
 -- back to the target's default strategy.
@@ -6786,11 +8006,216 @@ local function emit_string_builtin(expr)
         .. replacement .. ", " .. limit .. ", NULL)"
 end
 
+local function is_place_expr(expr)
+    local value = unwrap_paren(expr)
+    if value == nil then
+        return false
+    end
+    local tag = value.tag
+    return tag == "Name" or tag == "Field" or tag == "Index"
+        or tag == "Deref"
+end
+
+local function emit_sum_ctor(expr)
+    local kind, ok_type, err_type = sum_payloads(expr.ctype)
+    if kind == nil then
+        fail(expr.line, expr.column,
+            "internal: sum constructor has no canonical type")
+    end
+    local tag_name = collection_tag(expr.ctype)
+    if expr.sum_kind == "none" then
+        return "lusa_option_none_" .. tag_name .. "()"
+    end
+    local arg = expr.args[1]
+    local payload = ok_type
+    if kind == "result" and expr.sum_kind == "err" then
+        payload = err_type
+    end
+    local rendered = emit_expr(clone arg)
+    if is_heap_type(payload) and arg.own == false then
+        rendered = emit_clone_heap(payload, rendered)
+    elseif arg.own ~= false then
+        null_moved_source(arg, nil)
+    end
+    if expr.sum_kind == "ok" then
+        return "lusa_result_new_ok_" .. tag_name .. "(" .. rendered .. ")"
+    elseif expr.sum_kind == "err" then
+        return "lusa_result_new_err_" .. tag_name .. "(" .. rendered .. ")"
+    end
+    return "lusa_option_new_some_" .. tag_name .. "(" .. rendered .. ")"
+end
+
+local function emit_sum_method_expr(expr)
+    local kind, ok_type, err_type = sum_payloads(expr.sum_type)
+    local tag_name = collection_tag(expr.sum_type)
+    local name = expr.sum_method
+    local receiver = emit_expr(expr.obj)
+    if kind == "result" then
+        if name == "is_ok" then
+            return "lusa_result_is_ok_" .. tag_name .. "(" .. receiver .. ")"
+        end
+        if name == "is_err" then
+            return "lusa_result_is_err_" .. tag_name .. "(" .. receiver .. ")"
+        end
+        if name == "unwrap" then
+            return "lusa_result_get_" .. tag_name .. "(" .. receiver .. ")"
+        end
+        if name == "unwrap_err" then
+            return "lusa_result_get_err_" .. tag_name .. "(" .. receiver .. ")"
+        end
+        if name == "unwrap_or" then
+            local arg = expr.args[1]
+            local fallback = emit_expr(clone arg)
+            if arg.own ~= false then
+                null_moved_source(arg, nil)
+            end
+            return "lusa_result_unwrap_or_" .. tag_name .. "("
+                .. receiver .. ", " .. fallback .. ")"
+        end
+        if name == "expect" then
+            local message = expr.args[1]
+            if message.tag == "String" then
+                return "lusa_result_expect_" .. tag_name .. "(" .. receiver
+                    .. ", " .. emit_expr(message) .. "->data)"
+            end
+            local rendered = emit_expr(clone message)
+            if message.own == false then
+                rendered = "lusa_string_clone(" .. rendered .. ")"
+            end
+            local message_temp = fresh("expect_message")
+            line("LusaString *" .. message_temp .. " = " .. rendered .. ";")
+            if message.own ~= false then
+                null_moved_source(message, nil)
+            end
+            local out = fresh("expect_value")
+            line(c_type(expr.ctype) .. " " .. out
+                .. " = lusa_result_expect_" .. tag_name .. "(" .. receiver
+                .. ", " .. message_temp .. "->data);")
+            line("lusa_drop_string(&" .. message_temp .. ");")
+            return out
+        end
+    else
+        if name == "is_some" then
+            return "lusa_option_is_some_" .. tag_name .. "(" .. receiver .. ")"
+        end
+        if name == "is_none" then
+            return "lusa_option_is_none_" .. tag_name .. "(" .. receiver .. ")"
+        end
+        if name == "unwrap" then
+            return "lusa_option_get_" .. tag_name .. "(" .. receiver .. ")"
+        end
+        if name == "unwrap_or" then
+            local arg = expr.args[1]
+            local fallback = emit_expr(clone arg)
+            if arg.own ~= false then
+                null_moved_source(arg, nil)
+            end
+            return "lusa_option_unwrap_or_" .. tag_name .. "("
+                .. receiver .. ", " .. fallback .. ")"
+        end
+        if name == "expect" then
+            local message = expr.args[1]
+            if message.tag == "String" then
+                return "lusa_option_expect_" .. tag_name .. "(" .. receiver
+                    .. ", " .. emit_expr(message) .. "->data)"
+            end
+            local rendered = emit_expr(clone message)
+            if message.own == false then
+                rendered = "lusa_string_clone(" .. rendered .. ")"
+            end
+            local message_temp = fresh("expect_message")
+            line("LusaString *" .. message_temp .. " = " .. rendered .. ";")
+            if message.own ~= false then
+                null_moved_source(message, nil)
+            end
+            local out = fresh("expect_value")
+            line(c_type(expr.ctype) .. " " .. out
+                .. " = lusa_option_expect_" .. tag_name .. "(" .. receiver
+                .. ", " .. message_temp .. "->data);")
+            line("lusa_drop_string(&" .. message_temp .. ");")
+            return out
+        end
+    end
+    fail(expr.line, expr.column,
+        "internal: unknown sum method `" .. tostring(name) .. "`")
+end
+
+-- `?` lowers to a checked early return.  The operand is materialised once so
+-- the success payload can be taken out of the temporary and the failure path
+-- can clone/propagate the error without consuming the original binding.
+local function emit_try_expr(expr)
+    local sum_type = expr.try_sum_type
+    local kind, ok_type, err_type = sum_payloads(sum_type)
+    local tag_name = collection_tag(sum_type)
+    local value_node = expr.value
+    local value_owned = value_node.own
+    local value_is_place = is_place_expr(clone value_node)
+    local rendered = emit_expr(clone value_node)
+    if value_is_place or value_owned == false then
+        rendered = emit_clone_heap(sum_type, rendered)
+    end
+    local temp = fresh("try_value")
+    line(c_type(sum_type) .. " " .. temp .. " = " .. rendered .. ";")
+    line("if (lusa_error_pending) {")
+    emit_indent = emit_indent + 1
+    emit_drop_place(sum_type, temp)
+    emit_all_drops()
+    if emit_return_type == "void" then
+        line("return;")
+    else
+        line("return " .. default_c(emit_return_type) .. ";")
+    end
+    emit_indent = emit_indent - 1
+    line("}")
+    if kind == "result" then
+        line("if (!" .. temp .. ".is_ok) {")
+        emit_indent = emit_indent + 1
+        if err_type == "nil" then
+            -- The operand has no error payload, so this branch is unreachable.
+            emit_drop_place(sum_type, temp)
+            emit_all_drops()
+            line("return " .. default_c(emit_return_type) .. ";")
+        else
+            local error_temp = fresh("try_err")
+            line(c_type(err_type) .. " " .. error_temp
+                .. " = lusa_result_take_err_"
+                .. tag_name .. "(&" .. temp .. ");")
+            emit_drop_place(sum_type, temp)
+            emit_all_drops()
+            line("return lusa_result_new_err_"
+                .. collection_tag(emit_return_type) .. "(" .. error_temp .. ");")
+        end
+        emit_indent = emit_indent - 1
+        line("}")
+        local out = fresh("try_ok")
+        line(c_type(ok_type) .. " " .. out .. " = lusa_result_take_"
+            .. tag_name .. "(&" .. temp .. ");")
+        emit_drop_place(sum_type, temp)
+        return out
+    end
+    line("if (!" .. temp .. ".is_some) {")
+    emit_indent = emit_indent + 1
+    emit_drop_place(sum_type, temp)
+    emit_all_drops()
+    line("return lusa_option_none_"
+        .. collection_tag(emit_return_type) .. "();")
+    emit_indent = emit_indent - 1
+    line("}")
+    local out = fresh("try_some")
+    line(c_type(ok_type) .. " " .. out .. " = lusa_option_take_"
+        .. tag_name .. "(&" .. temp .. ");")
+    emit_drop_place(sum_type, temp)
+    return out
+end
+
 emit_expr = function(expr)
     if expr == nil then
         fail(0, 0, "internal: nil expression reached the C emitter")
     end
     local tag = expr.tag
+    if tag == "Try" then
+        return emit_try_expr(expr)
+    end
     if tag == "Nil" then
         return "NULL"
     end
@@ -6932,6 +8357,9 @@ emit_expr = function(expr)
             return "lusa_box_new_" .. collection_tag(box_element(expr.ctype))
                 .. "(" .. value .. ")"
         end
+        if expr.builtin == "sum_ctor" then
+            return emit_sum_ctor(expr)
+        end
         if expr.builtin == "print" then
             fail(expr.line, expr.column,
                 "internal: `print` must be used as a statement")
@@ -6957,9 +8385,20 @@ emit_expr = function(expr)
             fail(expr.line, expr.column, "internal: call has no function name")
         end
         local args = { emit_no_std and "NULL" or "lusa_current_coro" }
+        local param_types = expr.param_types or {}
         local i = 1
         while i <= #expr.args do
-            args[#args + 1] = emit_expr(expr.args[i])
+            local arg = expr.args[i]
+            local rendered = emit_expr(clone arg)
+            local param_type = param_types[i]
+            if param_type ~= nil and is_sum_type(param_type) then
+                if arg.own == false then
+                    rendered = emit_clone_heap(param_type, rendered)
+                else
+                    null_moved_source(arg, nil)
+                end
+            end
+            args[#args + 1] = rendered
             i = i + 1
         end
         return cname .. "(" .. table.concat(args, ", ") .. ")"
@@ -7209,6 +8648,9 @@ emit_expr = function(expr)
                     .. ")), (void)0)"
             end
         end
+        if expr.sum_method ~= nil then
+            return emit_sum_method_expr(expr)
+        end
         local string_value = emit_string_builtin(clone expr)
         if string_value ~= nil then
             return string_value
@@ -7219,9 +8661,20 @@ emit_expr = function(expr)
         end
         local args = { emit_no_std and "NULL" or "lusa_current_coro",
             emit_expr(expr.obj) }
+        local param_types = expr.param_types or {}
         local i = 1
         while i <= #expr.args do
-            args[#args + 1] = emit_expr(expr.args[i])
+            local arg = expr.args[i]
+            local rendered = emit_expr(clone arg)
+            local param_type = param_types[i]
+            if param_type ~= nil and is_sum_type(param_type) then
+                if arg.own == false then
+                    rendered = emit_clone_heap(param_type, rendered)
+                else
+                    null_moved_source(arg, nil)
+                end
+            end
+            args[#args + 1] = rendered
             i = i + 1
         end
         return cname .. "(" .. table.concat(args, ", ") .. ")"
@@ -7343,6 +8796,12 @@ local function emit_print_call(call)
             line("lusa_print_table(" .. value .. ");")
         elseif type_name == "value" then
             line("lusa_print_value(" .. value .. ");")
+        elseif is_sum_type(type_name) then
+            local printer = "lusa_print_result_"
+            if is_option_type(type_name) then
+                printer = "lusa_print_option_"
+            end
+            line(printer .. collection_tag(type_name) .. "(" .. value .. ");")
         elseif pointer_element(type_name) ~= nil then
             line("lusa_print_u32((uint32_t)(uintptr_t)(" .. value .. "));")
         elseif type_name == "nil" then
@@ -7393,13 +8852,7 @@ local function emit_pcall_local(stmt)
 
     -- Two names mean `ok, err`; release an owned result that is discarded.
     if result_temp ~= nil and is_heap_type(ret) then
-        if ret == "string" then
-            line("lusa_drop_string(&" .. result_temp .. ");")
-        elseif ret == "coroutine" then
-            line("lusa_drop_coroutine(&" .. result_temp .. ");")
-        else
-            line("lusa_drop_table(&" .. result_temp .. ");")
-        end
+        emit_drop_place(ret, result_temp)
     end
     local err_entry = emit_scope_declare(stmt.names[2], "string", true, false)
     line("LusaString *" .. err_entry.cname .. " = " .. err_temp .. ";")
@@ -7527,7 +8980,8 @@ local function emit_local(stmt)
             if value ~= nil then
                 local rendered = emit_expr(clone value)
                 if (type_name == "string" or is_struct_type(type_name)
-                    or is_box_type(type_name) or is_vec_type(type_name))
+                    or is_box_type(type_name) or is_vec_type(type_name)
+                    or is_sum_type(type_name))
                     and value.own == false and value.tag ~= "Borrow" then
                     -- Strings and structs are value types: reading a field/index
                     -- copies it, including nested heap fields.
@@ -7850,49 +9304,60 @@ local function emit_for_in(stmt)
     emit_leave_scope()
 end
 
-local function emit_if(stmt)
-    local i = 1
-    while i <= #stmt.branches do
-        local branch = stmt.branches[i]
-        if branch == nil then
-            fail(stmt.line, stmt.column, "internal: if branch is nil")
-        end
-        if branch.cond == nil then
-            fail(stmt.line, stmt.column, "internal: if condition is nil")
-        end
-        if branch.body == nil then
-            fail(stmt.line, stmt.column, "internal: if body is nil")
-        end
-        local condition = emit_expr(branch.cond)
-        if i == 1 then
-            line("if (" .. condition .. ") {")
-        else
-            line("} else if (" .. condition .. ") {")
-        end
-        emit_indent = emit_indent + 1
-        emit_scope_enter()
-        emit_block_statements(branch.body)
-        emit_leave_scope()
-        emit_indent = emit_indent - 1
-        i = i + 1
+local function emit_if_chain(stmt, index)
+    local branch = stmt.branches[index]
+    if branch == nil then
+        fail(stmt.line, stmt.column, "internal: if branch is nil")
     end
-    if stmt.else_body ~= nil then
-        line("} else {")
-        emit_indent = emit_indent + 1
-        emit_scope_enter()
+    if branch.cond == nil then
+        fail(stmt.line, stmt.column, "internal: if condition is nil")
+    end
+    if branch.body == nil then
+        fail(stmt.line, stmt.column, "internal: if body is nil")
+    end
+    -- Evaluate the condition here, inside the enclosing `else` block for
+    -- chained branches, so hoisted `?` temporaries keep valid C scope.
+    local condition = emit_expr(branch.cond)
+    line("if (" .. condition .. ") {")
+    emit_indent = emit_indent + 1
+    emit_scope_enter()
+    emit_block_statements(branch.body)
+    emit_leave_scope()
+    emit_indent = emit_indent - 1
+    local has_next = index < #stmt.branches
+    local has_else = stmt.else_body ~= nil
+    if not has_next and not has_else then
+        line("}")
+        return
+    end
+    line("} else {")
+    emit_indent = emit_indent + 1
+    emit_scope_enter()
+    if has_next then
+        emit_if_chain(stmt, index + 1)
+    else
         emit_block_statements(stmt.else_body)
-        emit_leave_scope()
-        emit_indent = emit_indent - 1
     end
+    emit_leave_scope()
+    emit_indent = emit_indent - 1
     line("}")
+end
+
+local function emit_if(stmt)
+    if #stmt.branches == 0 then
+        fail(stmt.line, stmt.column, "internal: if has no branches")
+    end
+    emit_if_chain(stmt, 1)
 end
 
 local function emit_while(stmt)
     local loop_scope = emit_scope_count
     emit_loop_stack[#emit_loop_stack + 1] = loop_scope
-    local condition = emit_expr(stmt.cond)
     line("while (1) {")
     emit_indent = emit_indent + 1
+    -- The condition is emitted inside the loop body: a `?` in it must be
+    -- re-evaluated per iteration and may return before the body runs.
+    local condition = emit_expr(stmt.cond)
     line("if (!(" .. condition .. ")) break;")
     emit_scope_enter()
     emit_block_statements(stmt.body)
@@ -8002,6 +9467,9 @@ local function emit_vec_push(expr)
     local vec_value = emit_expr(expr.obj)
     local arg = expr.args[1]
     local value = emit_expr(clone arg)
+    if is_heap_type(element) and arg.own == false then
+        value = emit_clone_heap(element, value)
+    end
     line("lusa_vec_push_" .. tag_name .. "(&(" .. vec_value .. "), "
         .. value .. ");")
     -- Ownership moved into the vector: cancel the source slot so its scope
@@ -8325,12 +9793,13 @@ local function emit_function_definition(signature)
     j = 1
     while j <= param_count do
         local param = signature.params[j]
+        local owned_sum = is_sum_type(param.type)
         local entry = {
             name = param.name,
             cname = signature.param_cnames[j],
             type = param.type,
-            own = false,
-            borrowed = true,
+            own = owned_sum,
+            borrowed = not owned_sum,
             moved = false
         }
         local scope = emit_scopes[emit_scope_count]
@@ -8575,9 +10044,10 @@ local function snapshot_program(borrow_ast)
     if type(borrow_ast) ~= "table" or borrow_ast.tag ~= "Program" then
         fail(0, 0, "expected a Program AST")
     end
+    local body = clone borrow_ast.body
     return {
         tag = "Program",
-        body = clone borrow_ast.body,
+        body = body,
         line = borrow_ast.line,
         column = borrow_ast.column
     }

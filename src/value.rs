@@ -341,12 +341,57 @@ impl Value {
             Value::Bool(b) => if *b { "true".into() } else { "false".into() },
             Value::Number(n) => format_number(*n),
             Value::Str(s) => s.to_string(),
-            Value::Table(t) => format!("table: 0x{:x}", t.vid),
+            Value::Table(t) => {
+                if let Some((_, tag, payload)) = self.sum_parts() {
+                    match tag {
+                        "ok" => return format!("Ok({})", payload.fmt_value()),
+                        "err" => return format!("Err({})", payload.fmt_value()),
+                        "some" => return format!("Some({})", payload.fmt_value()),
+                        "none" => return "None".into(),
+                        _ => {}
+                    }
+                }
+                format!("table: 0x{:x}", t.vid)
+            }
             Value::Func(f) => format!("function: 0x{:x}", f.vid),
             Value::Iter(_) => "iterator".into(),
             Value::Coroutine(c) => format!("coroutine: 0x{:x}", c.borrow().id),
             Value::Alias(_) => self.type_name().into(),
         }
+    }
+
+    /// If this value is one of the dynamic `Result`/`Option` sums, returns
+    /// `(kind, tag, payload)`. `kind` is `"result"` or `"option"`; `tag` is
+    /// `"ok"`, `"err"`, `"some"`, or `"none"`. `None` has a `nil` payload.
+    pub fn sum_parts(&self) -> Option<(&'static str, &'static str, Value)> {
+        let table = match self.base_value() {
+            Value::Table(table) => table,
+            _ => return None,
+        };
+        let marker = table.get(&Value::Str(Arc::from("__lusa_sum")))?;
+        let kind = match marker.base_value() {
+            Value::Str(s) => match &**s {
+                "result" => "result",
+                "option" => "option",
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let tag_value = table.get(&Value::Str(Arc::from("__lusa_tag")))?;
+        let tag = match tag_value.base_value() {
+            Value::Str(s) => match &**s {
+                "ok" => "ok",
+                "err" => "err",
+                "some" => "some",
+                "none" => "none",
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let payload = table
+            .get(&Value::Str(Arc::from("__lusa_value")))
+            .unwrap_or(Value::Nil);
+        Some((kind, tag, payload))
     }
 
     /// Deep clone (used by `clone x`). Cloned contents get fresh ownership.

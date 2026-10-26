@@ -158,6 +158,10 @@ pub struct VmFrame {
     pub(crate) truncate_return: bool,
     /// deferred call-argument takes pending finalization by the next call op
     pub(crate) undo: Vec<UndoRec>,
+    /// length of the shared value stack at frame entry; `?` truncates here
+    pub(crate) stack_base: usize,
+    /// length of the segment stack at frame entry; `?` truncates here
+    pub(crate) seg_base: usize,
     /// `unsafe` depth of the caller at entry. Restored when this frame returns
     /// or unwinds, so an early `return` cannot leak sandbox capability.
     entry_unsafe_depth: usize,
@@ -331,6 +335,8 @@ fn push_frame(
     } else {
         Vec::new()
     };
+    let stack_base = interp.vm.stack.len();
+    let seg_base = interp.vm.segs.len();
     interp.vm.frames.push(VmFrame {
         proto: compiled.clone(),
         slots,
@@ -339,6 +345,8 @@ fn push_frame(
         pc: 0,
         truncate_return: false,
         undo: Vec::new(),
+        stack_base,
+        seg_base,
         entry_unsafe_depth: interp.unsafe_depth,
     });
     Ok(())
@@ -406,6 +414,8 @@ fn push_frame_at(
         Vec::new()
     };
     interp.vm.stack.truncate(base.min(interp.vm.stack.len()));
+    let stack_base = interp.vm.stack.len();
+    let seg_base = interp.vm.segs.len();
     interp.vm.frames.push(VmFrame {
         proto: compiled,
         slots,
@@ -414,6 +424,8 @@ fn push_frame_at(
         pc: 0,
         truncate_return: false,
         undo: Vec::new(),
+        stack_base,
+        seg_base,
         entry_unsafe_depth: interp.unsafe_depth,
     });
     Ok(())
@@ -1080,6 +1092,43 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             interp.vm.last_ret = 1;
             StepOutcome::Continue
         }
+        Instr::Try => {
+            let value = pop1(interp);
+            let Some((kind, tag, payload)) = value.base_value().sum_parts() else {
+                return Err(err(
+                    E_CALL,
+                    format!(
+                        "the `?` operator needs a Result or Option value, found {} ({})",
+                        value.type_name(),
+                        value.fmt_value()
+                    ),
+                ));
+            };
+            let success =
+                (kind == "result" && tag == "ok") || (kind == "option" && tag == "some");
+            if success {
+                let cloned = interp.deep_clone_value(&payload);
+                interp.vm.stack.push(cloned);
+                interp.vm.last_ret = 1;
+                StepOutcome::Continue
+            } else {
+                let propagated = interp.deep_clone_value(&value);
+                let (stack_base, seg_base) = interp
+                    .vm
+                    .frames
+                    .last()
+                    .map(|f| (f.stack_base, f.seg_base))
+                    .unwrap_or((0, 0));
+                interp
+                    .vm
+                    .stack
+                    .truncate(stack_base.min(interp.vm.stack.len()));
+                interp.vm.segs.truncate(seg_base.min(interp.vm.segs.len()));
+                interp.vm.stack.push(propagated);
+                interp.vm.last_ret = 1;
+                StepOutcome::Returned(1)
+            }
+        }
         Instr::MakeBox => {
             let v = pop1(interp);
             interp.vm.stack.push(crate::builtins::box_value(v));
@@ -1676,10 +1725,12 @@ fn call_method(
         .get(obj_pos)
         .cloned()
         .unwrap_or(Value::Nil);
-    // Dynamic `Vec<T>` fallbacks: a table with no real field of that name
-    // behaves like a growable 0-based vector.
+    // Dynamic `Vec<T>` and `Result`/`Option` fallbacks: a table with no real
+    // field of that name behaves like the corresponding built-in surface.
     if let (Value::Table(table), Value::Str(name)) = (obj_value.base_value(), &key) {
-        if table.get(&key).is_none() && Interp::is_vec_method(name) {
+        let is_sum = Interp::is_sum_method(name)
+            && Value::Table(Rc::clone(table)).sum_parts().is_some();
+        if table.get(&key).is_none() && (is_sum || Interp::is_vec_method(name)) {
             if n_takes != 0 {
                 finalize_args(interp, false, n_takes)?;
             }
@@ -1688,8 +1739,11 @@ fn call_method(
             if !values.is_empty() {
                 values.remove(0); // receiver
             }
-            let results =
-                interp.vec_method_call(&Rc::clone(table), name, values, span)?;
+            let results = if is_sum {
+                interp.sum_method_call(&Rc::clone(table), name, values, span)?
+            } else {
+                interp.vec_method_call(&Rc::clone(table), name, values, span)?
+            };
             let n = results.len();
             interp.vm.stack.reserve(n);
             for value in results {

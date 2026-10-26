@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::path::{Path, PathBuf};
 
 use crate::error::{
-    LResult, LusaError, Span, E_ASSERT, E_CMP, E_ERROR, E_INDEX, E_IO, E_NUM,
+    LResult, LusaError, Span, E_ASSERT, E_CALL, E_CMP, E_ERROR, E_INDEX, E_IO, E_NUM,
 };
 use crate::interp::Interp;
 use crate::pattern::{self, CaptureKind, Gmatch};
@@ -89,6 +89,32 @@ pub fn box_set_inner(value: &Value, new_value: Value) -> bool {
     };
     box_set_table(&table, new_value);
     true
+}
+
+// ===== built-in Result/Option sums (module 21) =====
+//
+// The dynamic engines represent `Result<T, E>` and `Option<T>` as ordinary
+// tables tagged with private marker keys.  The C11 backend uses dedicated
+// structs instead; both surfaces share the same methods.
+
+pub const SUM_MARKER: &str = "__lusa_sum";
+pub const SUM_TAG: &str = "__lusa_tag";
+pub const SUM_VALUE: &str = "__lusa_value";
+
+/// Builds a tagged sum table.  Constructor payloads are stored by value; the
+/// ownership engine treats the wrapper as a heap value like any other table.
+pub fn make_sum(kind: &str, tag: &str, value: Value) -> Value {
+    let table = TableObj::new();
+    table
+        .set(Value::Str(Arc::from(SUM_MARKER)), Value::Str(Arc::from(kind)))
+        .expect("sum marker key");
+    table
+        .set(Value::Str(Arc::from(SUM_TAG)), Value::Str(Arc::from(tag)))
+        .expect("sum tag key");
+    table
+        .set(Value::Str(Arc::from(SUM_VALUE)), value)
+        .expect("sum value key");
+    Value::Table(Rc::new(table))
 }
 
 fn get<'a>(args: &'a [Value], i: usize, what: &str, span: Span) -> LResult<&'a Value> {
@@ -232,6 +258,30 @@ fn b_unsafe_read_mem(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Ve
 /// so `*b` can read and write the pointee without the raw-pointer gate.
 fn b_box(_i: &mut Interp, args: Vec<Value>, _span: Span) -> LResult<Vec<Value>> {
     one(box_value(args.first().cloned().unwrap_or(Value::Nil)))
+}
+
+fn sum_ctor(kind: &'static str, tag: &'static str, name: &'static str) -> BF {
+    Box::new(move |_i: &mut Interp, args: Vec<Value>, span: Span| {
+        if args.len() != 1 {
+            return Err(LusaError::new(
+                E_CALL,
+                Some(span),
+                format!("`{name}` takes exactly one value, found {}", args.len()),
+            ));
+        }
+        Ok(vec![make_sum(kind, tag, args.into_iter().next().unwrap())])
+    })
+}
+
+fn b_none(_i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    if !args.is_empty() {
+        return Err(LusaError::new(
+            E_CALL,
+            Some(span),
+            format!("`None` takes no arguments, found {}", args.len()),
+        ));
+    }
+    one(make_sum("option", "none", Value::Nil))
 }
 
 /// Dynamic lowering of unary `*`: boxes dereference safely, while ordinary
@@ -766,6 +816,10 @@ pub fn all() -> Vec<(&'static str, BF)> {
         ("pairs", Box::new(b_pairs)),
         ("ipairs", Box::new(b_ipairs)),
         ("Box", Box::new(b_box)),
+        ("Ok", sum_ctor("result", "ok", "Ok")),
+        ("Err", sum_ctor("result", "err", "Err")),
+        ("Some", sum_ctor("option", "some", "Some")),
+        ("None", Box::new(b_none)),
         ("box_read", Box::new(b_box_read)),
         ("box_write", Box::new(b_box_write)),
         ("unsafe_ptr_cast", Box::new(b_unsafe_ptr_cast)),

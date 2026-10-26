@@ -32,6 +32,9 @@ top-level locals. Module 20 adds the global allocator contract
 (`#[global_allocator]`), the `lusa_heap_alloc`/`lusa_heap_dealloc` dispatch, and
 the first growable collections: `Vec<T>` with push/pop/indexing and `Box<T>`
 owned pointers, both with RAII drops on hosted and freestanding targets.
+Module 21 adds safe error handling: built-in `Result<T, E>` and `Option<T>`
+sums, `Ok`/`Err`/`Some`/`None` constructors, pattern matching, combinators, and
+the Rust-style `?` operator that lowers to C11 checks and early returns.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -122,6 +125,7 @@ See [`examples/`](examples/):
 | `photocraft.lusa`         | mini photo-lab: 2D image in tables → filters → ASCII-art |
 | `baremetal_boot.lusa`     | `#[no_std]` `_start` entry with sectioned code/data |
 | `dynamic_heap.lusa`       | `Vec<T>` growth/pop/clear and `Box<T>` owned pointers |
+| `error_handling.lusa`     | `Result`/`Option`, combinators, `?`, and `match` arms |
 
 Also in the root: `bench.lusa` — reference workload for measuring speed
 (debug × release). Typical measurement on this machine: **4.6× faster** on
@@ -913,6 +917,104 @@ lusalang build examples/dynamic_heap.lusa --emit-c
 arena emission, `Vec<string>`/`Box<string>` RAII, allocator diagnostics, and
 native + dynamic parity.
 
+### Safe error handling with `Result`, `Option`, and `?` (Module 21)
+
+`Result<T, E>` and `Option<T>` are built-in sum types. Construct values with
+`Ok(value)`, `Err(error)`, `Some(value)`, and the bare `None` (also callable as
+`None()`):
+
+```lusa
+function parse(n: i32): Result<i32,string>
+    if n < 0 then
+        return Err("negative")
+    end
+    return Ok(n * 2)
+end
+
+function maybe(n: i32): Option<i32>
+    if n == 0 then
+        return None
+    end
+    return Some(n)
+end
+```
+
+The `?` operator propagates the failure variant and evaluates to the success
+payload. It only works inside a function returning a matching sum kind, and the
+propagated error type must be assignable to the function's error type:
+
+```lusa
+function double(n: i32): Result<i32,string>
+    local value: i32 = parse(n)?
+    return Ok(value + 1)
+end
+
+function plus_ten(n: i32): Option<i32>
+    local value: i32 = maybe(n)?
+    return Some(value + 10)
+end
+
+print(double(3):unwrap())        -- 7
+print(double(-1):unwrap_err())   -- negative
+print(plus_ten(5):unwrap())      -- 15
+print(plus_ten(0):is_none())     -- true
+```
+
+Match patterns bind payloads without moving the scrutinee:
+
+```lusa
+match parse(-2) with
+| Ok(value) => print("ok", value)
+| Err(error) => print("error", error)
+end
+
+match maybe(0) with
+| Some(value) => print("some", value)
+| None => print("none")
+end
+```
+
+Combinators are methods on both sums. Wrong-variant use is a catchable
+`E9999` runtime error:
+
+| type     | methods                                                |
+|----------|--------------------------------------------------------|
+| `Result` | `is_ok`, `is_err`, `unwrap`, `unwrap_err`, `unwrap_or`, `expect` |
+| `Option` | `is_some`, `is_none`, `unwrap`, `unwrap_or`, `expect`  |
+
+```lusa
+print(Ok(5):unwrap_or(9), Err("bad"):unwrap_or(9))  -- 5 9
+print(Some(2):unwrap_or(0), None:unwrap_or(0))      -- 2 0
+print(Ok(7):expect("ok"), Some(8):expect("some"))   -- 7 8
+print(Ok(5))      -- Ok(5)
+print(Err("x"))   -- Err(x)
+print(Some("hi")) -- Some(hi)
+print(None)       -- None
+```
+
+The dynamic engines represent sums as tagged tables and clone payloads out of
+the receiver; `?` is non-consuming there. The C11 backend uses
+`LusaResult { bool is_ok; void *ok; void *err; }` and
+`LusaOption { bool is_some; void *value; }` with heap-boxed payloads, generated
+per-type clone/drop/take helpers, and early return checks. Sum parameters are
+owned by the callee; arguments are moved or cloned at the call site. `Vec<T>`,
+`Box<T>`, structs, strings, and nested sums can be payloads; fixed arrays are
+rejected (`E0301`). In `#[no_std]` builds, sums keep their scalar and struct
+payloads through the static arena, but `string` payloads and the `print`
+helpers require the hosted runtime.
+
+```sh
+lusalang run examples/error_handling.lusa
+lusalang run examples/error_handling.lusa --vm
+lusalang run examples/error_handling.lusa --native
+lusalang build examples/error_handling.lusa --emit-c
+```
+
+`tests/module21.rs` covers constructors, combinators, `?` through branches and
+loops, struct/`Vec`/`Box`/nested payloads, sum parameters and fields, `match`
+binding and returns, freestanding scalar sums, typed diagnostics, runtime
+wrong-variant errors, and native + dynamic parity.
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -950,7 +1052,10 @@ locals, `E0101`/`E0325` diagnostics, dynamic parity, and native hosted and
 no_std build-and-run checks. `tests/module20.rs` adds `Vec<T>` growth and
 method semantics, `Box<T>` dereference/write, `#[global_allocator]` dispatch,
 freestanding arena emission, owned-element drops, allocator diagnostics, and
-three-engine parity. See
+three-engine parity. `tests/module21.rs` adds `Result`/`Option` constructors and
+combinators, `?` in branches and loops, rich payloads, sum parameters and
+fields, `match` binding, freestanding scalar sums, typed diagnostics, runtime
+wrong-variant errors, and native + dynamic parity. See
 [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
 [`docs/LANGUAGE.md`](docs/LANGUAGE.md) section 9 for details.
 
@@ -1021,6 +1126,9 @@ Near-term milestones:
 - **v1.6.0 (shipped):** `#[global_allocator]` heap dispatch, freestanding bump
   arena fallback, and RAII-managed `Vec<T>`/`Box<T>` collections usable on
   hosted and bare-metal targets.
+- **v1.7.0 (shipped):** built-in `Result<T, E>`/`Option<T>` sums, combinators,
+  `match` patterns, and the `?` early-return operator, with C11 checks and
+  freestanding scalar payload support.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

@@ -306,6 +306,43 @@ pub fn eval_expr(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr
             eval_take_single(interp, frame, e, &label, e.span)
         }
         ExprKind::Paren(inner) => eval_expr(interp, frame, inner),
+        ExprKind::Try { value } => {
+            let v = eval_expr(interp, frame, value)?;
+            let Some((kind, tag, payload)) = v.base_value().sum_parts() else {
+                return Err(LusaError::new(
+                    E_CALL,
+                    Some(e.span),
+                    format!(
+                        "the `?` operator needs a Result or Option value, found {} ({})",
+                        v.type_name(),
+                        v.fmt_value()
+                    ),
+                )
+                .help("`?` unwraps `Ok`/`Some` and returns `Err`/`None` from the current function"));
+            };
+            let success =
+                (kind == "result" && tag == "ok") || (kind == "option" && tag == "some");
+            if success {
+                Ok(interp.deep_clone_value(&payload))
+            } else {
+                if interp.depth == 0 {
+                    return Err(LusaError::new(
+                        E_CALL,
+                        Some(e.span),
+                        "the `?` operator can only be used inside a function returning Result or Option",
+                    ));
+                }
+                interp.try_pending = Some(crate::interp::TryPending {
+                    depth: interp.depth,
+                    value: v.deep_clone(),
+                });
+                Err(LusaError::new(
+                    crate::error::E_TRY,
+                    Some(e.span),
+                    "internal: `?` propagation",
+                ))
+            }
+        }
         ExprKind::Vararg => {
             let first = frame.varargs.get(0).map(|v| v.clone()).unwrap_or(Value::Nil);
             Ok(first)
@@ -684,6 +721,22 @@ pub fn eval_method(
             let t = as_table(&o).ok_or_else(|| index_err(&o, span))?;
             if let Some(method) = t.get(&key) {
                 method
+            } else if Interp::is_sum_method(name)
+                && Value::Table(Rc::clone(&t)).sum_parts().is_some()
+            {
+                let mut argv = Vec::new();
+                let n = args.len();
+                for (i, e) in args.iter().enumerate() {
+                    let is_last = i + 1 == n;
+                    if is_last && is_expansion(e) {
+                        argv.extend(eval_expand(interp, frame, e)?);
+                    } else {
+                        let label = format!("(argument {} of :{})", i + 1, name);
+                        let v = eval_take_single(interp, frame, e, &label, e.span)?;
+                        argv.push(v);
+                    }
+                }
+                return interp.sum_method_call(&t, name, argv, span);
             } else if Interp::is_vec_method(name) {
                 // `Vec<T>` is a 0-based table in the dynamic engines; the
                 // vector surface is a fallback when no real field shadows it.

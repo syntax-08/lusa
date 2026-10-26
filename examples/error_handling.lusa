@@ -1,0 +1,82 @@
+-- Module 21 example: safe error handling with Result, Option, and `?`.
+--
+-- Runs in the interpreter, bytecode VM, and C11 backend:
+--   lusalang run examples/error_handling.lusa
+--   lusalang run examples/error_handling.lusa --vm
+--   lusalang run examples/error_handling.lusa --native
+--   lusalang build examples/error_handling.lusa
+
+struct Measurement
+    sensor: i32,
+    value: i32
+end
+
+function read_sensor(id: i32): Result<Measurement,string>
+    if id < 0 then
+        return Err("unknown sensor")
+    end
+    return Ok(Measurement { sensor = id, value = id * 10 })
+end
+
+-- `?` returns the Err payload unchanged and evaluates to the Ok payload.
+function read_value(id: i32): Result<i32,string>
+    local reading: Measurement = read_sensor(id)?
+    return Ok(reading.value)
+end
+
+function find_sensor(target: i32): Option<i32>
+    local values: Vec<i32> = [3, 6, 9]
+    local i = 0
+    while i < values:len() do
+        if values[i] == target then
+            return Some(i)
+        end
+        i = i + 1
+    end
+    return None
+end
+
+function first_positive(n: i32): Option<i32>
+    if n <= 0 then
+        return None
+    end
+    return Some(n)
+end
+
+function double_first(n: i32): Option<i32>
+    local value: i32 = first_positive(n)?
+    return Some(value * 2)
+end
+
+print(read_value(3):unwrap(), read_value(-1):unwrap_err())
+
+local index = find_sensor(6):unwrap()
+print(index, find_sensor(7):is_none(), find_sensor(7):unwrap_or(99))
+
+-- Constructors infer their payloads; unwrap_or specializes a bare None.
+print(Ok(10):unwrap_or(0), Err("x"):unwrap_or(0))
+print(Some(4):expect("some"), None:unwrap_or(-1))
+
+print(double_first(5):unwrap(), double_first(0):is_none())
+print(Ok(5))
+print(Some("ready"))
+
+match read_sensor(2) with
+| Ok(reading) => print("sensor", reading.sensor, reading.value)
+| Err(error) => print("error", error)
+end
+
+match read_sensor(-5) with
+| Ok(reading) => print("sensor", reading.sensor)
+| Err(error) => print("error", error)
+end
+
+match find_sensor(9) with
+| Some(slot) => print("found at", slot)
+| None => print("not found")
+end
+
+match find_sensor(4) with
+| Some(slot) => print("found at", slot)
+| None => print("not found")
+end

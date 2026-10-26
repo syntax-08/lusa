@@ -158,6 +158,13 @@ enum MatchPattern {
     Literal(Expr),
     Binding(String, Span),
     Wildcard,
+    /// `Ok(x)`, `Err(e)`, `Some(x)`, or `None`.  `binding` is `None` for
+    /// `None`, `Ok(_)`, and the empty `Ok()` spelling.
+    Constructor {
+        name: String,
+        binding: Option<String>,
+        span: Span,
+    },
 }
 
 impl Parser {
@@ -448,6 +455,18 @@ impl Parser {
                 "box"
             };
             return Ok(format!("{tag}<{inner}>"));
+        }
+        if matches!(name.as_str(), "Result" | "result") && self.eat(TK::Lt) {
+            let ok = self.parse_type_annotation()?;
+            self.expect(TK::Comma, "`,` between the `Result` success and error types")?;
+            let err = self.parse_type_annotation()?;
+            self.expect(TK::Gt, "`>` to close the `Result` type")?;
+            return Ok(format!("result<{ok},{err}>"));
+        }
+        if matches!(name.as_str(), "Option" | "option") && self.eat(TK::Lt) {
+            let inner = self.parse_type_annotation()?;
+            self.expect(TK::Gt, "`>` to close the `Option` type")?;
+            return Ok(format!("option<{inner}>"));
         }
         Ok(name)
     }
@@ -896,6 +915,46 @@ impl Parser {
                     };
                     branches.push((cond, body));
                 }
+                MatchPattern::Constructor { name, binding, span: bspan } => {
+                    let (method, bind_method) = match name.as_str() {
+                        "Ok" => ("is_ok", Some("unwrap")),
+                        "Err" => ("is_err", Some("unwrap_err")),
+                        "Some" => ("is_some", Some("unwrap")),
+                        _ => ("is_none", None),
+                    };
+                    let cond = Expr {
+                        kind: ExprKind::Method {
+                            obj: Box::new(temp_var()),
+                            name: Box::new(method.to_string()),
+                            args: Vec::new(),
+                            span_args_end: bspan,
+                        },
+                        span: bspan,
+                    };
+                    let mut wrapped = Vec::new();
+                    if let (Some(bind), Some(bind_method)) = (binding, bind_method) {
+                        let value = Expr {
+                            kind: ExprKind::Method {
+                                obj: Box::new(temp_var()),
+                                name: Box::new(bind_method.to_string()),
+                                args: Vec::new(),
+                                span_args_end: bspan,
+                            },
+                            span: bspan,
+                        };
+                        wrapped.push(St {
+                            kind: StKind::Local {
+                                targets: vec![bind],
+                                values: vec![value],
+                                annotations: vec![None],
+                                link_section: None,
+                            },
+                            span: bspan,
+                        });
+                    }
+                    wrapped.extend(body);
+                    branches.push((cond, wrapped));
+                }
             }
             if saw_default {
                 break;
@@ -935,6 +994,43 @@ impl Parser {
             if name == "_" {
                 self.bump();
                 return Ok(MatchPattern::Wildcard);
+            }
+            if matches!(name.as_str(), "Ok" | "Err" | "Some" | "None") {
+                let name = name.clone();
+                self.bump();
+                if name == "None" {
+                    if self.eat(TK::LParen) {
+                        self.expect(TK::RParen, "`)` after `None`")?;
+                    }
+                    return Ok(MatchPattern::Constructor {
+                        name,
+                        binding: None,
+                        span: tk.span,
+                    });
+                }
+                if !self.at(TK::LParen) {
+                    return Ok(MatchPattern::Binding(name, tk.span));
+                }
+                self.bump();
+                let mut binding = None;
+                if !self.at(TK::RParen) {
+                    let inner = self.peek().clone();
+                    if let TK::Name(ref b) = inner.kind {
+                        let b = b.clone();
+                        self.bump();
+                        if b != "_" {
+                            binding = Some(b);
+                        }
+                    } else {
+                        return Err(self
+                            .unexpected_here("a binding name or `_` in the sum-type pattern")
+                            .help(
+                                "`Ok`, `Err`, `Some`, and `None` patterns bind a single name, e.g. `Ok(value)`",
+                            ));
+                    }
+                }
+                self.expect(TK::RParen, "`)` to close the sum-type pattern")?;
+                return Ok(MatchPattern::Constructor { name, binding, span: tk.span });
             }
             self.bump();
             return Ok(MatchPattern::Binding(name.clone(), tk.span));
@@ -1356,6 +1452,11 @@ impl Parser {
                         span,
                     };
                 }
+                TK::Question => {
+                    self.bump();
+                    let span = merge(e.span, t.span);
+                    e = Expr { kind: ExprKind::Try { value: Box::new(e) }, span };
+                }
                 _ => break,
             }
         }
@@ -1437,6 +1538,19 @@ impl Parser {
             TK::Name(n) => {
                 if n == "asm" && self.at(TK::Bang) {
                     return self.parse_asm(tk.span);
+                }
+                if n == "None" && !self.at(TK::LParen) {
+                    // Bare `None` is sugar for the zero-argument constructor;
+                    // the call keeps the value fresh for both dynamic engines.
+                    let callee = expr_var("None".to_string(), tk.span);
+                    return Ok(Expr {
+                        kind: ExprKind::Call {
+                            callee: Box::new(callee),
+                            args: Vec::new(),
+                            span_args_end: tk.span,
+                        },
+                        span: tk.span,
+                    });
                 }
                 ExprKind::Var(Box::new(n))
             }

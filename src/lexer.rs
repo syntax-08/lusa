@@ -246,6 +246,7 @@ impl Lexer {
             }
             '|' => TokenKind::Pipe,
             '!' => TokenKind::Bang,
+            '?' => TokenKind::Question,
             '<' => {
                 if self.peek() == '=' {
                     self.pos += 1;

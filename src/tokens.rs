@@ -81,6 +81,8 @@ pub enum TokenKind {
     Pipe,
     /// `!` - macro-style invocation, currently used by `asm!("...")`.
     Bang,
+    /// `?` - propagates an `Err`/`None` out of the current function.
+    Question,
     LParen,
     RParen,
     LBrace,
@@ -196,6 +198,7 @@ impl Token {
             TokenKind::FatArrow => "`=>`".into(),
             TokenKind::Pipe => "`|`".into(),
             TokenKind::Bang => "`!`".into(),
+            TokenKind::Question => "`?`".into(),
             TokenKind::LParen => "`(`".into(),
             TokenKind::RParen => "`)`".into(),
             TokenKind::LBrace => "`{`".into(),

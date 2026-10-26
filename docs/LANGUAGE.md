@@ -1313,7 +1313,142 @@ dereference and writes, `Vec<string>`/`Box<string>` RAII, custom allocator
 dispatch, freestanding arena emission, allocator diagnostics, and native +
 dynamic parity.
 
-### 9.14 Native subset limits
+### 9.14 Safe error handling (Module 21)
+
+`Result<T, E>` and `Option<T>` are built-in sum types shared by the interpreter,
+bytecode VM, and C11 backend. `Result` carries either `Ok(value)` or
+`Err(error)`; `Option` carries either `Some(value)` or `None`:
+
+```lusa
+function parse(n: i32): Result<i32,string>
+    if n < 0 then
+        return Err("negative")
+    end
+    return Ok(n * 2)
+end
+
+function maybe(n: i32): Option<i32>
+    if n == 0 then
+        return None
+    end
+    return Some(n)
+end
+```
+
+- Annotations are canonicalized to lowercase `result<T,E>` and `option<T>`;
+  both `Result<...>`/`Option<...>` and the lowercase spellings are accepted.
+- Constructors infer their payload types: `Ok(5)` is `result<i32,nil>`,
+  `Err("x")` is `result<nil,string>`, `Some(v)` is `option<T>`, and `None` is
+  `option<nil>`. A source-side `nil` payload is a wildcard when stored into a
+  fully typed `Result`/`Option`.
+- Bare `None` lowers to a zero-argument `None()` call in both parsers unless it
+  is followed by `(`, so the value is freshly constructed.
+- `nil` cannot be used to infer a payload (`E0308`); annotate the destination or
+  pass a typed value.
+
+The `?` operator short-circuits a function. On `Ok(value)`/`Some(value)` it
+evaluates to the payload; on `Err(error)`/`None` it returns from the enclosing
+function with that variant:
+
+```lusa
+function double(n: i32): Result<i32,string>
+    local value: i32 = parse(n)?
+    return Ok(value + 1)
+end
+
+function plus_ten(n: i32): Option<i32>
+    local value: i32 = maybe(n)?
+    return Some(value + 10)
+end
+```
+
+- `?` requires an enclosing function that returns the same sum kind
+  (`Result` with `Result`, `Option` with `Option`); otherwise `E0312`.
+- Only the error side must be compatible. A `Result<Point,string>` can be
+  propagated by a function returning `Result<i32,string>`; the success payload
+  of the operand becomes the expression value.
+- `Ok(...)?` with a `nil` error payload is allowed; the failure branch is
+  emitted but unreachable.
+- In the dynamic engines `?` clones the payload and leaves the operand usable.
+  In C11 the operand is cloned when it is a place or non-owning expression and
+  moved when it is owned; the success payload is taken and the sum is dropped
+  before the value is used.
+- In the VM, `?` lowers to `Instr::Try`, which truncates the shared stacks to
+  the frame base, pushes the cloned propagated sum, and returns from the frame.
+
+`match` supports the constructors directly. The scrutinee is not moved, and
+each arm binds the payload of its variant:
+
+```lusa
+match parse(-2) with
+| Ok(value) => print("ok", value)
+| Err(error) => print("error", error)
+end
+
+match maybe(0) with
+| Some(value) => print("some", value)
+| None => print("none")
+end
+```
+
+Patterns are `Ok(binding)`, `Ok(_)`, `Err(binding)`, `Err(_)`,
+`Some(binding)`, `Some(_)`, and `None`. Both parsers lower each arm to a hidden
+temporary check (`is_ok`/`is_err`/`is_some`/`is_none`) plus an `unwrap` or
+`unwrap_err` binding, so duplicate or unreachable arms follow the existing
+`match` rules.
+
+Combinators are methods on the sums. Calling one on the wrong variant raises
+the catchable runtime error `E9999` (for example
+`called \`Result::unwrap()\` on an \`Err\` value: boom`):
+
+| type     | methods |
+|----------|---------|
+| `Result` | `is_ok`, `is_err`, `unwrap`, `unwrap_err`, `unwrap_or`, `expect` |
+| `Option` | `is_some`, `is_none`, `unwrap`, `unwrap_or`, `expect` |
+
+```lusa
+print(Ok(5):unwrap_or(9), Err("bad"):unwrap_or(9))  -- 5 9
+print(Some(2):unwrap_or(0), None:unwrap_or(0))      -- 2 0
+print(Ok(7):expect("ok"), Some(8):expect("some"))   -- 7 8
+```
+
+- `unwrap_or(fallback)` checks the fallback against the success payload; a
+  one-sided constructor receiver (`Err("bad")`, `None`) specializes the payload
+  from the fallback.
+- `expect(message)` behaves like `unwrap` but raises `E9999` with the supplied
+  message on the wrong variant.
+- Printing formats sums as `Ok(value)`, `Err(error)`, `Some(value)`, and
+  `None`; payloads must themselves be printable.
+
+In the C11 backend, a `Result<T,E>` lowers to
+`LusaResult { bool is_ok; void *ok; void *err; }` and an `Option<T>` to
+`LusaOption { bool is_some; void *value; }`. Payloads are heap-boxed through the
+module 20 heap contract, and every instantiation receives
+`lusa_result_new_ok_<tag>`, `lusa_result_new_err_<tag>`, `lusa_result_take_*`,
+`lusa_result_get_*`, `lusa_result_clone_<tag>`, `lusa_result_drop_<tag>`, and
+the matching `lusa_option_*` helpers. Sum parameters are owned by the callee and
+dropped there; call sites clone non-owning arguments and move owned ones.
+Supported payloads are scalars, `string`, structs, `Vec<T>`, `Box<T>`, and
+nested sums. Fixed arrays are rejected with `E0301`.
+
+In `#[no_std]` builds, sums use the static bump arena and scalar or struct
+payloads; strings are unavailable, and the `lusa_print_result_*`/
+`lusa_print_option_*` helpers are omitted. `?` still lowers to the same
+early-return checks.
+
+```sh
+lusalang run examples/error_handling.lusa
+lusalang run examples/error_handling.lusa --vm
+lusalang run examples/error_handling.lusa --native
+lusalang build examples/error_handling.lusa --emit-c
+```
+
+`tests/module21.rs` covers constructors and combinators, `?` through branches
+and loops, struct/`Vec`/`Box`/nested payloads, sum parameters and fields,
+`match` binding and returns, freestanding scalar sums, typed diagnostics,
+runtime wrong-variant errors, and native + dynamic parity.
+
+### 9.15 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 table literals, fixed-size `[T; N]` arrays and array literals, nested keyed
@@ -1333,7 +1468,9 @@ dereferences inside `unsafe`, the raw intrinsics above (`unsafe_ptr_cast`,
 `volatile_write`, `unsafe_nop`, `unsafe_asm`, `asm!("...")`), native `pcall`,
 `Vec<T>` (push/pop/len/capacity/is_empty/reserve/clear, indexing, and
 element assignment) and `Box<T>` (implicit and `Box(value)` construction,
-safe `*b` reads/writes, `nil` clearing) with their RAII drop helpers, the
+safe `*b` reads/writes, `nil` clearing) with their RAII drop helpers,
+`Result<T,E>`/`Option<T>` (`Ok`/`Err`/`Some`/`None`, combinators, constructor
+`match` arms, and `?`) with their RAII helpers, the
 string-pattern surface in
 section 9.7, and the restricted
 `coroutine.create/resume/yield/status/close/isyieldable` surface described in
@@ -1343,7 +1480,8 @@ Not supported by the C emitter: numeric `for`, arbitrary dynamic key
 construction in table literals, assignment through a dynamic index, varargs,
 interpolated strings, closures/nested functions, forward struct references,
 whole-array assignment or arrays passed/returned by value, `&array`, `Vec<T>`
-values passed or returned by value (`E0312`), namespaced or selectively
+values passed or returned by value (`E0312`), fixed arrays as
+`Result`/`Option` payloads (`E0301`), namespaced or selectively
 exported imports, the rest of the dynamic string
 library, multiple function return values (`E0313`), dynamic `pcall`
 expressions, and general first-class coroutine operations. Native colon methods are static functions

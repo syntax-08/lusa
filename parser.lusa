@@ -449,6 +449,20 @@ parse_type = function()
         end
         return "box<" .. element .. ">"
     end
+    if (name == "Result" or name == "result") and at_value("<") then
+        advance()
+        local ok = parse_type()
+        expect_value(",", "`,` between the `Result` success and error types")
+        local err = parse_type()
+        expect_value(">", "`>` to close the `Result` type")
+        return "result<" .. ok .. "," .. err .. ">"
+    end
+    if (name == "Option" or name == "option") and at_value("<") then
+        advance()
+        local inner = parse_type()
+        expect_value(">", "`>` to close the `Option` type")
+        return "option<" .. inner .. ">"
+    end
     return name
 end
 
@@ -927,6 +941,45 @@ parse_match_pattern = function()
         if value == "_" then
             return {tag = "Wildcard", line = line, column = column}
         end
+        if value == "Ok" or value == "Err" or value == "Some" or value == "None" then
+            if value == "None" then
+                if at_value("(") then
+                    advance()
+                    expect_value(")", "`)` after `None`")
+                end
+                return {
+                    tag = "Constructor",
+                    name = value,
+                    binding = nil,
+                    line = line,
+                    column = column
+                }
+            end
+            if not at_value("(") then
+                return {tag = "Binding", name = value, line = line, column = column}
+            end
+            advance()
+            local binding = nil
+            if not at_value(")") then
+                if peek_kind() ~= "name" then
+                    fail_at(peek_line(), peek_column(),
+                        "expected a binding name or `_` in the sum-type pattern")
+                end
+                local inner = peek_value()
+                advance()
+                if inner ~= "_" then
+                    binding = inner
+                end
+            end
+            expect_value(")", "`)` to close the sum-type pattern")
+            return {
+                tag = "Constructor",
+                name = value,
+                binding = binding,
+                line = line,
+                column = column
+            }
+        end
         return {tag = "Binding", name = value, line = line, column = column}
     end
 
@@ -1031,6 +1084,61 @@ parse_match = function()
             end
             else_body = wrapped
             break
+        elseif pattern.tag == "Constructor" then
+            local method = "is_none"
+            local bind_method = nil
+            if pattern.name == "Ok" then
+                method = "is_ok"
+                bind_method = "unwrap"
+            elseif pattern.name == "Err" then
+                method = "is_err"
+                bind_method = "unwrap_err"
+            elseif pattern.name == "Some" then
+                method = "is_some"
+                bind_method = "unwrap"
+            end
+            local cond = {
+                tag = "MethodCall",
+                obj = {
+                    tag = "Name",
+                    name = temp,
+                    line = pattern.line,
+                    column = pattern.column
+                },
+                name = method,
+                args = {},
+                line = pattern.line,
+                column = pattern.column
+            }
+            local wrapped = {}
+            if pattern.binding ~= nil and bind_method ~= nil then
+                wrapped[1] = {
+                    tag = "Local",
+                    names = {pattern.binding},
+                    types = {"auto"},
+                    values = {{
+                        tag = "MethodCall",
+                        obj = {
+                            tag = "Name",
+                            name = temp,
+                            line = pattern.line,
+                            column = pattern.column
+                        },
+                        name = bind_method,
+                        args = {},
+                        line = pattern.line,
+                        column = pattern.column
+                    }},
+                    line = pattern.line,
+                    column = pattern.column
+                }
+            end
+            local i = 1
+            while i <= #body do
+                wrapped[#wrapped + 1] = body[i]
+                i = i + 1
+            end
+            branches[#branches + 1] = {cond = cond, body = wrapped}
         else
             local cond = {
                 tag = "Binary",
@@ -1510,6 +1618,16 @@ parse_suffixes = function(e)
                     column = column
                 }
             end
+        elseif at_value("?") then
+            advance()
+            local line = e.line
+            local column = e.column
+            e = {
+                tag = "Try",
+                value = transfer(e),
+                line = line,
+                column = column
+            }
         else
             return e
         end
@@ -1669,6 +1787,22 @@ parse_primary = function()
 
     if kind == "name" then
         advance()
+        if value == "None" and not at_value("(") then
+            -- Bare `None` is sugar for the zero-argument constructor; the call
+            -- keeps the dynamic value fresh in both engines.
+            return {
+                tag = "Call",
+                callee = {
+                    tag = "Name",
+                    name = "None",
+                    line = line,
+                    column = column
+                },
+                args = {},
+                line = line,
+                column = column
+            }
+        end
         return {
             tag = "Name",
             name = value,

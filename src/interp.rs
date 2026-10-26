@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::cell::RefCell;
 
 use crate::ast::*;
-use crate::error::{LResult, LusaError, Span, E_BORROW_CONFLICT, E_MOVED, E_RUNTIME};
+use crate::error::{LResult, LusaError, Span, E_BORROW_CONFLICT, E_CALL, E_MOVED, E_RUNTIME, E_TRY};
 use crate::eval;
 use crate::scope::{self, ScopeRef};
 use crate::value;
@@ -17,6 +17,13 @@ use crate::value::{
 };
 
 pub const MAX_CALL_DEPTH: usize = 200;
+
+/// Pending `?` payload.  `depth` identifies the interpreter call whose body
+/// produced the early return; only that frame consumes the value.
+pub struct TryPending {
+    pub depth: usize,
+    pub value: Value,
+}
 
 /// A registered `struct` declaration, used by the safe emulation layer.
 #[derive(Clone, Debug)]
@@ -56,6 +63,9 @@ pub struct Interp {
     /// capacity across pop/clear semantics; tables have no header, so the
     /// sandbox records the capacity out of band.
     pub vec_caps: RefCell<HashMap<u64, u32>>,
+    /// Payload of the most recent `?` early return, consumed by the matching
+    /// `call_value` frame.
+    pub try_pending: Option<TryPending>,
     /// next simulated base address handed out by `unsafe_alloc`
     pub unsafe_alloc_next: u64,
     /// next simulated address handed out by `&place`
@@ -108,6 +118,7 @@ impl Interp {
             struct_defs: HashMap::new(),
             struct_tables: RefCell::new(HashMap::new()),
             vec_caps: RefCell::new(HashMap::new()),
+            try_pending: None,
             unsafe_alloc_next: 0x1000,
             addr_next: 0x8000_0000,
             active_coroutines: Vec::new(),
@@ -415,8 +426,21 @@ impl Interp {
                             f2.varargs.clear();
                         }
                         let result = self.exec_block(&mut f2, &lit.body);
+                        let frame_depth = self.depth;
                         self.depth -= 1;
-                        result?;
+                        if let Err(e) = result {
+                            if e.code == E_TRY {
+                                if let Some(pending) = self.try_pending.take() {
+                                    if pending.depth == frame_depth {
+                                        f2.ret.clear();
+                                        f2.ret.push(pending.value);
+                                        return Ok(std::mem::take(&mut f2.ret));
+                                    }
+                                    self.try_pending = Some(pending);
+                                }
+                            }
+                            return Err(e);
+                        }
                         Ok(std::mem::take(&mut f2.ret))
                     }
                     FuncBody::Builtin(b) => b(self, args, span),
@@ -975,6 +999,160 @@ impl Interp {
         };
         for (source, cloned) in pairs {
             self.tag_cloned_structs(&source, &cloned, visited);
+        }
+    }
+
+    /// The `Result`/`Option` method surface shared by both dynamic engines.
+    /// These names fall back only when the table has no real field with the
+    /// same spelling, so user structs are unaffected.
+    pub fn is_sum_method(name: &str) -> bool {
+        matches!(
+            name,
+            "is_ok"
+                | "is_err"
+                | "unwrap"
+                | "unwrap_err"
+                | "unwrap_or"
+                | "expect"
+                | "is_some"
+                | "is_none"
+        )
+    }
+
+    /// Executes a `Result`/`Option` fallback method.  Arguments have already
+    /// been read by the caller.  Payloads are cloned rather than moved out of
+    /// the receiver, matching `Clone`-based Rust combinators and keeping the
+    /// sum usable after the call.
+    pub(crate) fn sum_method_call(
+        &mut self,
+        table: &Rc<TableObj>,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> LResult<Vec<Value>> {
+        let value = Value::Table(Rc::clone(table));
+        let (kind, tag, payload) = match value.sum_parts() {
+            Some(parts) => parts,
+            None => {
+                return Err(LusaError::new(
+                    E_CALL,
+                    Some(span),
+                    format!("method `:{name}` is only available on Result and Option values"),
+                ))
+            }
+        };
+        let label = if kind == "result" { "Result" } else { "Option" };
+        let is_ok = kind == "result" && tag == "ok";
+        let is_err = kind == "result" && tag == "err";
+        let is_some = kind == "option" && tag == "some";
+        let is_none = kind == "option" && tag == "none";
+        match name {
+            "is_ok" | "is_err" | "is_some" | "is_none" => {
+                if (name == "is_ok" || name == "is_err") && kind != "result" {
+                    return Err(LusaError::new(
+                        E_CALL,
+                        Some(span),
+                        format!("`Option` has no method `:{name}`"),
+                    ));
+                }
+                if (name == "is_some" || name == "is_none") && kind != "option" {
+                    return Err(LusaError::new(
+                        E_CALL,
+                        Some(span),
+                        format!("`Result` has no method `:{name}`"),
+                    ));
+                }
+                Ok(vec![Value::Bool(match name {
+                    "is_ok" => is_ok,
+                    "is_err" => is_err,
+                    "is_some" => is_some,
+                    _ => is_none,
+                })])
+            }
+            "unwrap" => {
+                if is_ok || is_some {
+                    Ok(vec![self.deep_clone_value(&payload)])
+                } else if kind == "result" {
+                    Err(LusaError::new(
+                        E_RUNTIME,
+                        Some(span),
+                        format!(
+                            "called `Result::unwrap()` on an `Err` value: {}",
+                            payload.fmt_value()
+                        ),
+                    ))
+                } else {
+                    Err(LusaError::new(
+                        E_RUNTIME,
+                        Some(span),
+                        "called `Option::unwrap()` on a `None` value",
+                    ))
+                }
+            }
+            "unwrap_err" => {
+                if kind != "result" {
+                    return Err(LusaError::new(
+                        E_CALL,
+                        Some(span),
+                        "`Option` has no method `:unwrap_err`".to_string(),
+                    ));
+                }
+                if is_err {
+                    Ok(vec![self.deep_clone_value(&payload)])
+                } else {
+                    Err(LusaError::new(
+                        E_RUNTIME,
+                        Some(span),
+                        format!(
+                            "called `Result::unwrap_err()` on an `Ok` value: {}",
+                            payload.fmt_value()
+                        ),
+                    ))
+                }
+            }
+            "unwrap_or" => {
+                if args.len() != 1 {
+                    return Err(LusaError::new(
+                        E_CALL,
+                        Some(span),
+                        format!(
+                            "`{label}:unwrap_or` takes one fallback value, found {}",
+                            args.len()
+                        ),
+                    ));
+                }
+                if is_ok || is_some {
+                    Ok(vec![self.deep_clone_value(&payload)])
+                } else {
+                    Ok(vec![args.into_iter().next().unwrap()])
+                }
+            }
+            "expect" => {
+                if args.len() != 1 {
+                    return Err(LusaError::new(
+                        E_CALL,
+                        Some(span),
+                        format!(
+                            "`{label}:expect` takes one message, found {}",
+                            args.len()
+                        ),
+                    ));
+                }
+                if is_ok || is_some {
+                    Ok(vec![self.deep_clone_value(&payload)])
+                } else {
+                    let message = match args[0].base_value() {
+                        Value::Str(text) => text.to_string(),
+                        other => other.fmt_value(),
+                    };
+                    Err(LusaError::new(E_RUNTIME, Some(span), message))
+                }
+            }
+            other => Err(LusaError::new(
+                E_CALL,
+                Some(span),
+                format!("unknown {label} method `:{other}`"),
+            )),
         }
     }
 
