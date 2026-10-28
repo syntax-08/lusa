@@ -1,0 +1,22 @@
+// Minimal ESP32-C3 platform.  Renode 1.17 has an ESP32 UART but no TIMG;
+// Arm_CMSDK_Timer at the TIMG T0 base provides the same offsets used by the
+// example for CTRL, VALUE (T0LO), and RELOAD (T0HI).  GPIO output is backed by
+// MappedMemory because Renode exposes no ESP32 GPIO port model.
+flash: Memory.MappedMemory @ sysbus 0x42000000
+    size: 0x400000
+
+sram: Memory.MappedMemory @ sysbus 0x3FC80000
+    size: 0x64000
+
+gpio: Memory.MappedMemory @ sysbus 0x60004000
+    size: 0x1000
+
+uart0: UART.ESP32_UART @ sysbus 0x60000000
+
+timer0: Timers.Arm_CMSDK_Timer @ sysbus 0x6001F000
+    frequency: 16000000
+
+cpu: CPU.RiscV32 @ sysbus
+    cpuType: "rv32imc"
+    privilegedArchitecture: PrivilegedArchitecture.Priv1_10
+    hartId: 0

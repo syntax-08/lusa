@@ -1,0 +1,123 @@
+-- Module 25 companion example: RP2040 SIO GPIO and SysTick timing.
+--
+--   lusalang build examples/modern_mcu_rp2040.lusa --target rp2040
+--
+-- The platform in renode/lusa_rp2040.repl models both Cortex-M0+ cores, UART0
+-- as a PL011, the SIO GPIO output block at 0xD0000000, and architectural
+-- SysTick on each NVIC. Renode 1.17 has no RP2040 TIMER or SIO peripheral, so
+-- this example uses SysTick for timing and reads GPIO_OUT back directly; those
+-- are the parts the emulator can verify. Core 1 is halted by the reset script.
+--
+-- The UART model requires UARTEN and TXE, so the example initialises CR the
+-- same way real PL011 firmware does before writing bytes to DR.
+
+#[no_std]
+
+function uart_init(): void
+    unsafe do
+        local uart: *mut u32 = 0x40034000
+        local ibrd: *mut u32 = uart + 9
+        local fbrd: *mut u32 = uart + 10
+        local lcr: *mut u32 = uart + 11
+        local control: *mut u32 = uart + 12
+        ibrd.write_volatile(8)         -- 115200 baud from a 48 MHz UART clock
+        fbrd.write_volatile(44)
+        lcr.write_volatile(0x70)       -- 8 bits, FIFO enabled
+        control.write_volatile(0x301)  -- UARTEN | TXE | RXE
+    end
+end
+
+function uart_putc(byte: u32): void
+    unsafe do
+        local uart: *mut u32 = 0x40034000
+        local data: *mut u32 = uart
+        local flags: *mut u32 = uart + 6
+        while (flags.read_volatile() // 32) % 2 ~= 0 do
+        end
+        data.write_volatile(byte)
+    end
+end
+
+function uart_puts(message: *mut u32, length: u32): void
+    local i: u32 = 0
+    unsafe do
+        local cursor: *mut u32 = message
+        while i < length do
+            uart_putc(cursor.read_volatile())
+            cursor = cursor + 1
+            i = i + 1
+        end
+    end
+end
+
+function gpio_selftest(): bool
+    unsafe do
+        local sio: *mut u32 = 0xD0000000
+        local output: *mut u32 = sio + 4
+        -- GPIO25 is the Pico board LED. Renode 1.17 has no RP2040 SIO model,
+        -- so the platform backs SIO with MappedMemory: write the output latch
+        -- directly, read it back, then clear it. The SET/CLR/XOR aliases exist
+        -- on hardware but have no special behaviour in plain memory.
+        output.write_volatile(0x02000000)
+        local high: u32 = output.read_volatile()
+        output.write_volatile(0)
+        if (high // 0x02000000) % 2 ~= 0 then
+            return true
+        end
+        return false
+    end
+end
+
+function systick_selftest(): bool
+    unsafe do
+        -- 0xE000E010 as decimal: the parser currently classifies any numeric
+        -- token containing `e`/`E` as a float, including hex literals.
+        local systick: *mut u32 = 3758153744
+        local control: *mut u32 = systick
+        local reload: *mut u32 = systick + 1
+        local value: *mut u32 = systick + 2
+        reload.write_volatile(0xFFFF)
+        value.write_volatile(0)
+        control.write_volatile(5) -- CLKSOURCE | ENABLE
+        local start: u32 = value.read_volatile()
+        local spins: u32 = 0
+        while spins < 1000000 do
+            if value.read_volatile() ~= start then
+                return true
+            end
+            spins = spins + 1
+        end
+        return false
+    end
+end
+
+#[entry]
+function _start(): void
+    uart_init()
+
+    local prefix: [u32; 31] = [
+        76, 85, 83, 65, 32, 77, 79, 68, 69, 82, 78, 32, 77, 67, 85, 32,
+        79, 75, 10, 114, 112, 50, 48, 52, 48, 32, 103, 112, 105, 111, 61
+    ]
+    local ok: [u32; 2] = [111, 107]
+    local fail: [u32; 4] = [102, 97, 105, 108]
+    local systick_label: [u32; 9] = [32, 115, 121, 115, 116, 105, 99, 107, 61]
+    local newline: [u32; 2] = [10, 10]
+
+    uart_puts(&prefix[0], 31)
+    if gpio_selftest() then
+        uart_puts(&ok[0], 2)
+    else
+        uart_puts(&fail[0], 4)
+    end
+    uart_puts(&systick_label[0], 9)
+    if systick_selftest() then
+        uart_puts(&ok[0], 2)
+    else
+        uart_puts(&fail[0], 4)
+    end
+    uart_puts(&newline[0], 2)
+
+    while true do
+    end
+end

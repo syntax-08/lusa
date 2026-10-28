@@ -1,0 +1,33 @@
+// Minimal Raspberry Pi RP2040 platform for Lusa bare-metal images.
+// Renode 1.17 has no RP2040 SIO/TIMER peripherals, so the SIO GPIO output
+// block is backed by MappedMemory and timing uses the architectural SysTick.
+// The CPU model is cortex-m0: Renode does not expose cortex-m0plus.
+flash: Memory.MappedMemory @ sysbus 0x10000000
+    size: 0x200000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x42000
+
+sio: Memory.MappedMemory @ sysbus 0xD0000000
+    size: 0x1000
+
+uart0: UART.PL011 @ sysbus 0x40034000
+    -> nvic@20
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 125000000
+    IRQ -> cpu0@0
+
+cpu0: CPU.CortexM @ sysbus
+    cpuType: "cortex-m0"
+    nvic: nvic
+
+nvic1: IRQControllers.NVIC @ sysbus 0xE000F000
+    priorityMask: 0xF0
+    systickFrequency: 125000000
+    IRQ -> cpu1@0
+
+cpu1: CPU.CortexM @ sysbus
+    cpuType: "cortex-m0"
+    nvic: nvic1

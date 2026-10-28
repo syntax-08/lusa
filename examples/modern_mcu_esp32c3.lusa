@@ -1,0 +1,103 @@
+-- Module 25 companion example: ESP32-C3 GPIO and TIMG polling.
+--
+--   lusalang build examples/modern_mcu_esp32c3.lusa --target esp32c3
+--
+-- Renode 1.17 ships an ESP32 UART model but no ESP32-C3 TIMG or GPIO port.
+-- renode/lusa_esp32c3.repl therefore backs GPIO output with MappedMemory and
+-- maps an Arm CMSDK timer at the TIMG T0 base: CTRL (0x00), T0LO (0x04), and
+-- T0HI (0x08) share offsets with the CMSDK CTRL/VALUE/RELOAD registers. The
+-- example writes the T0HI reload first, then sets both the real ESP32 EN bit
+-- (31) and the model's enable bit (0), and polls T0LO until it moves.
+--
+-- On hardware, configure the GPIO matrix and the TIMG clock first; this image
+-- intentionally reaches the registers directly so the emulator test stays
+-- focused on the Lusa volatile-access and polling surface.
+
+#[no_std]
+
+function uart_putc(byte: u32): void
+    unsafe do
+        local fifo: *mut u32 = 0x60000000
+        fifo.write_volatile(byte)
+    end
+end
+
+function uart_puts(message: *mut u32, length: u32): void
+    local i: u32 = 0
+    unsafe do
+        local cursor: *mut u32 = message
+        while i < length do
+            uart_putc(cursor.read_volatile())
+            cursor = cursor + 1
+            i = i + 1
+        end
+    end
+end
+
+function gpio_selftest(): bool
+    unsafe do
+        local gpio: *mut u32 = 0x60004000
+        local output: *mut u32 = gpio + 1
+        -- GPIO10 is a common dev-board LED pin. Renode exposes no ESP32 GPIO
+        -- port model, so the platform backs the block with MappedMemory:
+        -- write GPIO_OUT directly, read it back, then clear it. The W1TS/W1TC
+        -- aliases exist on hardware but have no special behaviour here.
+        output.write_volatile(0x00000400)
+        local high: u32 = output.read_volatile()
+        output.write_volatile(0)
+        if (high // 1024) % 2 ~= 0 then
+            return true
+        end
+        return false
+    end
+end
+
+function timer_selftest(): bool
+    unsafe do
+        local timg: *mut u32 = 0x6001F000
+        local config: *mut u32 = timg
+        local low: *mut u32 = timg + 1
+        local high: *mut u32 = timg + 2
+        high.write_volatile(0xFFFF)
+        config.write_volatile(0x80000001)
+        local start: u32 = low.read_volatile()
+        local spins: u32 = 0
+        while spins < 1000000 do
+            if low.read_volatile() ~= start then
+                return true
+            end
+            spins = spins + 1
+        end
+        return false
+    end
+end
+
+#[entry]
+function _start(): void
+    local prefix: [u32; 32] = [
+        76, 85, 83, 65, 32, 77, 79, 68, 69, 82, 78, 32, 77, 67, 85, 32,
+        79, 75, 10, 101, 115, 112, 51, 50, 99, 51, 32, 103, 112, 105, 111,
+        61
+    ]
+    local ok: [u32; 2] = [111, 107]
+    local fail: [u32; 4] = [102, 97, 105, 108]
+    local timer_label: [u32; 7] = [32, 116, 105, 109, 101, 114, 61]
+    local newline: [u32; 2] = [10, 10]
+
+    uart_puts(&prefix[0], 32)
+    if gpio_selftest() then
+        uart_puts(&ok[0], 2)
+    else
+        uart_puts(&fail[0], 4)
+    end
+    uart_puts(&timer_label[0], 7)
+    if timer_selftest() then
+        uart_puts(&ok[0], 2)
+    else
+        uart_puts(&fail[0], 4)
+    end
+    uart_puts(&newline[0], 2)
+
+    while true do
+    end
+end

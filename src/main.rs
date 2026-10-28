@@ -37,7 +37,8 @@ fn main() {
             println!("  lusalang version               runtime version");
             println!();
             println!("  C backend: --cc <path> selects GCC/Clang/TCC/cl.exe; LUSA_CC and CC are honored.");
-            println!("             --target <name> cross-builds bare metal (host, riscv32-virt, riscv64-virt).");
+            println!("             --target <name> cross-builds bare metal (host, riscv32-virt, riscv64-virt,");
+            println!("                              rp2040, stm32f4, esp32c3).");
             println!("             build --emit-c writes the intermediate C without invoking the C compiler.");
             println!();
             println!("  (short aliases: lusa [file.lusa] | lusa -e \"<code>\")");

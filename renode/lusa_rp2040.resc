@@ -1,0 +1,11 @@
+using sysbus
+
+mach create "lusa-rp2040"
+machine LoadPlatformDescription @PLATFORM@
+
+sysbus LoadELF @ELF@
+cpu1 IsHalted true
+sysbus.uart0 CreateFileBackend "@UART_LOG@" true
+
+emulation RunFor "00:00:02"
+quit

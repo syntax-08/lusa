@@ -1675,7 +1675,7 @@ execution, awaited children, `.await`/`::await`/`task.await`, `task.run` polling
 counts, freestanding arena emission, typed diagnostics, and native + dynamic
 parity.
 
-### 9.16 Cross-compilation and Renode targets (Module 24)
+### 9.16 Cross-compilation and Renode targets (Modules 24–25)
 
 `lusalang build` selects an output machine with `--target`. Without the flag it
 builds the host executable exactly as before:
@@ -1684,6 +1684,9 @@ builds the host executable exactly as before:
 lusalang build examples/baremetal_renode_uart.lusa --target riscv32-virt
 lusalang build examples/baremetal_renode_uart.lusa --target riscv64-virt
 lusalang build examples/baremetal_renode_uart.lusa --target=riscv32-unknown-elf
+lusalang build examples/modern_mcu_peripherals.lusa --target stm32f4
+lusalang build examples/modern_mcu_rp2040.lusa --target rp2040
+lusalang build examples/modern_mcu_esp32c3.lusa --target esp32c3
 lusalang build examples/baremetal_renode_uart.lusa --target host
 lusalang build --help
 ```
@@ -1693,6 +1696,9 @@ lusalang build --help
 | host | `host`, `native`, omitted | host | host compiler | `.exe` on Windows, no extension elsewhere |
 | 32-bit Renode `virt` | `riscv32-virt`, `riscv32-unknown-elf` | `riscv32-unknown-elf` | `rv32imac` / `ilp32` | `.elf` |
 | 64-bit Renode `virt` | `riscv64-virt`, `riscv64-unknown-elf` | `riscv64-unknown-elf` | `rv64imac` / `lp64` | `.elf` |
+| Raspberry Pi RP2040 | `rp2040`, `thumbv6m-none-eabi` | `thumbv6m-none-eabi` | Cortex-M0+ / soft-float | `.elf` |
+| STM32F4 | `stm32f4`, `thumbv7em-none-eabi` | `thumbv7em-none-eabi` | Cortex-M4 / soft-float | `.elf` |
+| Espressif ESP32-C3 | `esp32c3`, `riscv32-esp-elf` | `riscv32-esp-elf` | `rv32imc` / `ilp32` | `.elf` |
 
 Names and triples are matched case-insensitively. An unknown target exits with
 status 2 and prints the available names.
@@ -1714,44 +1720,88 @@ The rest of the image is compiled with `-std=c11 -O2 -ffreestanding
 -fno-builtin -fno-stack-protector -mcmodel=medany` plus the target ISA/ABI
 flags.
 
-`renode/startup_riscv.S` is assembled into the image and linked first at
-`0x80000000` by `renode/linker_riscv.ld`:
+`renode/startup_riscv.S` is assembled into the image and linked first by the
+active linker script. For the `virt` boards that is `renode/linker_riscv.ld`
+at `0x80000000`; for ESP32-C3 it is `renode/linker_riscv_flash.ld`, which
+places `.text.init` in flash at `0x42000000` and `.data`/`.bss` in SRAM at
+`0x3FC80000`. The RISC-V stub copies `.data` from its load image, zeroes
+`.bss`, and then calls the entry:
 
 ```asm
 _reset:
-    la sp, _stack_top          # 64 KiB stack placed after .bss
-    la t0, _bss_start
-    la t1, _bss_end
-1:  bgeu t0, t1, 2f
-    sd zero, 0(t0)             # sw on RV32
-    addi t0, t0, 8
+    la sp, _stack_top          # stack placed after .bss
+    la t0, _data_load_start
+    la t1, _data_start
+    la t2, _data_end
+1:  bgeu t1, t2, 2f
+    lw t3, 0(t0)               # ld on RV64
+    sw t3, 0(t1)
+    addi t0, t0, 4
+    addi t1, t1, 4
     j 1b
-2:  call lusa_entry
-3:  j 3b
+2:  la t0, _bss_start
+    la t1, _bss_end
+3:  bgeu t0, t1, 4f
+    sw zero, 0(t0)
+    addi t0, t0, 4
+    j 3b
+4:  call lusa_entry
+5:  j 5b
 ```
+
+The ARM targets reuse `renode/startup_arm.S`. It places a 16-entry Cortex-M
+vector table at the start of flash, sets VTOR, copies `.data` from flash to
+SRAM, zeroes `.bss`, and calls `lusa_entry`:
+
+```asm
+_vectors:
+    .word _stack_top
+    .word _reset
+    .rept 14
+    .word _default_handler
+    .endr
+
+_reset:
+    cpsid i
+    ldr r0, =_stack_top
+    mov sp, r0
+    ldr r0, =0xE000ED08
+    ldr r1, =_vectors
+    str r1, [r0]
+    @ copy .data and zero .bss, then bl lusa_entry
+```
+
+`renode/linker_arm_rp2040.ld` maps 2 MiB flash at `0x10000000` and 264 KiB
+SRAM at `0x20000000`; `renode/linker_arm_stm32f4.ld` maps 1 MiB flash at
+`0x08000000` and 128 KiB SRAM at `0x20000000`. Both place `.vectors` first,
+`.data` in SRAM with a flash load address, and reserve the stack at the top of
+SRAM. GCC can lower aggregate copies to `memcpy`/`memset` even with
+`-ffreestanding`, so both startup stubs define byte-wise `memcpy`/`memset`
+routines for libc-free images.
 
 The final link uses `-nostdlib -nostartfiles -Wl,-T,linker.ld
 -Wl,--gc-sections -Wl,--build-id=none ... -lgcc`. `-lgcc` supplies compiler
 helpers only; no libc, `crt0`, `malloc`, `printf`, or hosted startup code is
-linked. The linker script places `.text.init` first, then `.text`, `.rodata`,
-`.data`, and `.bss`, and reserves the stack after BSS.
+linked.
 
 #### Cross-compiler discovery
 
 Cross builds use their own chain and never fall back to the host `LUSA_CC`/`CC`
-variables:
+variables. The exact environment chain depends on the target:
 
-1. `--cc <path>`
-2. `LUSA_RISCV_CC`
-3. `LUSA_CROSS_CC`
-4. `riscv32-unknown-elf-gcc`, `riscv-none-elf-gcc`,
-   `riscv64-unknown-elf-gcc`, or `riscv64-elf-gcc` on `PATH` (target-specific
-   order)
+| target family | `--cc` → environment → `PATH` candidates |
+|---------------|-------------------------------------------|
+| RISC-V `virt` | `LUSA_RISCV_CC`, `LUSA_CROSS_CC`; `riscv32-unknown-elf-gcc`, `riscv-none-elf-gcc`, `riscv64-unknown-elf-gcc`, `riscv64-elf-gcc` |
+| RP2040 / STM32F4 | `LUSA_ARM_CC`, `LUSA_CROSS_CC`; `arm-none-eabi-gcc` |
+| ESP32-C3 | `LUSA_ESP32_CC`, `LUSA_RISCV_CC`, `LUSA_CROSS_CC`; `riscv32-esp-elf-gcc`, `riscv-none-elf-gcc`, `riscv32-unknown-elf-gcc`, `riscv64-unknown-elf-gcc` |
 
-MSVC is rejected for cross targets. If no compiler is found, the build prints
-the target, the candidate names, the environment variables, and the `--cc`
-option. If compilation or linking fails, the generated C is saved next to the
-requested output as `<output>.c` for inspection.
+`riscv32-unknown-elf` continues to mean the `riscv32-virt` board. Use
+`esp32c3`/`riscv32-esp-elf` (or point `LUSA_ESP32_CC` at the compiler) for the
+ESP32-C3 image. MSVC is rejected for cross targets. If no compiler is found,
+the build prints the target, its toolchain family and hint, the candidate
+names, the environment variables, and the `--cc` option. If compilation or
+linking fails, the generated C is saved next to the requested output as
+`<output>.c` for inspection.
 
 #### Renode platform and UART
 
@@ -1805,6 +1855,40 @@ On real hardware, poll the line-status register (bit 5, THRE) before each
 write or use the vendor UART driver. The example intentionally omits that poll
 because Renode's model accepts back-to-back stores.
 
+#### Modern MCU platforms
+
+Module 25 adds three platforms with production memory maps and the Renode
+peripherals available in Renode 1.17:
+
+| platform | memory | peripherals |
+|----------|--------|-------------|
+| `renode/lusa_rp2040.repl` | 2 MiB flash `0x10000000`, 264 KiB SRAM `0x20000000`, 4 KiB SIO window `0xD0000000` | `cpu0`/`cpu1` `CPU.CortexM` (`cortex-m0`), `nvic` at `0xE000E000`, `nvic1` at `0xE000F000`, `UART.PL011` at `0x40034000`, SysTick in each NVIC |
+| `renode/lusa_stm32f4.repl` | 1 MiB flash `0x08000000`, 128 KiB SRAM `0x20000000` | `UART.STM32_UART` at `0x40004400`, `GPIOPort.STM32_GPIOPort` at `0x40020000`, `Timers.STM32_Timer` at `0x40000000`, NVIC/SysTick |
+| `renode/lusa_esp32c3.repl` | 4 MiB flash `0x42000000`, 400 KiB SRAM `0x3FC80000`, GPIO window `0x60004000` | `CPU.RiscV32` (`rv32imc`), `UART.ESP32_UART` at `0x60000000`, `Timers.Arm_CMSDK_Timer` at `0x6001F000` |
+
+Renode 1.17 does not ship RP2040 SIO, RP2040 TIMER, ESP32-C3 GPIO, or ESP32-C3
+TIMG models. The platforms compensate without changing the register addresses
+the examples use:
+
+- the RP2040 SIO window and the ESP32-C3 GPIO block are `Memory.MappedMemory`;
+  writes to the plain `GPIO_OUT` register are read back directly. The
+  hardware-only SET/CLR/W1TS/W1TC aliases have no special behaviour in these
+  windows;
+- RP2040 timing uses architectural SysTick at `0xE000E010` (the parser treats
+  numeric tokens containing `e`/`E` as decimal floats, so the example writes
+  the base as the integer `3758153744`);
+- ESP32-C3 puts `Timers.Arm_CMSDK_Timer` at the TIMG T0 base. The example writes
+  `T0HI` (CMSDK `RELOAD`), then `T0CONFIG` with the real ESP32 `EN` bit (31)
+  plus the CMSDK enable bit (0), and polls `T0LO` (CMSDK `VALUE`);
+- the RP2040 CPU model is `cortex-m0`, because Renode does not expose
+  `cortex-m0plus`. The script halts `cpu1` after loading the ELF so the test
+  observes a single-core boot.
+
+The examples use only Lusa's arithmetic and comparison operators. Lusa does not
+have bitwise binary operators yet, so bit tests are written as
+`(value // mask) % 2 ~= 0` and register setup writes complete values rather than
+read-modify-writing them.
+
 #### Running Renode
 
 The monitor templates live in `renode/` and use three substitutions:
@@ -1845,21 +1929,25 @@ a script that captures a fixed window and then quits.
 
 ```sh
 cargo test --test module24_renode -- --test-threads=1 --nocapture
+cargo test --test module25_modern_mcus -- --test-threads=1 --nocapture
 ```
 
 The static tests (platform/UART definitions, freestanding C, hosted/no-entry
 rejections) always run. The compile-and-boot tests skip with a printed reason
-when no RISC-V compiler or Renode executable is found. To execute them locally:
+when no cross compiler or Renode executable is found. To execute them locally:
 
 ```powershell
 $env:LUSA_RISCV_CC = "C:\tools\riscv-none-elf-gcc\bin\riscv-none-elf-gcc.exe"
+$env:LUSA_ESP32_CC = $env:LUSA_RISCV_CC
+$env:LUSA_ARM_CC = "C:\tools\arm-none-eabi-gcc\bin\arm-none-eabi-gcc.exe"
 $env:LUSA_RENODE = "C:\tools\renode\renode.exe"
-cargo test --test module24_renode -- --test-threads=1 --nocapture
+cargo test --test module24_renode --test module25_modern_mcus -- --test-threads=1 --nocapture
 ```
 
 Set `LUSA_KEEP_RENODE_ARTIFACTS=1` to keep the generated platform, script,
-ELF, and UART log. `.github/workflows/renode.yml` downloads Renode and xPack
-RISC-V GCC on Ubuntu, sets both environment variables, and runs the suite.
+ELF, and UART log. `.github/workflows/renode.yml` downloads Renode, xPack
+RISC-V GCC, and xPack Arm GCC on Ubuntu, sets `LUSA_RISCV_CC`,
+`LUSA_ESP32_CC`, `LUSA_ARM_CC`, and `LUSA_RENODE`, and runs both suites.
 
 ### 9.17 Native subset limits
 

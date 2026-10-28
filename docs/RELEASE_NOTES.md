@@ -63,10 +63,17 @@ Download `lusa-setup.zip` or the platform tarball.
 
 ## Current release
 
-The v2.0.0 body is [`.github/release-notes/v2.0.0.md`](../.github/release-notes/v2.0.0.md).
-It follows this structure and documents `lusalang build --target`, freestanding
-RISC-V `riscv32-virt`/`riscv64-virt` images, embedded startup and linker
-assets, Renode platform/UART capture, and the hardware-emulation test suite.
+The v2.1.0 body is [`.github/release-notes/v2.1.0.md`](../.github/release-notes/v2.1.0.md).
+It follows this structure and documents `--target rp2040`/`stm32f4`/`esp32c3`,
+per-board startup and linker maps, Renode platforms with GPIO, timers/SysTick,
+and UART, the three volatile-MMIO examples, and the module 25
+cross-build/emulation suite.
+
+The v2.0.0 body remains at
+[`.github/release-notes/v2.0.0.md`](../.github/release-notes/v2.0.0.md) and
+documents `lusalang build --target`, freestanding RISC-V
+`riscv32-virt`/`riscv64-virt` images, embedded startup and linker assets,
+Renode platform/UART capture, and the hardware-emulation test suite.
 
 The previous v1.9.0 body remains at
 [`.github/release-notes/v1.9.0.md`](../.github/release-notes/v1.9.0.md) and

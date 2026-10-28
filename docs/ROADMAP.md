@@ -918,6 +918,118 @@ registry.
 - The startup stub assumes a flat ELF load at `0x80000000`; position-independent
   images and other memory maps need a different linker script.
 
+## Module 25 - Modern microcontroller targets and peripheral emulation (shipped in v2.1.0)
+
+### 25.1 Target selection and toolchains
+
+- `TargetKind`/`TargetSpec` gained `Rp2040`, `Stm32F4`, and `Esp32C3`, each with
+  its own triple, architecture flags, memory map, startup stub, linker script,
+  Renode platform, and monitor template.
+- `lusalang build --target rp2040` uses `thumbv6m-none-eabi` with
+  `-mcpu=cortex-m0plus -mthumb -mfloat-abi=soft`.
+- `--target stm32f4` uses `thumbv7em-none-eabi` with
+  `-mcpu=cortex-m4 -mthumb -mfloat-abi=soft`.
+- `--target esp32c3` uses `riscv32-esp-elf` with
+  `-march=rv32imc -mabi=ilp32 -mcmodel=medany`.
+- Target specs carry toolchain family and hint metadata, so missing-compiler
+  diagnostics name the right compiler and environment variables instead of
+  always talking about RISC-V.
+- ARM discovery is `--cc` -> `LUSA_ARM_CC`/`LUSA_CROSS_CC` ->
+  `arm-none-eabi-gcc`. ESP32-C3 discovery is `--cc` ->
+  `LUSA_ESP32_CC`/`LUSA_RISCV_CC`/`LUSA_CROSS_CC` -> conventional GNU RISC-V
+  compiler names.
+- `riscv32-unknown-elf` continues to resolve to `riscv32-virt`, so existing
+  RISC-V builds keep their meaning.
+
+### 25.2 Startup code and memory maps
+
+- Memory maps:
+
+  | target | flash | SRAM |
+  |--------|-------|------|
+  | RP2040 | 2 MiB at `0x10000000` | 264 KiB at `0x20000000` |
+  | STM32F4 | 1 MiB at `0x08000000` | 128 KiB at `0x20000000` |
+  | ESP32-C3 | 4 MiB at `0x42000000` | 400 KiB at `0x3FC80000` |
+
+- `renode/startup_arm.S` installs a 16-entry Cortex-M vector table, sets VTOR,
+  copies `.data` from flash, zeroes `.bss`, and calls `lusa_entry`.
+  `renode/linker_arm_rp2040.ld` and `renode/linker_arm_stm32f4.ld` place
+  `.vectors` first and reserve the stack at the top of SRAM.
+- `renode/startup_riscv.S` gained `.data` copying, and
+  `renode/linker_riscv_flash.ld` places code in ESP32-C3 flash and data in
+  SRAM. The existing `virt` linker script defines the same data-load symbols.
+- Both startup stubs provide byte-wise `memcpy`/`memset`, because GCC lowers
+  aggregate copies and zero-initialisation to those symbols even under
+  `-ffreestanding`.
+
+### 25.3 Renode platforms and peripherals
+
+- `renode/lusa_rp2040.repl` models two `CPU.CortexM` cores (`cortex-m0`, since
+  Renode 1.17 has no M0+ model), two NVICs (`nvic` at `0xE000E000` and `nvic1`
+  at `0xE000F000`), PL011 UART0 at `0x40034000`, a 4 KiB `MappedMemory` SIO
+  window at `0xD0000000`, and architectural SysTick in each NVIC. The reset
+  script halts `cpu1`.
+- `renode/lusa_stm32f4.repl` uses the real `UART.STM32_UART`,
+  `GPIOPort.STM32_GPIOPort`, and `Timers.STM32_Timer` models for USART2, GPIOA,
+  and TIM2, plus NVIC/SysTick.
+- `renode/lusa_esp32c3.repl` models `CPU.RiscV32` with `rv32imc`,
+  `UART.ESP32_UART` at `0x60000000`, `Timers.Arm_CMSDK_Timer` at the TIMG T0
+  base `0x6001F000`, and a `MappedMemory` GPIO block at `0x60004000`.
+- Renode 1.17 has no RP2040 SIO/TIMER or ESP32-C3 GPIO/TIMG models. The
+  platforms use plain memory for GPIO and document that the hardware-only
+  SET/CLR/W1TS/W1TC aliases have no special behaviour there. The examples
+  therefore write the plain output register, read it back, and clear it.
+- The ESP32-C3 timer example writes `T0HI` (CMSDK `RELOAD`), then `T0CONFIG`
+  with the real `EN` bit 31 plus the CMSDK enable bit 0, and polls `T0LO`
+  (CMSDK `VALUE`). RP2040 timing uses SysTick at `0xE000E010`.
+- Renode `.resc` substitution rules are unchanged: platform and ELF paths keep
+  the leading `@` file marker, while the UART log path is quoted plain text.
+
+### 25.4 Examples, tests, and CI
+
+- `examples/modern_mcu_peripherals.lusa` is the STM32F4 reference image. It
+  prints `LUSA MODERN MCU OK\nstm32f4 gpio=ok timer=ok\n\n` through USART2,
+  drives PA5 and reads IDR, then enables TIM2 and polls CNT.
+- `examples/modern_mcu_rp2040.lusa` and `examples/modern_mcu_esp32c3.lusa`
+  are companion images with their own UART and self-test banners. The three
+  examples use `unsafe` volatile MMIO and park forever after the checks.
+- Lusa still has no bitwise binary operators; the examples test bits with
+  `(value // mask) % 2 ~= 0` and write complete register values.
+- `tests/module25_modern_mcus.rs` covers target registration, memory maps,
+  embedded assets, freestanding C emission, cross-built ELF headers, the CLI
+  target names, and exact-banner Renode boots for all three boards. Renode and
+  toolchain checks skip cleanly when the optional tools are absent.
+- `.github/workflows/renode.yml` now installs xPack Arm GCC as well as xPack
+  RISC-V GCC and Renode, exports `LUSA_ARM_CC`/`LUSA_ESP32_CC`, and runs
+  modules 24 and 25.
+
+**Acceptance criteria**
+
+- `lusalang build examples/modern_mcu_peripherals.lusa --target stm32f4`,
+  `... modern_mcu_rp2040.lusa --target rp2040`, and
+  `... modern_mcu_esp32c3.lusa --target esp32c3` produce ELF images, and
+  Renode prints the exact per-board banners.
+- The memory maps, startup paths, and embedded Renode assets match the target
+  specifications asserted by module 25.
+- The full `cargo test --all-targets -- --test-threads=1` suite stays green
+  with and without the optional tools installed.
+- `README.md`, `docs/LANGUAGE.md` section 9.16, and `docs/ROADMAP.md` document
+  the targets, platforms, limitations, and local test commands.
+
+**Risks**
+
+- Renode 1.17 does not model the RP2040 SIO/TIMER or the ESP32-C3 GPIO/TIMG.
+  The platforms substitute `MappedMemory` and a CMSDK timer at the documented
+  addresses; they validate Lusa's volatile-access and polling surface, not
+  every hardware alias or clock gate.
+- `cortex-m0` stands in for Cortex-M0+, and RP2040's second core is halted.
+  Multicore startup and inter-core FIFOs are not exercised.
+- The examples reach peripherals directly and skip vendor clock/GPIO-matrix
+  setup. They are emulator and bring-up references, not production drivers.
+- The cross toolchains and Renode remain optional local dependencies. CI covers
+  Linux x86_64; Windows and macOS developers must install the tools to execute
+  the boot tests.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -952,6 +1064,7 @@ registry.
 | v1.8.0 | Async tasks, `await`, cooperative executor (shipped) | async/await parsing in both front ends, lazy dynamic tasks, stackless C11 state machines, `task.spawn`/`run`/`yield_now`/`is_done`/`status`, freestanding static arena, three-engine parity, native builds |
 | v1.9.0 | Namespaced modules, `use`, and visibility (shipped) | inline and file modules, `pub` privacy with `E0350`, `use` aliases/globs/re-exports, path resolution precedence, struct hoisting, module-level method sugar, legacy import compatibility, multi-file example, three-engine parity, native builds |
 | v2.0.0 | Cross-compilation and Renode hardware tests (shipped) | `--target riscv32-virt`/`riscv64-virt`, `#[no_std]` + `#[entry]` validation, embedded startup/linker assets, xPack/GNU RISC-V discovery, custom Renode platforms, UART file backend, exact-banner execution tests for RV32 and RV64, dedicated Renode CI workflow |
+| v2.1.0 | Modern MCU targets and peripheral emulation (shipped) | `--target rp2040`/`stm32f4`/`esp32c3`, per-board startup and linker maps, target-aware toolchain discovery and diagnostics, Renode platforms with GPIO/timer/SysTick/UART, three volatile-MMIO examples, exact-banner Renode boots for all three boards, ARM and RISC-V toolchains in the Renode CI workflow |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

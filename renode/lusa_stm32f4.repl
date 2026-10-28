@@ -1,0 +1,27 @@
+// Minimal STM32F4 platform: 1 MiB flash, 128 KiB SRAM, USART2, GPIOA, TIM2,
+// and the Cortex-M4 NVIC/SysTick.
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x100000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x20000
+
+uart0: UART.STM32_UART @ sysbus <0x40004400, +0x100>
+    -> nvic@38
+
+gpioPortA: GPIOPort.STM32_GPIOPort @ sysbus <0x40020000, +0x400>
+    numberOfAFs: 16
+
+timer2: Timers.STM32_Timer @ sysbus 0x40000000
+    -> nvic@28
+    frequency: 10000000
+    initialLimit: 0xFFFFFFFF
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 168000000
+    IRQ -> cpu@0
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvic: nvic

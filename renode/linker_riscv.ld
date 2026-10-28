@@ -20,9 +20,13 @@ SECTIONS {
   } > RAM
 
   .data : {
+    _data_start = .;
     *(.data*)
     *(.sdata*)
+    . = ALIGN(4);
+    _data_end = .;
   } > RAM
+  _data_load_start = LOADADDR(.data);
 
   .bss : {
     _bss_start = .;

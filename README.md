@@ -41,7 +41,10 @@ aliases, and `pub` visibility. Module 24 closes the bare-metal loop:
 `lusalang build --target riscv32-virt` (or `riscv64-virt`) cross-compiles a
 `#[no_std]` program with a freestanding RISC-V toolchain, links the embedded
 startup stub and linker script, and `tests/module24_renode.rs` boots the image
-in Renode and asserts the UART output.
+in Renode and asserts the UART output. Module 25 extends the same pipeline to
+modern microcontrollers: RP2040 (`--target rp2040`), STM32F4
+(`--target stm32f4`), and ESP32-C3 (`--target esp32c3`), each with its own
+linker memory map, startup code, Renode platform, GPIO, timer, and UART.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -75,6 +78,7 @@ Then, from any new terminal:
 | `lusalang run main.lusa --native` | builds/runs through the C11 backend       |
 | `lusalang build main.lusa`      | compiles a native executable via C11        |
 | `lusalang build main.lusa --target riscv32-virt` | cross-builds a freestanding Renode ELF |
+| `lusalang build main.lusa --target stm32f4` | cross-builds a Cortex-M4 firmware ELF |
 | `lusalang check main.lusa`      | validates (lex+parse) without running      |
 | `lusalang check main.lusa --typed` | runs the static type checker            |
 | `lusalang new myproject`        | creates a new project with a ready scaffold |
@@ -133,6 +137,9 @@ See [`examples/`](examples/):
 | `photocraft.lusa`         | mini photo-lab: 2D image in tables → filters → ASCII-art |
 | `baremetal_boot.lusa`     | `#[no_std]` `_start` entry with sectioned code/data |
 | `baremetal_renode_uart.lusa` | RISC-V `virt` UART banner, cross-built for Renode |
+| `modern_mcu_peripherals.lusa` | STM32F4 USART2 banner, GPIOA output, TIM2 polling |
+| `modern_mcu_rp2040.lusa` | RP2040 UART0 banner, SIO GPIO, SysTick polling |
+| `modern_mcu_esp32c3.lusa` | ESP32-C3 UART0 banner, GPIO output, TIMG polling |
 | `dynamic_heap.lusa`       | `Vec<T>` growth/pop/clear and `Box<T>` owned pointers |
 | `error_handling.lusa`     | `Result`/`Option`, combinators, `?`, and `match` arms |
 | `async_cooperative.lusa`  | lazy tasks, `await`, `task.run`, and postfix `.await` |
@@ -1216,6 +1223,63 @@ available. To run them locally, point `LUSA_RISCV_CC` at `riscv-none-elf-gcc`
 and `LUSA_RENODE` at the Renode executable. `.github/workflows/renode.yml`
 installs both tools and runs the suite on every push and pull request.
 
+### Modern microcontroller targets (Module 25)
+
+The same `--target` pipeline now covers three production MCU families. Each
+target supplies its own linker script, startup stub, architecture flags, and
+Renode platform:
+
+| target | triple | CPU / ISA | Flash | SRAM | UART |
+|--------|--------|-----------|-------|------|------|
+| `rp2040` | `thumbv6m-none-eabi` | Cortex-M0+ (`-mcpu=cortex-m0plus -mthumb -mfloat-abi=soft`) | 2 MiB @ `0x10000000` | 264 KiB @ `0x20000000` | PL011 UART0 @ `0x40034000` |
+| `stm32f4` | `thumbv7em-none-eabi` | Cortex-M4 (`-mcpu=cortex-m4 -mthumb -mfloat-abi=soft`) | 1 MiB @ `0x08000000` | 128 KiB @ `0x20000000` | USART2 @ `0x40004400` |
+| `esp32c3` | `riscv32-esp-elf` | RV32IMC (`-march=rv32imc -mabi=ilp32 -mcmodel=medany`) | 4 MiB @ `0x42000000` | 400 KiB @ `0x3FC80000` | UART0 @ `0x60000000` |
+
+The ARM targets share `renode/startup_arm.S`, which installs the 16 architectural
+Cortex-M exception vectors, sets VTOR, copies `.data` from flash to SRAM, zeroes
+`.bss`, and calls `lusa_entry`. `renode/linker_arm_rp2040.ld` and
+`renode/linker_arm_stm32f4.ld` encode the flash/SRAM origins above.
+ESP32-C3 reuses the RISC-V startup stub, with `renode/linker_riscv_flash.ld`
+placing code in flash and data in SRAM. GCC can lower aggregate copies to
+`memcpy`/`memset` even under `-ffreestanding`, so both startup stubs provide
+byte-wise implementations for libc-free images.
+
+Cross-compiler discovery is target-aware. ARM targets try `--cc`, then
+`LUSA_ARM_CC`/`LUSA_CROSS_CC`, then `arm-none-eabi-gcc` on `PATH`. ESP32-C3
+tries `--cc`, then `LUSA_ESP32_CC`/`LUSA_RISCV_CC`/`LUSA_CROSS_CC`, then
+`riscv32-esp-elf-gcc`, `riscv-none-elf-gcc`, and related GNU RISC-V compilers.
+`riscv32-unknown-elf` still resolves to the `riscv32-virt` board so existing
+builds keep their meaning.
+
+The pre-configured Renode environments are:
+
+| platform | emulated peripherals | notes |
+|----------|----------------------|-------|
+| `renode/lusa_rp2040.repl` | dual `CPU.CortexM`, two NVICs, PL011 UART0, SIO window, SysTick | Renode 1.17 has no RP2040 SIO/TIMER models; SIO is backed by `MappedMemory`, timing uses SysTick, and `cortex-m0` stands in for M0+ (`cpu1` is halted by the script) |
+| `renode/lusa_stm32f4.repl` | `UART.STM32_UART`, `GPIOPort.STM32_GPIOPort`, `Timers.STM32_Timer`, NVIC/SysTick | USART2, GPIOA, and TIM2 use their real STM32 models |
+| `renode/lusa_esp32c3.repl` | `CPU.RiscV32` (`rv32imc`), `UART.ESP32_UART`, `Timers.Arm_CMSDK_Timer`, `MappedMemory` GPIO | no ESP32-C3 TIMG/GPIO model in 1.17, so CMSDK sits at the TIMG T0 base and the GPIO block is plain memory |
+
+`examples/modern_mcu_peripherals.lusa` is the STM32F4 reference image. It
+writes `LUSA MODERN MCU OK\nstm32f4 gpio=ok timer=ok\n\n` through USART2,
+drives PA5 with the real GPIO model and reads it back from IDR, then enables
+TIM2 and polls CNT. `examples/modern_mcu_rp2040.lusa` and
+`examples/modern_mcu_esp32c3.lusa` are the RP2040 and ESP32-C3 companions; they
+print their own `gpio=ok`/`systick=ok` or `gpio=ok`/`timer=ok` lines. All three
+use `unsafe` volatile MMIO and park forever after the self-tests.
+
+```sh
+lusalang build examples/modern_mcu_peripherals.lusa --target stm32f4
+lusalang build examples/modern_mcu_rp2040.lusa --target rp2040
+lusalang build examples/modern_mcu_esp32c3.lusa --target esp32c3
+```
+
+`tests/module25_modern_mcus.rs` checks the target registry, linker memory maps,
+embedded assets, freestanding C emission, cross-built ELF headers, the CLI
+target names, and—when the toolchains and Renode are present—boots each image
+and asserts its exact UART banner. `.github/workflows/renode.yml` installs
+xPack Arm GCC and xPack RISC-V GCC, exports `LUSA_ARM_CC`/`LUSA_ESP32_CC`, and
+runs modules 24 and 25 together.
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -1343,6 +1407,10 @@ Near-term milestones:
   cross-compilation with embedded startup and linker assets, custom Renode
   platforms, UART-backed hardware-emulation tests, and a dedicated Renode CI
   workflow.
+- **v2.1.0 (shipped):** `--target rp2040`/`stm32f4`/`esp32c3` with per-board
+  linker maps and startup code, pre-configured Renode platforms for GPIO,
+  timers/SysTick, and UART, three hardware examples, and module 25
+  cross-build/emulation tests.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

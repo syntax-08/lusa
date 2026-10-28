@@ -1,0 +1,124 @@
+-- Module 25 example: STM32F4 GPIO output and general-purpose timer polling.
+--
+--   lusalang build examples/modern_mcu_peripherals.lusa --target stm32f4
+--
+-- Open renode/lusa_stm32f4.resc through Renode after building, or run the
+-- module 25 integration test. The program writes a banner to USART2, drives
+-- PA5 through the STM32 GPIO model, reads the output back from IDR, and polls
+-- TIM2 to prove that the general-purpose timer advances. It parks forever
+-- afterwards, so it is intended for Renode or a real board rather than
+-- `lusalang run`.
+--
+-- `#[no_std]` keeps libc out of the image, and `#[entry]` exports the wrapper
+-- that the embedded startup stub calls. All register access goes through the
+-- `unsafe` volatile intrinsics, so the optimizer cannot discard the loads or
+-- stores.
+
+#[no_std]
+
+function uart_init(): void
+    unsafe do
+        local usart: *mut u32 = 0x40004400
+        local baud: *mut u32 = usart + 2
+        local control: *mut u32 = usart + 3
+        baud.write_volatile(0x8B)      -- 115200 baud (APB1 clock not modelled)
+        control.write_volatile(0x2008) -- UE | TE
+    end
+end
+
+function uart_putc(byte: u32): void
+    unsafe do
+        local usart: *mut u32 = 0x40004400
+        local status: *mut u32 = usart
+        local data: *mut u32 = usart + 1
+        while (status.read_volatile() // 128) % 2 == 0 do
+        end
+        data.write_volatile(byte)
+    end
+end
+
+function uart_puts(message: *mut u32, length: u32): void
+    local i: u32 = 0
+    unsafe do
+        local cursor: *mut u32 = message
+        while i < length do
+            uart_putc(cursor.read_volatile())
+            cursor = cursor + 1
+            i = i + 1
+        end
+    end
+end
+
+function gpio_selftest(): bool
+    unsafe do
+        local gpio: *mut u32 = 0x40020000
+        local moder: *mut u32 = gpio
+        local idr: *mut u32 = gpio + 4
+        local odr: *mut u32 = gpio + 5
+        -- PA5 as a push-pull output, then drive it high and read IDR back.
+        -- Lusa has no bitwise operators yet, so write the complete MODER/ODR
+        -- values this self-test needs instead of read-modify-writing them.
+        moder.write_volatile(0x00000400)
+        odr.write_volatile(0x20)
+        if (idr.read_volatile() // 32) % 2 ~= 0 then
+            return true
+        end
+        return false
+    end
+end
+
+function timer_selftest(): bool
+    unsafe do
+        local tim: *mut u32 = 0x40000000
+        local cr1: *mut u32 = tim
+        local cnt: *mut u32 = tim + 9
+        local psc: *mut u32 = tim + 10
+        local arr: *mut u32 = tim + 11
+        -- 10 MHz / (9999 + 1) = 1 kHz, auto-reload every 100 ticks.
+        psc.write_volatile(9999)
+        arr.write_volatile(99)
+        cnt.write_volatile(0)
+        cr1.write_volatile(1)
+        local start: u32 = cnt.read_volatile()
+        local spins: u32 = 0
+        while spins < 1000000 do
+            if cnt.read_volatile() ~= start then
+                return true
+            end
+            spins = spins + 1
+        end
+        return false
+    end
+end
+
+#[entry]
+function _start(): void
+    uart_init()
+
+    local prefix: [u32; 32] = [
+        76, 85, 83, 65, 32, 77, 79, 68, 69, 82, 78, 32, 77, 67, 85, 32,
+        79, 75, 10, 115, 116, 109, 51, 50, 102, 52, 32, 103, 112, 105, 111,
+        61
+    ]
+    local ok: [u32; 2] = [111, 107]
+    local fail: [u32; 4] = [102, 97, 105, 108]
+    local timer_label: [u32; 7] = [32, 116, 105, 109, 101, 114, 61]
+    local newline: [u32; 2] = [10, 10]
+
+    uart_puts(&prefix[0], 32)
+    if gpio_selftest() then
+        uart_puts(&ok[0], 2)
+    else
+        uart_puts(&fail[0], 4)
+    end
+    uart_puts(&timer_label[0], 7)
+    if timer_selftest() then
+        uart_puts(&ok[0], 2)
+    else
+        uart_puts(&fail[0], 4)
+    end
+    uart_puts(&newline[0], 2)
+
+    while true do
+    end
+end

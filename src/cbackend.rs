@@ -393,9 +393,9 @@ pub fn find_compiler(explicit: Option<&str>) -> Result<CCompiler, String> {
 /// Discovers the host compiler or a target-specific cross compiler.
 ///
 /// Cross targets deliberately do not fall back to `LUSA_CC`/`CC`: a host MSVC
-/// or an x86 GCC cannot produce a RISC-V image.  Use `--cc`, one of the
-/// target's environment variables, or place a conventional GNU RISC-V
-/// compiler on `PATH`.
+/// or an x86 GCC cannot produce a bare-metal image.  Use `--cc`, one of the
+/// target's environment variables, or place a conventional GNU cross compiler
+/// on `PATH`.
 pub fn find_target_compiler(
     target: &TargetSpec,
     explicit: Option<&str>,
@@ -408,8 +408,9 @@ pub fn find_target_compiler(
             .ok_or_else(|| format!("C compiler `{value}` was not found"))?;
         if compiler.kind == CompilerKind::Msvc {
             return Err(format!(
-                "target `{}` requires a GNU RISC-V compiler, but `{}` is MSVC",
+                "target `{}` requires a {} compiler, but `{}` is MSVC",
                 target.name,
+                target.toolchain,
                 compiler.display_name()
             ));
         }
@@ -432,9 +433,11 @@ pub fn find_target_compiler(
         }
     }
     Err(format!(
-        "no C compiler found for target `{}`; install a GNU RISC-V toolchain \
-         (for example xPack riscv-none-elf-gcc), put one of {} on PATH, set {}, or pass --cc",
+        "no C compiler found for target `{}`; install a {} toolchain \
+         ({}), put one of {} on PATH, set {}, or pass --cc",
         target.name,
+        target.toolchain,
+        target.toolchain_hint,
         target.compiler_candidates.join(", "),
         target.compiler_env.join("/")
     ))
