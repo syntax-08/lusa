@@ -1,0 +1,12 @@
+-- Sensor drivers and the public sensor facade.
+-- 
+-- Temperature and Pressure are re-exports, so callers do not need to know
+-- which file each reading type lives in.
+
+pub mod temperature;
+pub mod pressure;
+
+pub use temperature::Reading as Temperature;
+pub use pressure::Reading as Pressure;
+
+pub local SAMPLE_COUNT = 4

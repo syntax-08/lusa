@@ -127,6 +127,7 @@ See [`examples/`](examples/):
 | `dynamic_heap.lusa`       | `Vec<T>` growth/pop/clear and `Box<T>` owned pointers |
 | `error_handling.lusa`     | `Result`/`Option`, combinators, `?`, and `match` arms |
 | `async_cooperative.lusa`  | lazy tasks, `await`, `task.run`, and postfix `.await` |
+| `modules_project/`        | multi-file modules, `use` aliases, `pub use`, and privacy |
 
 Also in the root: `bench.lusa` — reference workload for measuring speed
 (debug × release). Typical measurement on this machine: **4.6× faster** on
@@ -1100,6 +1101,64 @@ lusalang build examples/async_cooperative.lusa --emit-c
 child tasks, postfix and method awaits, executor polling counts, freestanding
 arena emission, typed diagnostics, and native + dynamic parity.
 
+### Modules, namespaces, and visibility (Module 23)
+
+`mod name { ... }` declares an inline module and `mod name;` loads a file
+module. A file module resolves as `name/mod.lusa` first, then `name.lusa`
+relative to the declaring file. Items are private to their module by default;
+`pub` exposes them to the rest of the program.
+
+```lusa
+mod sensors;
+mod board {
+    pub struct Pin { port: i32, bit: i32 }
+
+    function label(pin: Pin): i32      -- private helper
+        return pin.port * 10 + pin.bit
+    end
+
+    pub function describe(pin: Pin): i32
+        return label(pin) * 10
+    end
+}
+
+use board::Pin;
+use sensors::temperature as temp;
+use board::describe;
+
+local boot: Pin = Pin{port: 1, bit: 5}
+print(describe(boot))
+print(temp::sample(72))
+```
+
+`use path::item` binds the last segment; `use path::item as alias` binds an
+explicit name; `use path::*` imports every public item. `pub use` re-exports a
+public symbol to the parent module, which lets `sensors/mod.lusa` expose
+`temperature::Reading` as `sensors::Temperature` without leaking the internal
+file layout. `crate::`, `self::`, and `super::` anchor paths at the root, the
+current module, and the parent module. A private item or module accessed from
+outside its subtree is `E0350`.
+
+Resolution happens after the legacy textual importer and before parsing. The
+resolver flattens the module tree into one translation unit with collision-free
+internal names, so the interpreter, bytecode VM, and C11 backend see exactly
+the same program. Legacy `import "file"` and un-terminated `mod name` keep
+their flat textual-merge behavior.
+
+```sh
+lusalang run examples/modules_project/main.lusa
+lusalang run examples/modules_project/main.lusa --vm
+lusalang run examples/modules_project/main.lusa --native
+lusalang build examples/modules_project/main.lusa --emit-c
+```
+
+The example spans seven files, two directories, an inline module nested in a
+file module, private helpers, aliases, and `pub use` re-exports.
+`tests/module23.rs` covers file and inline modules, path resolution and
+directory precedence, aliases, glob re-exports, `E0350`, `self`/`super`/
+`crate`, module-level method sugar, cycles, and three-engine parity for the
+shipped example.
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -1218,6 +1277,9 @@ Near-term milestones:
   `await`/`.await`/`task.await`, `task.spawn`/`run`/`yield_now`/`is_done`/
   `status`, stackless C11 state-machine lowering, and a freestanding static
   arena executor.
+- **v1.9.0 (shipped):** namespaced modules (`mod name;`,
+  `mod name { ... }`), `use` aliases and globs, `pub`/`pub use` visibility,
+  `E0350` privacy diagnostics, and multi-file projects shared by all engines.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

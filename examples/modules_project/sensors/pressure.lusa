@@ -1,0 +1,10 @@
+-- Simulated pressure sensor.
+
+pub struct Reading {
+    kpa: i32,
+    valid: bool
+}
+
+pub function sample(raw: i32): Reading
+    return Reading{kpa: raw / 10, valid: raw > 100}
+end

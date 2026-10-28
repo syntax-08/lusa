@@ -67,6 +67,89 @@ rule in section 5. Type annotations are accepted by the interpreter and the
 bytecode VM too, but ignored at runtime; `lusalang build` and
 `lusalang check --typed` enforce them statically before emitting C11.
 
+### Modules, namespaces, and visibility (Module 23)
+
+`mod name { ... }` declares an inline module; `mod name;` loads a file module
+relative to the current file (or the entry directory):
+
+```lusa
+mod board;          -- board/mod.lusa first, then board.lusa
+mod sensors {       -- inline module
+    pub function read(): i32
+        return 42
+    end
+}
+```
+
+A file loaded as `name/mod.lusa` resolves its own children inside `name/`. A
+file loaded as `name.lusa` uses a sibling `name/` directory when it exists,
+otherwise its own directory. The module directory therefore takes precedence
+over a sibling `name.lusa` with the same logical name.
+
+Items are private by default. Only `pub` items can be reached from outside the
+defining module and its descendants:
+
+```lusa
+mod math {
+    function secret(): i32
+        return 1
+    end
+
+    pub function value(): i32
+        return secret()          -- allowed: same module
+    end
+}
+
+print(math::value())             -- 1
+print(math::secret())            -- error[E0350]
+```
+
+`pub` is accepted on `mod`, `use`, `function`, `async function`, `struct`, and
+top-level `local` declarations or assignments. Private items remain visible in
+child modules (`super::`), so a parent can expose a narrow public API over
+private helpers.
+
+`use` imports a symbol and binds it to a local name:
+
+```lusa
+use board::Pin;
+use sensors::temperature as temp;
+use crate::protocol::Frame;
+use super::util::clamp;
+use self::local_mod::Item;
+
+local p: Pin = Pin{port: 1, bit: 5}
+print(temp::sample(72))
+```
+
+- `use path::item as alias` binds the item to `alias`; without `as`, the last
+  path segment is used.
+- `pub use` re-exports the imported name to the parent. Re-exporting a private
+  symbol is `E0350`.
+- `crate::` starts at the root, `self::` at the current module, and `super::`
+  at the parent module. Plain paths start at the current module, so use one of
+  the roots for cross-module access.
+- `use path::*` imports every public item of a module.
+- Grouped imports (`use a::{b, c}`) are not supported yet; write one `use` per
+  name.
+
+All module resolution happens before parsing and before either front end runs.
+The resolver flattens the tree into one translation unit with collision-free
+internal names, then hands the same text to the interpreter, bytecode VM, and
+C11 backend. Legacy textual composition is unchanged:
+
+```lusa
+import "geo/point.lusa"   -- exact file, textual merge
+mod counter               -- legacy textual include (no `;` or `{ ... }`)
+```
+
+Older `mod counter` (without a terminator) keeps merging one symbol table; use
+`mod counter;` for the namespaced form. Module struct declarations are hoisted
+ahead of the module bodies and child modules, so a module can export struct
+types used by later declarations. Method sugar
+(`function state:add(v) ... end`) targets an existing binding and also works
+inside modules.
+
 ---
 
 ## 4. Control flow
@@ -470,6 +553,7 @@ Codes `E{category}{n}`, like rustc:
 | E0001  | lex      | malformed character, unterminated string, invalid escape |
 | E0101  | parser   | syntax (unexpected token, missing `end`) |
 | E0102  | reserved | `break` outside a loop (reported as E0101 today) |
+| E0350  | module   | module visibility violation: private item/module accessed outside its subtree, or `pub use` of a private symbol |
 | E1001  | move     | `use of moved-out value` — a moved slot was reused |
 | E1002  | borrow   | move, read, or write needing exclusive access while a borrow or method receiver borrow is active |
 | E1003  | reserved | (future) access through a borrow whose owner was moved |
@@ -1006,6 +1090,14 @@ mod counter               -- counter.lusa, counter/mod.lusa, or counter/main.lus
 - The same expansion runs in the interpreter, bytecode VM, `build`,
   `run --native`, `check`, and `--emit-c`. Missing files report `E0101` with a
   help line describing the two forms.
+
+The legacy forms above stay flat: every file shares one symbol table and
+nothing is namespaced. Namespaced modules (`mod name;`,
+`mod name { ... }`, `use`, and `pub`) are the Module 23 layer described in
+section 3. They run after this textual expansion and before parsing, so the
+same expanded unit reaches the interpreter, VM, and C11 backend. The two
+layers compose: an imported file may declare namespaced modules, and a module
+file may use legacy `import`.
 
 Inline assembly is covered in section 9.5.
 
@@ -1596,7 +1688,9 @@ form, `#[packed]`/`#[repr(align(N))]` representation attributes,
 `#[no_std]`/`#[entry]`/`#[global_allocator]`/`#[link_section = "..."]`
 (sections 9.12 and 9.13), struct
 literals with defaults (scalar, `string`, `table`, pointer, and previously
-declared struct fields), `match`, compile-time `import`/`mod`, address-of
+declared struct fields), `match`, compile-time `import`/`mod`, namespaced
+modules with `mod name;`/`mod name { ... }`, `use` aliases and globs, and
+`pub` visibility/re-exports, address-of
 (`&place`), raw pointer types (`*mut T`, `*const T`), pointer arithmetic and
 dereferences inside `unsafe`, the raw intrinsics above (`unsafe_ptr_cast`,
 `unsafe_read_mem`, `unsafe_write_mem`, `unsafe_alloc`, `volatile_read`,
@@ -1618,8 +1712,7 @@ construction in table literals, assignment through a dynamic index, varargs,
 interpolated strings, closures/nested functions, forward struct references,
 whole-array assignment or arrays passed/returned by value, `&array`, `Vec<T>`
 values passed or returned by value (`E0312`), fixed arrays as
-`Result`/`Option` payloads (`E0301`), namespaced or selectively
-exported imports, the rest of the dynamic string
+`Result`/`Option` payloads (`E0301`), the rest of the dynamic string
 library, multiple function return values (`E0313`), dynamic `pcall`
 expressions, and general first-class coroutine operations. Native colon methods are static functions
 and are not stored as table fields, so `pairs(user)` does not enumerate method

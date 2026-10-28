@@ -1,0 +1,31 @@
+-- Firmware entry point for the Module 23 example.
+-- 
+-- board, sensors, and protocol are file-backed modules.  Only the
+-- symbols marked pub are reachable from here; everything else stays private
+-- to its module subtree.
+
+mod board;
+mod sensors;
+mod protocol;
+
+use board::Pin;
+use board::timing as clock;
+use protocol::Frame;
+use protocol::make as make_frame;
+use sensors::pressure;
+use sensors::temperature;
+use sensors::temperature as temp;
+use sensors::Temperature;
+
+local boot: Pin = board::BOOT_PIN
+local t: Temperature = temp::sample(72)
+local p: pressure::Reading = pressure::sample(1010)
+local f: Frame = make_frame(1, t.celsius)
+
+print(board::describe(boot))
+print(clock::ticks_for_ms(5))
+print(t.celsius, t.valid)
+print(temp::is_hot(t))
+print(p.kpa, p.valid)
+print(f.kind, f.payload, f.checksum)
+print(protocol::encode(f))

@@ -1,0 +1,7 @@
+-- Wire protocol: frames and their public re-exports.
+
+pub mod frame;
+
+pub use frame::Frame;
+pub use frame::encode;
+pub use frame::make;

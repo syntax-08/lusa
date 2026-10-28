@@ -1,0 +1,19 @@
+-- Simulated temperature sensor.
+
+pub struct Reading {
+    celsius: i32,
+    valid: bool
+}
+
+-- Private conversion shared by the public API.
+function decode(raw: i32): i32
+    return raw - 40
+end
+
+pub function sample(raw: i32): Reading
+    return Reading{celsius: decode(raw), valid: raw > 0}
+end
+
+pub function is_hot(reading: Reading): bool
+    return reading.celsius > 30
+end

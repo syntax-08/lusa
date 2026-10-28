@@ -1,0 +1,25 @@
+-- Board support: pins and timing.
+
+pub struct Pin {
+    port: i32,
+    bit: i32
+}
+
+pub local BOOT_PIN = Pin{port: 1, bit: 5}
+
+-- Private helper: visible to describe below, hidden from other modules.
+function label(pin: Pin): i32
+    return pin.port * 10 + pin.bit
+end
+
+pub function describe(pin: Pin): i32
+    return label(pin) * 10
+end
+
+pub mod timing {
+    pub TICKS_PER_MS = 8
+
+    pub function ticks_for_ms(ms: i32): i32
+        return ms * TICKS_PER_MS
+    end
+}

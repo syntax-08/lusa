@@ -63,14 +63,20 @@ Download `lusa-setup.zip` or the platform tarball.
 
 ## Current release
 
-The v1.8.0 body is [`.github/release-notes/v1.8.0.md`](../.github/release-notes/v1.8.0.md).
-It follows this structure and documents `async function`/`async fn`, lazy
-`task<T>` handles, `await`/`.await`/`::await`/`task.await`, the
-`task.spawn`/`run`/`yield_now`/`is_done`/`status` executor surface, stackless
-C11 state-machine lowering, the freestanding static-arena executor, and the
-`E0301`/`E0312`/`E0325` diagnostics.
+The v1.9.0 body is [`.github/release-notes/v1.9.0.md`](../.github/release-notes/v1.9.0.md).
+It follows this structure and documents namespaced modules (`mod name;` and
+`mod name { ... }`), `use` aliases and globs, `pub`/`pub use` visibility,
+`E0350` privacy diagnostics, and multi-file projects shared by the interpreter,
+bytecode VM, and C11 backend.
 
-The previous v1.7.0 body remains at
+The previous v1.8.0 body remains at
+[`.github/release-notes/v1.8.0.md`](../.github/release-notes/v1.8.0.md) and
+documents `async function`/`async fn`, lazy `task<T>` handles,
+`await`/`.await`/`::await`/`task.await`, the
+`task.spawn`/`run`/`yield_now`/`is_done`/`status` executor surface, and the
+freestanding static-arena executor.
+
+The v1.7.0 body remains at
 [`.github/release-notes/v1.7.0.md`](../.github/release-notes/v1.7.0.md) and
 documents built-in `Result<T, E>`/`Option<T>`, constructors, combinators,
 constructor `match` patterns, and the `?` operator.

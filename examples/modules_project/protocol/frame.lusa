@@ -1,0 +1,20 @@
+-- Frame construction and encoding.
+
+pub struct Frame {
+    kind: i32,
+    payload: i32,
+    checksum: i32
+}
+
+-- Private checksum strategy; callers only see make/encode.
+function checksum(kind: i32, payload: i32): i32
+    return kind + payload + 1
+end
+
+pub function make(kind: i32, payload: i32): Frame
+    return Frame{kind: kind, payload: payload, checksum: checksum(kind, payload)}
+end
+
+pub function encode(frame: Frame): i32
+    return frame.kind * 256 + frame.payload + frame.checksum
+end

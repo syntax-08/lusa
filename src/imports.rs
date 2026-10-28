@@ -1,16 +1,20 @@
-//! Compile-time imports.
+//! Compile-time imports and module loading.
 //!
-//! Lusa modules are included textually before parsing:
+//! Two compatible forms are supported:
 //!
 //! ```lusa
-//! import "point.lusa"   -- exact relative/absolute path
-//! mod point             -- resolves point.lusa, point/mod.lusa or point/main.lusa
+//! import "point.lusa"   -- exact relative/absolute path, textual merge
+//! mod point             -- legacy textual include (point.lusa, point/mod.lusa)
+//! mod point;            -- namespaced file module (v1.9)
+//! mod point { ... }     -- namespaced inline module (v1.9)
 //! ```
 //!
-//! Expansion is recursive, resolves paths relative to the importing file, and
-//! includes every canonical path at most once.  The merged source then goes
-//! through the normal lexer/parser/type-checker pipeline, so imported structs,
-//! functions, and globals share one symbol table.
+//! Legacy imports are expanded recursively before parsing.  The v1.9 module
+//! resolver then loads file-backed modules, applies `pub`/private visibility,
+//! resolves `use` aliases and re-exports, and rewrites module paths to
+//! collision-free internal names.  The resulting single translation unit goes
+//! through the normal lexer/parser/type-checker pipeline, so the interpreter,
+//! bytecode VM, and C11 backend observe identical semantics.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -19,14 +23,29 @@ use crate::error::{LResult, LusaError, Span, E_PARSE};
 use crate::lexer;
 use crate::tokens::{StrSeg, TokenKind};
 
-/// Expands imports using `base` (or the current directory) as the root.
+/// Expands imports and namespaced modules using `base` (or the current
+/// directory) as the root.
 pub fn expand_imports(src: &str, base: Option<&Path>) -> LResult<String> {
+    let legacy = expand_legacy(src, base)?;
+    crate::modules::expand_modules(&legacy, base, None)
+}
+
+/// Expands imports and modules from a file, treating that file as already
+/// visited.
+pub fn expand_imports_file(src: &str, path: &Path) -> LResult<String> {
+    let legacy = expand_legacy_file(src, path)?;
+    crate::modules::expand_modules(&legacy, path.parent(), Some(path))
+}
+
+/// Expands only the legacy textual imports (`import`, un-terminated `mod`).
+/// This runs before the v1.9 module resolver.
+pub(crate) fn expand_legacy(src: &str, base: Option<&Path>) -> LResult<String> {
     let mut visited = HashSet::new();
     expand_inner(src, base, &mut visited)
 }
 
-/// Expands imports from a file, treating that file as already visited.
-pub fn expand_imports_file(src: &str, path: &Path) -> LResult<String> {
+/// Expands legacy textual imports from a module file.
+pub(crate) fn expand_legacy_file(src: &str, path: &Path) -> LResult<String> {
     let mut visited = HashSet::new();
     if let Ok(canonical) = std::fs::canonicalize(path) {
         visited.insert(canonical);
@@ -175,6 +194,15 @@ fn expand_inner(src: &str, base: Option<&Path>, visited: &mut HashSet<PathBuf>) 
                 }
                 let end_token = &toks[j - 1];
                 let span = Span::new(token.span.start, end_token.span.end);
+                // `mod name;` and `mod name { ... }` are handled by the v1.9
+                // namespaced resolver, which enforces privacy and `use`.
+                if matches!(
+                    toks.get(j).map(|t| &t.kind),
+                    Some(TokenKind::Semi) | Some(TokenKind::LBrace)
+                ) {
+                    i = j;
+                    continue;
+                }
                 let dotted = parts.join(".");
                 let path = resolve_module(&dotted, &base)
                     .ok_or_else(|| import_error(span, format!("cannot find module `{dotted}`")))?;

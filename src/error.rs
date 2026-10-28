@@ -113,6 +113,8 @@ pub type LResult<T> = Result<T, LusaError>;
 
 pub const E_LEX: &str = "E0001";
 pub const E_PARSE: &str = "E0101";
+/// module visibility violation (`pub` privacy, private paths)
+pub const E_MODULE: &str = "E0350";
 /// reserved: `break` outside a loop is a parse error (reported as E0101 for now)
 #[allow(dead_code)]
 pub const E_BREAK: &str = "E0102";

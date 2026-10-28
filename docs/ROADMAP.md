@@ -776,6 +776,65 @@ registry.
 - The dynamic executor is intentionally minimal: there is no priority,
   cancellation, or blocking I/O integration yet.
 
+## Module 23 - Modules, namespaces, and visibility (shipped in v1.9.0)
+
+### 23.1 Module syntax and file layout
+
+- `mod name { ... }` declares an inline module; `mod name;` loads a file
+  module relative to the declaring file (or the entry directory).
+- A file module resolves as `name/mod.lusa` first, then `name.lusa`. A file
+  loaded as `name/mod.lusa` resolves its children inside `name/`; a file loaded
+  as `name.lusa` uses a sibling `name/` directory when one exists.
+- Legacy `import "file"` and un-terminated `mod name` keep their flat textual
+  merge. Namespaced forms require the `;` or `{ ... }` terminator.
+- Module declarations may nest, so inline and file modules compose.
+
+### 23.2 Namespaces and visibility
+
+- Every item is private to its defining module and descendants by default.
+  `pub` exposes modules, functions, `async function`, structs, and top-level
+  `local`/assignment bindings to the rest of the program.
+- `use path::item` binds the last segment; `use path::item as alias` binds an
+  explicit name; `use path::*` imports every public item. `pub use` re-exports
+  a public symbol to the parent.
+- `crate::`, `self::`, and `super::` anchor paths at the root, current module,
+  and parent module. Plain relative paths start at the current module.
+- Grouped imports (`use a::{b, c}`) are rejected for now.
+- Accessing a private item or module outside its subtree, including a `pub use`
+  of a private symbol, reports `E0350` with the definition site as a note.
+
+### 23.3 One translation unit for all engines
+
+- `src/modules.rs` collects the module tree, loads files, validates visibility,
+  resolves `use` aliases/re-exports, and rewrites declarations to collision-free
+  internal names (`__lusa_m_<path>__<name>`).
+- The resolver runs after the legacy textual importer and before parsing. The
+  interpreter, bytecode VM, and C11 backend therefore consume identical source.
+- Module-level struct declarations are hoisted ahead of module bodies and child
+  modules, because the parser is one-pass and needs a struct before its
+  literals and field types.
+- Method sugar (`function state:add(...)`) targets an existing binding and
+  works inside modules; it is not treated as a new declaration.
+- File inclusion is cycle-checked and detects duplicate module paths.
+
+**Acceptance criteria**
+
+- `tests/module23.rs` covers inline and file modules, aliases, `pub use`
+  re-exports, `E0350` privacy, directory precedence, nested `self`/`crate`,
+  module-level method sugar, cycles, and three-engine parity for the shipped
+  example.
+- `examples/modules_project/` runs in `run`, `--vm`, and `--native` with
+  identical output, and `build --emit-c` succeeds.
+- Legacy `tests/module15.rs` import tests keep passing unchanged.
+
+**Risks**
+
+- The flattened translation unit is intentionally source-to-source; debugger
+  line mapping points at the generated unit rather than the original files.
+- Module-level `local` constants read inside functions are not visible in the
+  C11 backend today; use a top-level assignment (`pub TICKS_PER_MS = 8`).
+- `use a::{b, c}` and wildcard re-export edge cases are deferred.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -808,6 +867,7 @@ registry.
 | v1.6.0 | Heap allocator, `Vec<T>`, and `Box<T>` (shipped) | allocator dispatch and validation, freestanding bump arena, geometric vector growth, Box deref safety, owned-element RAII, three-engine parity, native builds |
 | v1.7.0 | Safe error handling, `Result`/`Option`, `?` (shipped) | built-in sums in both parsers, combinators, constructor match patterns, `?` lowering in all engines, sum ownership and drop helpers, freestanding scalar sums, three-engine parity, native builds |
 | v1.8.0 | Async tasks, `await`, cooperative executor (shipped) | async/await parsing in both front ends, lazy dynamic tasks, stackless C11 state machines, `task.spawn`/`run`/`yield_now`/`is_done`/`status`, freestanding static arena, three-engine parity, native builds |
+| v1.9.0 | Namespaced modules, `use`, and visibility (shipped) | inline and file modules, `pub` privacy with `E0350`, `use` aliases/globs/re-exports, path resolution precedence, struct hoisting, module-level method sugar, legacy import compatibility, multi-file example, three-engine parity, native builds |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,
