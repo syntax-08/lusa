@@ -1,0 +1,69 @@
+name: Renode hardware emulation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RENODE_VERSION: "1.17.0"
+  XPACK_RISCV_VERSION: "15.2.0-1"
+
+jobs:
+  renode:
+    name: RISC-V bare metal under Renode
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Cache emulator and cross toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/renode
+            ${{ runner.temp }}/riscv-gcc
+          key: renode-${{ env.RENODE_VERSION }}-xpack-riscv-${{ env.XPACK_RISCV_VERSION }}-linux-x64
+
+      - name: Install Renode
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/renode"
+          if [ ! -x "$root/renode" ]; then
+            mkdir -p "$root"
+            curl -L --fail --retry 3 \
+              -o "$RUNNER_TEMP/renode.tar.gz" \
+              "https://github.com/renode/renode/releases/download/v${RENODE_VERSION}/renode-${RENODE_VERSION}.linux-portable.tar.gz"
+            tar -xzf "$RUNNER_TEMP/renode.tar.gz" -C "$root" --strip-components=1
+          fi
+          echo "LUSA_RENODE=$root/renode" >> "$GITHUB_ENV"
+          "$root/renode" --version
+
+      - name: Install xPack RISC-V GCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/riscv-gcc"
+          if [ ! -x "$root/bin/riscv-none-elf-gcc" ]; then
+            mkdir -p "$root"
+            curl -L --fail --retry 3 \
+              -o "$RUNNER_TEMP/riscv-gcc.tar.gz" \
+              "https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v${XPACK_RISCV_VERSION}/xpack-riscv-none-elf-gcc-${XPACK_RISCV_VERSION}-linux-x64.tar.gz"
+            tar -xzf "$RUNNER_TEMP/riscv-gcc.tar.gz" -C "$root" --strip-components=1
+          fi
+          echo "LUSA_RISCV_CC=$root/bin/riscv-none-elf-gcc" >> "$GITHUB_ENV"
+          echo "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/riscv-none-elf-gcc" --version | head -n 1
+
+      - name: Cross-compile and run Lusa firmware in Renode
+        run: cargo test --test module24_renode -- --test-threads=1 --nocapture

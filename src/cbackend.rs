@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::LusaError;
+use crate::targets::{TargetKind, TargetSpec};
 
 const LEXER: &str = include_str!("../lexer.lusa");
 const PARSER: &str = include_str!("../parser.lusa");
@@ -186,6 +187,16 @@ pub fn default_output(input: &Path) -> PathBuf {
     } else {
         output.set_extension("");
     }
+    output
+}
+
+/// Default image path for a source file and target.
+pub fn default_output_for(input: &Path, target: &TargetSpec) -> PathBuf {
+    if target.is_host() {
+        return default_output(input);
+    }
+    let mut output = input.to_path_buf();
+    output.set_extension(target.output_extension);
     output
 }
 
@@ -379,6 +390,56 @@ pub fn find_compiler(explicit: Option<&str>) -> Result<CCompiler, String> {
     )
 }
 
+/// Discovers the host compiler or a target-specific cross compiler.
+///
+/// Cross targets deliberately do not fall back to `LUSA_CC`/`CC`: a host MSVC
+/// or an x86 GCC cannot produce a RISC-V image.  Use `--cc`, one of the
+/// target's environment variables, or place a conventional GNU RISC-V
+/// compiler on `PATH`.
+pub fn find_target_compiler(
+    target: &TargetSpec,
+    explicit: Option<&str>,
+) -> Result<CCompiler, String> {
+    if target.kind == TargetKind::Host {
+        return find_compiler(explicit);
+    }
+    if let Some(value) = explicit {
+        let compiler = resolve_compiler(value)
+            .ok_or_else(|| format!("C compiler `{value}` was not found"))?;
+        if compiler.kind == CompilerKind::Msvc {
+            return Err(format!(
+                "target `{}` requires a GNU RISC-V compiler, but `{}` is MSVC",
+                target.name,
+                compiler.display_name()
+            ));
+        }
+        return Ok(compiler);
+    }
+    for key in target.compiler_env {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() {
+                if let Some(compiler) = resolve_compiler(&value) {
+                    if compiler.kind == CompilerKind::Gnu {
+                        return Ok(compiler);
+                    }
+                }
+            }
+        }
+    }
+    for name in target.compiler_candidates {
+        if let Some(path) = find_on_path(name) {
+            return Ok(make_compiler(path));
+        }
+    }
+    Err(format!(
+        "no C compiler found for target `{}`; install a GNU RISC-V toolchain \
+         (for example xPack riscv-none-elf-gcc), put one of {} on PATH, set {}, or pass --cc",
+        target.name,
+        target.compiler_candidates.join(", "),
+        target.compiler_env.join("/")
+    ))
+}
+
 fn run_compiler(mut command: Command, label: &str) -> Result<(), String> {
     let out = command
         .output()
@@ -498,6 +559,154 @@ fn compile_c_file(
     }
 }
 
+/// Extracts the `#[entry]` wrapper name from generated C.
+///
+/// The no_std emitter writes a plain `void <entry>(void)` (or `int main(void)`
+/// when the user picked that name) immediately before a body that calls
+/// `lusa_program_body()`.  Cross builds rename that symbol to `lusa_entry`, so
+/// the startup stub always has one stable symbol to call.
+fn entry_wrapper_name(c_source: &str) -> Option<String> {
+    let mut candidate = None;
+    for line in c_source.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = entry_signature(trimmed) {
+            candidate = Some(name);
+        }
+        if trimmed.contains("lusa_program_body() != 0") {
+            return candidate;
+        }
+    }
+    None
+}
+
+fn entry_signature(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix("void ")
+        .or_else(|| line.strip_prefix("int "))?;
+    let rest = rest.strip_suffix(" {")?;
+    let name = rest.strip_suffix("(void)")?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn cross_build_source(
+    c_source: &str,
+    output: &Path,
+    cc: Option<&str>,
+    target: &TargetSpec,
+) -> Result<CCompiler, String> {
+    if !c_source.starts_with("/* lusa:no_std */") {
+        return Err(format!(
+            "target `{}` requires a `#[no_std]` program; hosted programs need the host C runtime",
+            target.name
+        ));
+    }
+    let entry = entry_wrapper_name(c_source).ok_or_else(|| {
+        format!(
+            "target `{}` requires an `#[entry]` function so the reset stub has an entry point",
+            target.name
+        )
+    })?;
+    let compiler = find_target_compiler(target, cc)?;
+    let output = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("cannot resolve the current directory: {e}"))?
+            .join(output)
+    };
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+    }
+
+    let workdir =
+        std::env::temp_dir().join(format!("lusa-cross-{}-{}", std::process::id(), nanos()));
+    std::fs::create_dir_all(&workdir)
+        .map_err(|e| format!("cannot create {}: {e}", workdir.display()))?;
+
+    let write = || -> Result<(), String> {
+        std::fs::write(workdir.join("program.c"), c_source)
+            .map_err(|e| format!("cannot write generated C: {e}"))?;
+        std::fs::write(workdir.join("startup.S"), target.startup)
+            .map_err(|e| format!("cannot write startup assembly: {e}"))?;
+        std::fs::write(workdir.join("linker.ld"), target.linker_script)
+            .map_err(|e| format!("cannot write linker script: {e}"))?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_dir_all(&workdir);
+        return Err(e);
+    }
+
+    let result = (|| -> Result<(), String> {
+        let mut compile = Command::new(&compiler.path);
+        compile
+            .current_dir(&workdir)
+            .arg("-std=c11")
+            .arg("-O2")
+            .arg("-ffreestanding")
+            .arg("-fno-builtin")
+            .arg("-fno-stack-protector")
+            .args(target.arch_flags);
+        if entry != "lusa_entry" {
+            compile.arg(format!("-D{entry}=lusa_entry"));
+        }
+        compile
+            .arg("-c")
+            .arg("program.c")
+            .arg("-o")
+            .arg("program.o");
+        run_compiler(compile, "cross C compiler")?;
+
+        let mut startup = Command::new(&compiler.path);
+        startup
+            .current_dir(&workdir)
+            .args(target.arch_flags)
+            .arg("-c")
+            .arg("startup.S")
+            .arg("-o")
+            .arg("startup.o");
+        run_compiler(startup, "startup assembler")?;
+
+        let mut link = Command::new(&compiler.path);
+        link.current_dir(&workdir)
+            .arg("-nostdlib")
+            .arg("-nostartfiles")
+            .args(target.arch_flags)
+            .arg("-Wl,-T,linker.ld")
+            .arg("-Wl,--gc-sections")
+            .arg("-Wl,--build-id=none")
+            .arg("-o")
+            .arg(&output)
+            .arg("program.o")
+            .arg("startup.o")
+            .arg("-lgcc");
+        run_compiler(link, "cross linker")
+    })();
+
+    match result {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&workdir);
+            Ok(compiler)
+        }
+        Err(error) => {
+            let saved = output.with_extension("c");
+            let _ = std::fs::write(&saved, c_source);
+            let _ = std::fs::remove_dir_all(&workdir);
+            Err(format!("{error}\ngenerated C saved to {}", saved.display()))
+        }
+    }
+}
+
 fn build_c_source(
     c_source: &str,
     output: &Path,
@@ -569,6 +778,27 @@ pub fn build_with_base(
 ) -> Result<CCompiler, String> {
     let c = emit_c_with_base(source, base)?;
     build_c_source(&c, output, cc, None)
+}
+
+/// Builds an executable or freestanding image for an explicit target.
+///
+/// Host targets use the regular hosted C runtime.  Cross targets require a
+/// `#[no_std]` program with `#[entry]`; the generated C is compiled with the
+/// target toolchain, linked with the embedded startup stub and linker script,
+/// and written as an ELF image.
+pub fn build_with_target(
+    source: &str,
+    output: &Path,
+    cc: Option<&str>,
+    base: Option<&Path>,
+    target: &TargetSpec,
+) -> Result<CCompiler, String> {
+    let c = emit_c_with_base(source, base)?;
+    if target.is_host() {
+        build_c_source(&c, output, cc, None)
+    } else {
+        cross_build_source(&c, output, cc, target)
+    }
 }
 
 /// Builds a native executable from a source file.
@@ -653,5 +883,24 @@ mod tests {
         let err = emit_c("local x: u32 = \"bad\"\nreturn 0\n").expect_err("type error");
         assert!(err.contains("error[E"), "diagnostic: {err}");
         assert!(err.contains("--> lusa:"), "diagnostic: {err}");
+    }
+
+    #[test]
+    fn finds_entry_wrapper_in_generated_c() {
+        let c = "static int lusa_program_body(void) {\n    return 0;\n}\n\
+                 void _start(void) {\n    if (lusa_program_body() != 0) {\n        return;\n    }\n}\n";
+        assert_eq!(entry_wrapper_name(c).as_deref(), Some("_start"));
+    }
+
+    #[test]
+    fn finds_main_as_entry_wrapper() {
+        let c = "int main(void) {\n    if (lusa_program_body() != 0) {\n        return 1;\n    }\n}\n";
+        assert_eq!(entry_wrapper_name(c).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn missing_entry_wrapper_is_reported() {
+        let c = "static int lusa_program_body(void) {\n    return 0;\n}\n";
+        assert!(entry_wrapper_name(c).is_none());
     }
 }

@@ -1675,10 +1675,196 @@ execution, awaited children, `.await`/`::await`/`task.await`, `task.run` polling
 counts, freestanding arena emission, typed diagnostics, and native + dynamic
 parity.
 
-### 9.16 Native subset limits
+### 9.16 Cross-compilation and Renode targets (Module 24)
+
+`lusalang build` selects an output machine with `--target`. Without the flag it
+builds the host executable exactly as before:
+
+```sh
+lusalang build examples/baremetal_renode_uart.lusa --target riscv32-virt
+lusalang build examples/baremetal_renode_uart.lusa --target riscv64-virt
+lusalang build examples/baremetal_renode_uart.lusa --target=riscv32-unknown-elf
+lusalang build examples/baremetal_renode_uart.lusa --target host
+lusalang build --help
+```
+
+| target | accepted spellings | triple | ISA/ABI | default output |
+|--------|--------------------|--------|---------|----------------|
+| host | `host`, `native`, omitted | host | host compiler | `.exe` on Windows, no extension elsewhere |
+| 32-bit Renode `virt` | `riscv32-virt`, `riscv32-unknown-elf` | `riscv32-unknown-elf` | `rv32imac` / `ilp32` | `.elf` |
+| 64-bit Renode `virt` | `riscv64-virt`, `riscv64-unknown-elf` | `riscv64-unknown-elf` | `rv64imac` / `lp64` | `.elf` |
+
+Names and triples are matched case-insensitively. An unknown target exits with
+status 2 and prints the available names.
+
+#### Entry and freestanding requirements
+
+Cross targets accept only programs that declare `#[no_std]` and an `#[entry]`
+function. Both conditions are checked before compiler discovery:
+
+- A hosted program fails with `target ... requires a #[no_std] program;
+  hosted programs need the host C runtime`.
+- A `#[no_std]` program without `#[entry]` fails with `target ... requires an
+  #[entry] function so the reset stub has an entry point`.
+
+The generated C exports the entry wrapper under the user's chosen name. The
+cross build passes `-D<entry>=lusa_entry` (unless the name is already
+`lusa_entry`), so any `#[entry]` name links against the fixed startup stub.
+The rest of the image is compiled with `-std=c11 -O2 -ffreestanding
+-fno-builtin -fno-stack-protector -mcmodel=medany` plus the target ISA/ABI
+flags.
+
+`renode/startup_riscv.S` is assembled into the image and linked first at
+`0x80000000` by `renode/linker_riscv.ld`:
+
+```asm
+_reset:
+    la sp, _stack_top          # 64 KiB stack placed after .bss
+    la t0, _bss_start
+    la t1, _bss_end
+1:  bgeu t0, t1, 2f
+    sd zero, 0(t0)             # sw on RV32
+    addi t0, t0, 8
+    j 1b
+2:  call lusa_entry
+3:  j 3b
+```
+
+The final link uses `-nostdlib -nostartfiles -Wl,-T,linker.ld
+-Wl,--gc-sections -Wl,--build-id=none ... -lgcc`. `-lgcc` supplies compiler
+helpers only; no libc, `crt0`, `malloc`, `printf`, or hosted startup code is
+linked. The linker script places `.text.init` first, then `.text`, `.rodata`,
+`.data`, and `.bss`, and reserves the stack after BSS.
+
+#### Cross-compiler discovery
+
+Cross builds use their own chain and never fall back to the host `LUSA_CC`/`CC`
+variables:
+
+1. `--cc <path>`
+2. `LUSA_RISCV_CC`
+3. `LUSA_CROSS_CC`
+4. `riscv32-unknown-elf-gcc`, `riscv-none-elf-gcc`,
+   `riscv64-unknown-elf-gcc`, or `riscv64-elf-gcc` on `PATH` (target-specific
+   order)
+
+MSVC is rejected for cross targets. If no compiler is found, the build prints
+the target, the candidate names, the environment variables, and the `--cc`
+option. If compilation or linking fails, the generated C is saved next to the
+requested output as `<output>.c` for inspection.
+
+#### Renode platform and UART
+
+The shipped platforms mirror Renode's `riscv_virt` memory map:
+
+| region | address | notes |
+|--------|---------|-------|
+| RAM | `0x80000000`, 128 MiB | code, data, BSS, stack |
+| NS16550 UART | `0x10000000` | `uart0`, IRQ to PLIC source 3 |
+| PLIC | `0x0C000000` | 52 sources, one context |
+| CLINT | `0x02000000` | 10 MHz time provider |
+
+`renode/lusa_riscv32_virt.repl` uses `CPU.RiscV32` with `cpuType: "rv32imac"`;
+`renode/lusa_riscv64_virt.repl` uses `CPU.RiscV64` with `cpuType: "rv64imac"`.
+Both enable the RISC-V privileged architecture 1.10 and hart 0.
+
+Lusa does not have a `u8` scalar yet, so the example performs 32-bit volatile
+stores to the NS16550 transmit register. Renode accepts the 32-bit access:
+
+```lusa
+#[no_std]
+
+function uart_putc(byte: u32): void
+    unsafe do
+        local uart: *mut u32 = 0x10000000
+        uart.write_volatile(byte)
+    end
+end
+
+#[entry]
+function _start(): void
+    local message: [u32; 38] = [
+        76, 85, 83, 65, 32, 82, 69, 78, 79, 68, 69, 32, 85, 65, 82, 84,
+        32, 79, 75, 10,
+        108, 117, 115, 97, 32, 118, 105, 114, 116, 32, 118, 50, 46, 48,
+        46, 48, 10, 10
+    ]
+
+    local i: u32 = 0
+    while i < 38 do
+        uart_putc(message[i])
+        i = i + 1
+    end
+
+    while true do
+    end
+end
+```
+
+On real hardware, poll the line-status register (bit 5, THRE) before each
+write or use the vendor UART driver. The example intentionally omits that poll
+because Renode's model accepts back-to-back stores.
+
+#### Running Renode
+
+The monitor templates live in `renode/` and use three substitutions:
+
+| placeholder | replacement |
+|-------------|-------------|
+| `@PLATFORM@` | `@<absolute forward-slash path to the .repl>` |
+| `@ELF@` | `@<absolute path to the .elf>` |
+| `@UART_LOG@` | plain absolute path to the UART log file (quoted by the template) |
+
+The leading `@` on the platform and ELF substitutions is Renode's file
+reference marker; dropping it produces `Could not tokenize here`. The rendered
+script is:
+
+```text
+using sysbus
+
+mach create "lusa-riscv32-virt"
+machine LoadPlatformDescription @<platform>
+
+sysbus LoadELF @<elf>
+sysbus.uart0 CreateFileBackend "<uart.log>" true
+
+emulation RunFor "00:00:01"
+quit
+```
+
+Run it headlessly with:
+
+```sh
+renode --disable-gui --console --plain --hide-log run.resc
+```
+
+`emulation RunFor` advances virtual time directly; do not call `start` first in
+a script that captures a fixed window and then quits.
+
+#### Tests and CI
+
+```sh
+cargo test --test module24_renode -- --test-threads=1 --nocapture
+```
+
+The static tests (platform/UART definitions, freestanding C, hosted/no-entry
+rejections) always run. The compile-and-boot tests skip with a printed reason
+when no RISC-V compiler or Renode executable is found. To execute them locally:
+
+```powershell
+$env:LUSA_RISCV_CC = "C:\tools\riscv-none-elf-gcc\bin\riscv-none-elf-gcc.exe"
+$env:LUSA_RENODE = "C:\tools\renode\renode.exe"
+cargo test --test module24_renode -- --test-threads=1 --nocapture
+```
+
+Set `LUSA_KEEP_RENODE_ARTIFACTS=1` to keep the generated platform, script,
+ELF, and UART log. `.github/workflows/renode.yml` downloads Renode and xPack
+RISC-V GCC on Ubuntu, sets both environment variables, and runs the suite.
+
+### 9.17 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
-table literals, fixed-size `[T; N]` arrays and array literals, nested keyed
+table literals, fixed-size `[T; N]` arrays and local array literals, nested keyed
 tables, field reads/writes, zero-based array indexing and element assignment,
 colon methods, `pairs`/`ipairs` generic `for` over tables, `#` on strings,
 tables, and arrays, `if`, `while`, `repeat`, `do`, `return`, `break`,
@@ -1714,7 +1900,14 @@ whole-array assignment or arrays passed/returned by value, `&array`, `Vec<T>`
 values passed or returned by value (`E0312`), fixed arrays as
 `Result`/`Option` payloads (`E0301`), the rest of the dynamic string
 library, multiple function return values (`E0313`), dynamic `pcall`
-expressions, and general first-class coroutine operations. Native colon methods are static functions
+expressions, and general first-class coroutine operations.
+
+A local declaration such as `local message: [u32; 38] = [...]` is supported and
+lowers to a C aggregate initializer. A top-level array initializer is still a
+whole-array assignment (`E0312`); declare the table inside the function that
+uses it, or fill a promoted global element by element.
+
+Native colon methods are static functions
 and are not stored as table fields, so `pairs(user)` does not enumerate method
 names; keep enumerable data in a separate table when parity with the dynamic
 engines matters. The normal `lusalang run` interpreter and `--vm` engine

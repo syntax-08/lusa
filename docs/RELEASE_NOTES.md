@@ -63,13 +63,18 @@ Download `lusa-setup.zip` or the platform tarball.
 
 ## Current release
 
-The v1.9.0 body is [`.github/release-notes/v1.9.0.md`](../.github/release-notes/v1.9.0.md).
-It follows this structure and documents namespaced modules (`mod name;` and
-`mod name { ... }`), `use` aliases and globs, `pub`/`pub use` visibility,
-`E0350` privacy diagnostics, and multi-file projects shared by the interpreter,
-bytecode VM, and C11 backend.
+The v2.0.0 body is [`.github/release-notes/v2.0.0.md`](../.github/release-notes/v2.0.0.md).
+It follows this structure and documents `lusalang build --target`, freestanding
+RISC-V `riscv32-virt`/`riscv64-virt` images, embedded startup and linker
+assets, Renode platform/UART capture, and the hardware-emulation test suite.
 
-The previous v1.8.0 body remains at
+The previous v1.9.0 body remains at
+[`.github/release-notes/v1.9.0.md`](../.github/release-notes/v1.9.0.md) and
+documents namespaced modules (`mod name;` and `mod name { ... }`), `use`
+aliases and globs, `pub`/`pub use` visibility, `E0350` privacy diagnostics, and
+multi-file projects shared by the interpreter, bytecode VM, and C11 backend.
+
+The v1.8.0 body remains at
 [`.github/release-notes/v1.8.0.md`](../.github/release-notes/v1.8.0.md) and
 documents `async function`/`async fn`, lazy `task<T>` handles,
 `await`/`.await`/`::await`/`task.await`, the

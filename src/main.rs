@@ -8,6 +8,7 @@ use lusa::cbackend;
 use lusa::error::{render, LusaError};
 use lusa::interp::{Frame, Interp};
 use lusa::parser;
+use lusa::targets;
 
 const BANNER: &str = concat!("Lusa ", env!("CARGO_PKG_VERSION"), " — Lua-like language with optional ownership (made in Rust)\ntype `:quit` to exit, finished blocks with `end` are evaluated as you go");
 
@@ -21,7 +22,7 @@ fn main() {
             println!(
                 "  lusalang run <file.lusa>       run a program ([--vm] bytecode; [--native] C11)"
             );
-            println!("  lusalang build <file.lusa>     compile to a native executable with the host C compiler");
+            println!("  lusalang build <file.lusa>     compile with the host C compiler ([--target <name>] for Renode)");
             println!("  lusalang check <file.lusa>     validate (lex+parse; [--typed] runs the C11 type checker)");
             println!("  lusalang repl                  open the interactive REPL");
             println!("  lusalang new <name>            create a new project (scaffold)");
@@ -36,6 +37,7 @@ fn main() {
             println!("  lusalang version               runtime version");
             println!();
             println!("  C backend: --cc <path> selects GCC/Clang/TCC/cl.exe; LUSA_CC and CC are honored.");
+            println!("             --target <name> cross-builds bare metal (host, riscv32-virt, riscv64-virt).");
             println!("             build --emit-c writes the intermediate C without invoking the C compiler.");
             println!();
             println!("  (short aliases: lusa [file.lusa] | lusa -e \"<code>\")");
@@ -232,11 +234,12 @@ fn cmd_run(args: &[String]) -> i32 {
     run_source_with_base(&src, &path, Path::new(&path).parent())
 }
 
-/// `lusalang build <file> [-o <output>] [--cc <cc>] [--emit-c]`.
+/// `lusalang build <file> [-o <output>] [--target <name>] [--cc <cc>] [--emit-c]`.
 fn cmd_build(args: &[String]) -> i32 {
     let mut input: Option<String> = None;
     let mut output: Option<PathBuf> = None;
     let mut cc: Option<String> = None;
+    let mut target_name: Option<String> = None;
     let mut emit_c = false;
     let mut i = 0;
     while i < args.len() {
@@ -263,9 +266,28 @@ fn cmd_build(args: &[String]) -> i32 {
                 }
             }
             s if s.starts_with("--cc=") => cc = Some(s["--cc=".len()..].to_string()),
+            "--target" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => target_name = Some(v.clone()),
+                    None => {
+                        eprintln!(
+                            "lusa: --target requires a target name ({})",
+                            targets::target_names()
+                        );
+                        return 2;
+                    }
+                }
+            }
+            s if s.starts_with("--target=") => {
+                target_name = Some(s["--target=".len()..].to_string())
+            }
             "--emit-c" => emit_c = true,
             "-h" | "--help" => {
-                println!("usage: lusalang build <file.lusa> [-o <output>] [--cc <cc>] [--emit-c]");
+                println!(
+                    "usage: lusalang build <file.lusa> [-o <output>] [--target <name>] [--cc <cc>] [--emit-c]"
+                );
+                println!("targets: {}", targets::target_names());
                 return 0;
             }
             s if s.starts_with('-') => {
@@ -285,9 +307,24 @@ fn cmd_build(args: &[String]) -> i32 {
     let input = match input {
         Some(p) => PathBuf::from(p),
         None => {
-            eprintln!("usage: lusalang build <file.lusa> [-o <output>] [--cc <cc>] [--emit-c]");
+            eprintln!(
+                "usage: lusalang build <file.lusa> [-o <output>] [--target <name>] [--cc <cc>] [--emit-c]"
+            );
             return 2;
         }
+    };
+    let target = match target_name.as_deref() {
+        Some(name) => match targets::find(name) {
+            Some(target) => target,
+            None => {
+                eprintln!(
+                    "lusa: unknown target `{name}` (available: {})",
+                    targets::target_names()
+                );
+                return 2;
+            }
+        },
+        None => &targets::HOST,
     };
     let src = match std::fs::read_to_string(&input) {
         Ok(s) => s,
@@ -311,14 +348,23 @@ fn cmd_build(args: &[String]) -> i32 {
         };
     }
 
-    let output = output.unwrap_or_else(|| cbackend::default_output(&input));
-    match cbackend::build_with_base(&src, &output, cc.as_deref(), input.parent()) {
+    let output = output.unwrap_or_else(|| cbackend::default_output_for(&input, target));
+    match cbackend::build_with_target(&src, &output, cc.as_deref(), input.parent(), target) {
         Ok(compiler) => {
-            println!(
-                "built {} with {}",
-                output.display(),
-                compiler.display_name()
-            );
+            if target.is_host() {
+                println!(
+                    "built {} with {}",
+                    output.display(),
+                    compiler.display_name()
+                );
+            } else {
+                println!(
+                    "built {} for {} with {}",
+                    output.display(),
+                    target.name,
+                    compiler.display_name()
+                );
+            }
             0
         }
         Err(e) => {

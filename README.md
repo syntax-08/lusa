@@ -35,6 +35,13 @@ owned pointers, both with RAII drops on hosted and freestanding targets.
 Module 21 adds safe error handling: built-in `Result<T, E>` and `Option<T>`
 sums, `Ok`/`Err`/`Some`/`None` constructors, pattern matching, combinators, and
 the Rust-style `?` operator that lowers to C11 checks and early returns.
+Module 22 adds `async function`/`await` with a cooperative, stackless executor.
+Module 23 adds namespaced modules (`mod name;`/`mod name { ... }`), `use`
+aliases, and `pub` visibility. Module 24 closes the bare-metal loop:
+`lusalang build --target riscv32-virt` (or `riscv64-virt`) cross-compiles a
+`#[no_std]` program with a freestanding RISC-V toolchain, links the embedded
+startup stub and linker script, and `tests/module24_renode.rs` boots the image
+in Renode and asserts the UART output.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -67,6 +74,7 @@ Then, from any new terminal:
 | `lusalang run main.lusa`        | runs a program in the interpreter          |
 | `lusalang run main.lusa --native` | builds/runs through the C11 backend       |
 | `lusalang build main.lusa`      | compiles a native executable via C11        |
+| `lusalang build main.lusa --target riscv32-virt` | cross-builds a freestanding Renode ELF |
 | `lusalang check main.lusa`      | validates (lex+parse) without running      |
 | `lusalang check main.lusa --typed` | runs the static type checker            |
 | `lusalang new myproject`        | creates a new project with a ready scaffold |
@@ -124,6 +132,7 @@ See [`examples/`](examples/):
 | `struct_match.lusa`       | struct literals, nested deep clone, and `match` arms |
 | `photocraft.lusa`         | mini photo-lab: 2D image in tables → filters → ASCII-art |
 | `baremetal_boot.lusa`     | `#[no_std]` `_start` entry with sectioned code/data |
+| `baremetal_renode_uart.lusa` | RISC-V `virt` UART banner, cross-built for Renode |
 | `dynamic_heap.lusa`       | `Vec<T>` growth/pop/clear and `Box<T>` owned pointers |
 | `error_handling.lusa`     | `Result`/`Option`, combinators, `?`, and `match` arms |
 | `async_cooperative.lusa`  | lazy tasks, `await`, `task.run`, and postfix `.await` |
@@ -1159,20 +1168,70 @@ directory precedence, aliases, glob re-exports, `E0350`, `self`/`super`/
 `crate`, module-level method sugar, cycles, and three-engine parity for the
 shipped example.
 
+### Cross-compilation and Renode hardware tests (Module 24)
+
+`lusalang build <file> --target <name>` selects the output machine. `host`
+(default) keeps the hosted C runtime. `riscv32-virt` and `riscv64-virt` produce
+freestanding ELF images for Renode's `virt` board:
+
+| target | triple | ISA / ABI | default output |
+|--------|--------|-----------|----------------|
+| `host` | host | host C compiler | `.exe` on Windows, no extension elsewhere |
+| `riscv32-virt` | `riscv32-unknown-elf` | `rv32imac` / `ilp32` | `.elf` |
+| `riscv64-virt` | `riscv64-unknown-elf` | `rv64imac` / `lp64` | `.elf` |
+
+A cross build requires a `#[no_std]` program with an `#[entry]` function; a
+hosted program fails with "requires a `#[no_std]` program" and a no_std program
+without an entry fails with "requires an `#[entry]` function" before any
+toolchain is discovered. The backend renames the entry wrapper to `lusa_entry`,
+compiles the generated C with `-ffreestanding -fno-builtin
+-fno-stack-protector -mcmodel=medany`, assembles the embedded
+`renode/startup_riscv.S` (stack pointer, BSS zeroing, call, park), and links the
+embedded `renode/linker_riscv.ld` with `-nostdlib -nostartfiles -Wl,-T,linker.ld
+-lgcc`. RAM is placed at `0x80000000` and the NS16550 UART at `0x10000000`.
+
+Cross-compiler discovery is `--cc` → `LUSA_RISCV_CC`/`LUSA_CROSS_CC` → a
+conventional GNU RISC-V compiler on `PATH` (`riscv32-unknown-elf-gcc`,
+`riscv-none-elf-gcc`, `riscv64-unknown-elf-gcc`, `riscv64-elf-gcc`). The host
+`LUSA_CC`/`CC` variables are deliberately not reused for cross targets, and
+MSVC is rejected because it cannot produce RISC-V code.
+
+`examples/baremetal_renode_uart.lusa` emits a 38-byte banner one `u32` at a
+time. Lusa has no `u8` scalar, so the program performs volatile 32-bit stores
+to the UART data register, which Renode's NS16550 accepts:
+
+```sh
+lusalang build examples/baremetal_renode_uart.lusa --target riscv32-virt
+lusalang build examples/baremetal_renode_uart.lusa --target riscv64-virt
+lusalang build examples/baremetal_renode_uart.lusa --emit-c
+```
+
+The repository ships two custom platforms (`renode/lusa_riscv32_virt.repl`,
+`renode/lusa_riscv64_virt.repl`) and monitor templates
+(`renode/lusa_riscv32_virt.resc`, `renode/lusa_riscv64_virt.resc`) that load
+the ELF, attach a file backend to `uart0`, run one emulated second, and quit.
+`tests/module24_renode.rs` always checks the assets and freestanding emission;
+its compile-and-boot tests skip cleanly unless a RISC-V compiler and Renode are
+available. To run them locally, point `LUSA_RISCV_CC` at `riscv-none-elf-gcc`
+and `LUSA_RENODE` at the Renode executable. `.github/workflows/renode.yml`
+installs both tools and runs the suite on every push and pull request.
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
 Studio via `vswhere.exe` (and runs `vcvars64.bat` when needed). GCC/Clang/TCC
 use `-std=c11 -O2`; MSVC uses `/nologo /TC /O2 /std:c11`. If no compiler is
 found, the interpreter and bytecode VM still work; only `build`/`run --native`
-require a C toolchain.
+require a C toolchain. Cross targets use the separate discovery chain described
+above.
 
 Runnable examples: `examples/typed_native.lusa` (build/run),
 `examples/baremetal_gpio.lusa` (volatile polling with packed/aligned register
 layouts; uses `unsafe_alloc` so it runs on a desktop),
 `examples/baremetal_asm.lusa` (inline assembly fences and a `nop` polling
 loop), `examples/baremetal_boot.lusa` (freestanding `_start` with sectioned
-code/data), and `examples/unsafe_hardware.lusa` (simulated memory in
+code/data), `examples/baremetal_renode_uart.lusa` (cross-built RISC-V UART
+banner), and `examples/unsafe_hardware.lusa` (simulated memory in
 `run`/`--vm`; replace the illustrative MMIO address before native execution).
 
 `tests/c_backend.rs` covers typed mapping, functions/tables, moves/clone/drops,
@@ -1280,6 +1339,10 @@ Near-term milestones:
 - **v1.9.0 (shipped):** namespaced modules (`mod name;`,
   `mod name { ... }`), `use` aliases and globs, `pub`/`pub use` visibility,
   `E0350` privacy diagnostics, and multi-file projects shared by all engines.
+- **v2.0.0 (shipped):** `--target riscv32-virt`/`riscv64-virt`
+  cross-compilation with embedded startup and linker assets, custom Renode
+  platforms, UART-backed hardware-emulation tests, and a dedicated Renode CI
+  workflow.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

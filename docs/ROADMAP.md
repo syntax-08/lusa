@@ -835,6 +835,89 @@ registry.
   C11 backend today; use a top-level assignment (`pub TICKS_PER_MS = 8`).
 - `use a::{b, c}` and wildcard re-export edge cases are deferred.
 
+## Module 24 - Cross-compilation and Renode emulation (shipped in v2.0.0)
+
+### 24.1 Target selection
+
+- `lusalang build <file> --target <name>` accepts `host` (default), `native`,
+  `riscv32-virt`, `riscv64-virt`, and the matching GNU triples
+  `riscv32-unknown-elf`/`riscv64-unknown-elf`.
+- Unknown targets exit with status 2 and list the available names. Host builds
+  keep the existing compiler chain and output naming.
+- Cross targets default to `<input>.elf` and print the target name in the
+  success message.
+
+### 24.2 Freestanding RISC-V images
+
+- Cross builds accept only `#[no_std]` programs with an `#[entry]` function.
+  Both checks run before compiler discovery and produce actionable
+  diagnostics.
+- The generated C's entry wrapper is renamed to `lusa_entry`; the fixed
+  startup stub has one stable symbol to call regardless of the user's entry
+  name.
+- `renode/startup_riscv.S` initializes `sp` from `_stack_top`, zeroes `.bss`,
+  calls `lusa_entry`, and parks. It is assembled with the target ISA/ABI and
+  linked before the C object.
+- `renode/linker_riscv.ld` places `.text.init` first at `0x80000000`, then
+  `.text`, `.rodata`, `.data`, and `.bss`, and reserves a 64 KiB stack.
+- The link uses `-nostdlib -nostartfiles -Wl,-T,linker.ld
+  -Wl,--gc-sections -Wl,--build-id=none -lgcc`; no libc or hosted startup is
+  involved.
+- Cross-compiler discovery is `--cc` -> `LUSA_RISCV_CC`/`LUSA_CROSS_CC` ->
+  conventional GNU RISC-V compiler names on `PATH`. Host `LUSA_CC`/`CC` and
+  MSVC are not used for cross targets.
+
+### 24.3 Renode platform and UART capture
+
+- `renode/lusa_riscv32_virt.repl` and `renode/lusa_riscv64_virt.repl` define
+  `CPU.RiscV32`/`CPU.RiscV64` (`rv32imac`/`rv64imac`), 128 MiB RAM at
+  `0x80000000`, an NS16550 UART at `0x10000000`, a PLIC at `0x0C000000`, and a
+  CLINT at `0x02000000`.
+- `renode/lusa_riscv32_virt.resc` and `renode/lusa_riscv64_virt.resc` load the
+  platform, load the ELF, attach a `CreateFileBackend` to `uart0`, run one
+  emulated second, and quit. The platform and ELF paths keep Renode's `@` file
+  marker; the UART log path is quoted plain text.
+- `examples/baremetal_renode_uart.lusa` writes a target-neutral banner one
+  `u32` at a time, then parks. Lusa has no `u8` yet, so the example relies on
+  Renode's NS16550 accepting 32-bit stores to the transmit register.
+
+### 24.4 Tests and CI
+
+- `tests/module24_renode.rs` always validates the embedded assets, the
+  freestanding C shape, and the hosted/no-entry rejections. Cross-build and
+  boot tests skip with a printed reason when the toolchain or emulator is
+  missing.
+- The execution tests assert the exact UART banner for both `riscv32-virt` and
+  `riscv64-virt`.
+- `.github/workflows/renode.yml` installs Renode and xPack RISC-V GCC on Ubuntu,
+  sets `LUSA_RENODE` and `LUSA_RISCV_CC`, and runs the suite with
+  `--test-threads=1`.
+
+**Acceptance criteria**
+
+- `lusalang build examples/baremetal_renode_uart.lusa --target riscv32-virt`
+  and `--target riscv64-virt` produce ELF images, and Renode prints the exact
+  banner from both.
+- Hosted programs and no_std programs without `#[entry]` fail before compiler
+  discovery.
+- The full `cargo test --all-targets -- --test-threads=1` suite stays green
+  with and without the optional tools installed.
+- The example and assets are documented in `README.md` and
+  `docs/LANGUAGE.md` section 9.16.
+
+**Risks**
+
+- Renode's 32-bit UART store is a convenience of the model; real NS16550
+  hardware expects 8-bit accesses and THRE polling. The example documents this
+  and is not a production driver.
+- There is no interrupt-driven UART, clock configuration, or board abstraction
+  yet; the targets are fixed `virt` machines.
+- Renode and the cross compiler are optional local dependencies. CI covers
+  Linux x86_64; Windows and macOS developers must install both tools to run the
+  execution tests.
+- The startup stub assumes a flat ELF load at `0x80000000`; position-independent
+  images and other memory maps need a different linker script.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -868,6 +951,7 @@ registry.
 | v1.7.0 | Safe error handling, `Result`/`Option`, `?` (shipped) | built-in sums in both parsers, combinators, constructor match patterns, `?` lowering in all engines, sum ownership and drop helpers, freestanding scalar sums, three-engine parity, native builds |
 | v1.8.0 | Async tasks, `await`, cooperative executor (shipped) | async/await parsing in both front ends, lazy dynamic tasks, stackless C11 state machines, `task.spawn`/`run`/`yield_now`/`is_done`/`status`, freestanding static arena, three-engine parity, native builds |
 | v1.9.0 | Namespaced modules, `use`, and visibility (shipped) | inline and file modules, `pub` privacy with `E0350`, `use` aliases/globs/re-exports, path resolution precedence, struct hoisting, module-level method sugar, legacy import compatibility, multi-file example, three-engine parity, native builds |
+| v2.0.0 | Cross-compilation and Renode hardware tests (shipped) | `--target riscv32-virt`/`riscv64-virt`, `#[no_std]` + `#[entry]` validation, embedded startup/linker assets, xPack/GNU RISC-V discovery, custom Renode platforms, UART file backend, exact-banner execution tests for RV32 and RV64, dedicated Renode CI workflow |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

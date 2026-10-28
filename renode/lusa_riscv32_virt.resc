@@ -1,0 +1,10 @@
+using sysbus
+
+mach create "lusa-riscv32-virt"
+machine LoadPlatformDescription @PLATFORM@
+
+sysbus LoadELF @ELF@
+sysbus.uart0 CreateFileBackend "@UART_LOG@" true
+
+emulation RunFor "00:00:01"
+quit
