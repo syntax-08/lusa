@@ -64,6 +64,8 @@ local KEYWORDS = {
     ["borrow"] = true,
     ["clone"] = true,
     ["move"] = true,
+    ["async"] = true,
+    ["await"] = true,
     ["match"] = true,
     ["with"] = true,
     ["import"] = true,
@@ -105,7 +107,8 @@ local TWO_SYMBOLS = {
     ["~="] = true,
     ["<="] = true,
     [">="] = true,
-    ["=>"] = true
+    ["=>"] = true,
+    ["::"] = true
 }
 
 local THREE_SYMBOLS = {

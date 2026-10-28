@@ -704,6 +704,78 @@ registry.
   payloads, while C moves owned operands. Programs that rely on using a moved
   sum after `?` are rejected statically by the C checker.
 
+## Module 22 - Asynchronous concurrency and native coroutines (shipped in v1.8.0)
+
+### 22.1 Syntax and task handles
+
+- `async function name(...) ... end` and the compact `async fn` alias are
+  parsed by both front ends. An async signature returns `task<T>` (or
+  `task<void>`), and an async call creates a lazy handle instead of running the
+  body.
+- `await expr`, postfix `.await`/`::await`, and `task.await(t)` drive a task to
+  completion and evaluate to its result. `task.yield_now()` is the cooperative
+  suspension point.
+- `task.spawn(task)` enqueues a task; `task.run()` drains the queue in rounds
+  and returns the number of distinct tasks first-polled; `task.is_done(t)` and
+  `task.status(t)` query completion. `task.status` is hosted-only.
+- Calling an async function captures its arguments and creates a fresh task.
+  Awaiting a finished task reuses the stored result; awaiting a non-task is
+  `E2005`, and awaiting the currently running task is `E9999`.
+
+### 22.2 Dynamic runtime
+
+- `src/task.rs` stores a `TaskObj` per handle: state, private coroutine, stored
+  results, error text, start/queue flags, and pending arguments.
+- The first drive resumes the private coroutine with the captured arguments;
+  later drives resume it after a `task.yield_now()` suspension. No OS threads
+  are created.
+- `task.run()` executes queued tasks in FIFO batches. A task that yields is
+  re-queued; a task that awaits is driven with its child until both settle.
+- Awaiting a failed child raises the child's error in the parent, matching the
+  native `LUSA_TASK_FAIL` propagation.
+
+### 22.3 C11 lowering and freestanding executor
+
+- Each async function emits `LusaTaskState_<cname>` with the public `LusaTask`
+  header, hoisted parameters, and hoisted locals, plus a constructor and a
+  `lusa_task_step_<cname>(LusaTask *base)` step function.
+- Step functions dispatch through `switch (base->state)`. `await` returns
+  `LUSA_TASK_WAIT` around a saved `case`; `task.yield_now()` returns
+  `LUSA_TASK_YIELD`; `return` stores the typed result and returns
+  `LUSA_TASK_DONE`; failures return `LUSA_TASK_FAIL`.
+- Hosted builds append the heap-backed task queue and typed result getters.
+  `#[no_std]` builds append the static-arena executor
+  (`LUSA_TASK_ARENA_BYTES`, 16 KiB by default) and omit string/status helpers.
+- Synchronous and top-level `await` lower to `lusa_task_drive`, which runs the
+  task inline; async parents await children cooperatively through the same
+  queue.
+
+**Acceptance criteria**
+
+- `tests/module22.rs` covers state-machine emission, lazy task creation,
+  awaited children, postfix/method awaits, executor polling counts, repeated
+  await result reuse, freestanding arena emission, typed diagnostics, and
+  native + interpreter + VM parity.
+- `examples/async_cooperative.lusa` runs in `run`, `--vm`, and `--native` with
+  identical output.
+- No generated C contains `pthread_create`, `CreateThread`, fibers, or other
+  OS threading primitives.
+- `#[no_std]` async output contains the static arena and no libc, `malloc`,
+  `free`, string runtime, or hosted print helpers.
+
+**Risks**
+
+- The native state machine hoists locals and parameters but does not emit
+  drops for owned values yet; long-lived async bodies should prefer scalars,
+  pointers, and borrowed data.
+- Async methods, async entry points, struct-by-value results, fixed-array
+  locals, and suspension inside `for ... in` loops are rejected in the native
+  backend for now.
+- `task.status` requires strings and is therefore unavailable in `#[no_std]`;
+  use `task.is_done`.
+- The dynamic executor is intentionally minimal: there is no priority,
+  cancellation, or blocking I/O integration yet.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -735,6 +807,7 @@ registry.
 | v1.5.0 | Custom entries, `#[no_std]`, and linker sections (shipped) | freestanding preamble, entry-wrapper ordering, section lowering and promotion, `E0101`/`E0325` diagnostics, three-engine parity, native builds |
 | v1.6.0 | Heap allocator, `Vec<T>`, and `Box<T>` (shipped) | allocator dispatch and validation, freestanding bump arena, geometric vector growth, Box deref safety, owned-element RAII, three-engine parity, native builds |
 | v1.7.0 | Safe error handling, `Result`/`Option`, `?` (shipped) | built-in sums in both parsers, combinators, constructor match patterns, `?` lowering in all engines, sum ownership and drop helpers, freestanding scalar sums, three-engine parity, native builds |
+| v1.8.0 | Async tasks, `await`, cooperative executor (shipped) | async/await parsing in both front ends, lazy dynamic tasks, stackless C11 state machines, `task.spawn`/`run`/`yield_now`/`is_done`/`status`, freestanding static arena, three-engine parity, native builds |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

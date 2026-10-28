@@ -75,6 +75,8 @@ pub struct Interp {
     /// upvalue cells of the running coroutine, used when helper functions are
     /// compiled on demand so they share captures instead of taking snapshots
     pub coroutine_captures: Vec<value::CaptureMap>,
+    /// pending `task.spawn` queue drained by `task.run`
+    pub task_queue: Vec<Rc<RefCell<crate::value::TaskObj>>>,
 }
 
 pub struct Frame {
@@ -123,6 +125,7 @@ impl Interp {
             addr_next: 0x8000_0000,
             active_coroutines: Vec::new(),
             coroutine_captures: Vec::new(),
+            task_queue: Vec::new(),
         }
     }
 
@@ -399,6 +402,15 @@ impl Interp {
                     .help(format!("Lusa allows {} nested calls", MAX_CALL_DEPTH)));
                 }
                 match &f.body {
+                    FuncBody::Lusa(lit) if lit.is_async => {
+                        let task = crate::task::spawn_value(
+                            self,
+                            &Value::Func(Rc::clone(f)),
+                            args,
+                            span,
+                        )?;
+                        Ok(vec![Value::Task(task)])
+                    }
                     FuncBody::Lusa(lit) => {
                         self.depth += 1;
                         let mut f2 = Frame::new(f.name.clone(), f.env.clone());
@@ -445,6 +457,15 @@ impl Interp {
                     }
                     FuncBody::Builtin(b) => b(self, args, span),
                     FuncBody::Vm(compiled, upvals) => {
+                        if compiled.proto.is_async {
+                            let task = crate::task::spawn_compiled(
+                                compiled.clone(),
+                                upvals.clone(),
+                                args,
+                                crate::coroutine::next_id(),
+                            );
+                            return Ok(vec![Value::Task(task)]);
+                        }
                         self.depth += 1;
                         let res = crate::vm::invoke(self, compiled, upvals.clone(), args, span);
                         self.depth -= 1;

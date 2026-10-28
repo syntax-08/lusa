@@ -126,6 +126,7 @@ See [`examples/`](examples/):
 | `baremetal_boot.lusa`     | `#[no_std]` `_start` entry with sectioned code/data |
 | `dynamic_heap.lusa`       | `Vec<T>` growth/pop/clear and `Box<T>` owned pointers |
 | `error_handling.lusa`     | `Result`/`Option`, combinators, `?`, and `match` arms |
+| `async_cooperative.lusa`  | lazy tasks, `await`, `task.run`, and postfix `.await` |
 
 Also in the root: `bench.lusa` — reference workload for measuring speed
 (debug × release). Typical measurement on this machine: **4.6× faster** on
@@ -159,9 +160,16 @@ cargo run -- examples/basics.lusa
   `pop`, `len`, `capacity`, `is_empty`, `reserve`, and `clear`; `Box<T>` is an
   owned pointer read and written with `*b`. Both own their contents and run
   RAII drops in every engine.
+- **Async tasks**: `async function`/`async fn` calls return a lazy `task<T>`;
+  `await expr`, `.await`, and `task.await(t)` drive it to completion.
+  `task.spawn`, `task.run`, `task.yield_now`, `task.is_done`, and
+  `task.status` provide a cooperative single-threaded executor in every engine.
+  The C11 backend lowers async bodies to stackless state machines with no OS
+  threads.
 - **stdlib**: `print type tostring tonumber error assert pcall pairs ipairs`
   `io_read_file` `io_write_binary` `io_read_binary` + `string` `table` `math`
-  `json` modules, and `coroutine.create/resume/yield/status/close/isyieldable`.
+  `json` modules, `coroutine.create/resume/yield/status/close/isyieldable`,
+  and `task.spawn/run/yield_now/is_done/status/await`.
   `string` includes Lua-style `find`, `match`, `gmatch`, and `gsub` (see
   [String patterns](#string-patterns-module-13)).
 - **Errors** in cargo style (`error[E1001]: ...`, `note:` and `help:`),
@@ -179,6 +187,7 @@ src/
   ast.rs     parser.rs    # AST — Lua-like syntax tree
   value.rs                # values, tables, coroutines, ownership registry
   coroutine.rs            # isolated stacks and cooperative resume/yield
+  task.rs                 # lazy async tasks and the cooperative executor
   scope.rs   interp.rs    # scopes, frames, execution, move rules
   eval.rs     builtins.rs # expression evaluation; stdlib
   compiler.rs vm.rs       # AST → bytecode compiler; register-based VM
@@ -1015,6 +1024,82 @@ loops, struct/`Vec`/`Box`/nested payloads, sum parameters and fields, `match`
 binding and returns, freestanding scalar sums, typed diagnostics, runtime
 wrong-variant errors, and native + dynamic parity.
 
+### Asynchronous tasks and cooperative scheduling (Module 22)
+
+An `async function` (or the compact `async fn` alias) returns a lazy
+`task<T>` instead of running immediately. Nothing executes until the task is
+awaited or queued:
+
+```lusa
+async function countdown(ticks: i32): i32
+    local elapsed: i32 = 0
+    while elapsed < ticks do
+        task.yield_now()
+        elapsed = elapsed + 1
+    end
+    return elapsed * 10
+end
+
+local lazy = countdown(2)
+print(task.status(lazy), task.is_done(lazy))  -- pending false
+print(await lazy)                             -- 20
+print(task.is_done(lazy))                     -- true
+```
+
+`await expr` is eager: it drives the task until it finishes and evaluates to
+its result. `.await` and `::await` are postfix spellings, and
+`task.await(t)` is the method form. A parent async function can await child
+tasks; it suspends cooperatively between them without blocking a thread:
+
+```lusa
+async function pipeline(): i32
+    local first: i32 = await countdown(2)
+    local second: i32 = await countdown(1)
+    return first + second
+end
+
+local task_a = task.spawn(countdown(3))
+local task_b = task.spawn(countdown(1))
+print(task.run())          -- 2 tasks polled
+print(await task_a)        -- 30
+print(await task_b)        -- 10
+print(task.run())          -- 0: queue is empty
+```
+
+`task.spawn(value)` accepts a task or a function and enqueues it;
+`task.run()` drains the queue in rounds and returns the number of distinct
+tasks that received their first poll. `task.yield_now()` suspends the current
+task at an instruction boundary. `task.is_done(t)` is true after success or
+failure, while `task.status(t)` reports `pending`, `running`, `done`, or
+`failed` in hosted programs.
+
+The dynamic engines implement tasks on top of their private coroutine
+machines. The C11 backend lowers each async function to a stackless
+`LusaTaskState_*` struct with hoisted parameters/locals and a
+`switch (base->state)` step function. Suspensions return `LUSA_TASK_YIELD` or
+`LUSA_TASK_WAIT`; `lusa_task_drive`, `lusa_task_spawn`, and `lusa_task_run`
+form the cooperative executor. No `pthread_create`, `CreateThread`, fibers, or
+other OS threading primitives are involved. In `#[no_std]` builds the executor
+and task allocations use a static arena (`LUSA_TASK_ARENA_BYTES`, 16 KiB by
+default), and `task.status` is unavailable because it returns a string.
+
+Current native limits: async methods, async entry functions, struct-by-value
+async results, fixed-array async locals, and suspending inside `for ... in`
+loops are rejected with `E0312`/`E0301`/`E0325`. Task-owned heap locals and
+parameters are not dropped by the generated state machine yet, so long-lived
+programs should keep async bodies scalar/pointer oriented.
+
+```sh
+lusalang run examples/async_cooperative.lusa
+lusalang run examples/async_cooperative.lusa --vm
+lusalang run examples/async_cooperative.lusa --native
+lusalang build examples/async_cooperative.lusa --emit-c
+```
+
+`tests/module22.rs` covers state-machine emission, lazy execution, awaited
+child tasks, postfix and method awaits, executor polling counts, freestanding
+arena emission, typed diagnostics, and native + dynamic parity.
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -1129,6 +1214,10 @@ Near-term milestones:
 - **v1.7.0 (shipped):** built-in `Result<T, E>`/`Option<T>` sums, combinators,
   `match` patterns, and the `?` early-return operator, with C11 checks and
   freestanding scalar payload support.
+- **v1.8.0 (shipped):** `async function`/`async fn`, lazy `task<T>` handles,
+  `await`/`.await`/`task.await`, `task.spawn`/`run`/`yield_now`/`is_done`/
+  `status`, stackless C11 state-machine lowering, and a freestanding static
+  arena executor.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

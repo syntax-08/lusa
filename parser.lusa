@@ -87,6 +87,7 @@ local parse_block
 local parse_stmt
 local parse_local
 local parse_function
+local parse_async_function
 local parse_type
 local parse_if
 local parse_while
@@ -463,6 +464,12 @@ parse_type = function()
         expect_value(">", "`>` to close the `Option` type")
         return "option<" .. inner .. ">"
     end
+    if (name == "Task" or name == "task") and at_value("<") then
+        advance()
+        local inner = parse_type()
+        expect_value(">", "`>` to close the `Task` type")
+        return "task<" .. inner .. ">"
+    end
     return name
 end
 
@@ -510,7 +517,7 @@ parse_local = function(link_section)
     }
 end
 
-parse_function = function(entry, link_section, global_allocator)
+parse_function = function(entry, link_section, global_allocator, is_async)
     local line = peek_line()
     local column = peek_column()
     advance() -- function
@@ -566,10 +573,31 @@ parse_function = function(entry, link_section, global_allocator)
         body = body,
         entry = entry == true,
         global_allocator = global_allocator == true,
+        is_async = is_async == true,
         link_section = link_section,
         line = line,
         column = column
     }
+end
+
+-- `async function name(...) ... end`; `async fn name(...)` is accepted as a
+-- compact alias.  Async functions lower to stackless C task state machines.
+parse_async_function = function(entry, link_section, global_allocator)
+    local line = peek_line()
+    local column = peek_column()
+    advance() -- async
+    if at_value("fn") then
+        -- Keep `fn` for `parse_function`, which consumes one leading keyword
+        -- token before the function name.  This keeps `async fn name(...)`
+        -- identical to `async function name(...)` after parsing.
+    elseif not at_keyword("function") then
+        fail_at(line, column, "expected `function` after `async`, found "
+            .. describe_token())
+    end
+    local stmt = parse_function(entry, link_section, global_allocator, true)
+    stmt.line = line
+    stmt.column = column
+    return stmt
 end
 
 parse_if = function()
@@ -1213,7 +1241,7 @@ end
 
 local function parse_expression_statement()
     local e = parse_expr()
-    if e.tag ~= "Call" then
+    if e.tag ~= "Call" and e.tag ~= "Await" then
         fail_at(e.line, e.column, "only calls may appear as expression statements")
     end
     local line = e.line
@@ -1261,7 +1289,8 @@ parse_assign_or_call = function(link_section)
             "`#[link_section]` is only supported on functions and global variables")
     end
 
-    if first.tag ~= "Call" and first.tag ~= "MethodCall" then
+    if first.tag ~= "Call" and first.tag ~= "MethodCall"
+        and first.tag ~= "Await" then
         fail_at(first_line, first_column,
             "only calls may appear as expression statements")
     end
@@ -1299,10 +1328,14 @@ parse_attributed_stmt = function()
         return parse_struct(attrs.packed, attrs.align)
     end
 
-    if at_keyword("function") then
+    if at_keyword("function") or at_keyword("async") then
         if attrs.packed or attrs.align ~= nil then
             fail_at(attr_line, attr_column,
                 "`#[packed]` and `#[repr(align(N))]` are only supported on structs")
+        end
+        if at_keyword("async") then
+            return parse_async_function(attrs.entry, attrs.link_section,
+                attrs.global_allocator)
         end
         return parse_function(attrs.entry, attrs.link_section,
             attrs.global_allocator)
@@ -1345,6 +1378,8 @@ parse_stmt = function()
             return parse_local()
         elseif value == "function" then
             return parse_function()
+        elseif value == "async" then
+            return parse_async_function()
         elseif value == "if" then
             return parse_if()
         elseif value == "while" then
@@ -1563,18 +1598,30 @@ parse_suffixes = function(e)
                 line = line,
                 column = column
             }
-        elseif at_value(".") then
+        elseif at_value(".") or at_value("::") then
             advance()
-            local name = expect_member_name()
-            local line = e.line
-            local column = e.column
-            e = {
-                tag = "Field",
-                table = transfer(e),
-                field_name = name,
-                line = line,
-                column = column
-            }
+            if at_keyword("await") and peek_value_at(1) ~= "(" then
+                advance()
+                local line = e.line
+                local column = e.column
+                e = {
+                    tag = "Await",
+                    value = transfer(e),
+                    line = line,
+                    column = column
+                }
+            else
+                local name = expect_member_name()
+                local line = e.line
+                local column = e.column
+                e = {
+                    tag = "Field",
+                    table = transfer(e),
+                    field_name = name,
+                    line = line,
+                    column = column
+                }
+            end
         elseif at_value(":") then
             advance()
             local name = expect_member_name()
@@ -1639,6 +1686,18 @@ parse_prefix = function()
     local value = peek_value()
     local line = peek_line()
     local column = peek_column()
+
+    if kind == "keyword" and value == "await" then
+        advance()
+        local operand = subexpr(7)
+        local node = {
+            tag = "Await",
+            value = operand,
+            line = line,
+            column = column
+        }
+        return parse_suffixes(node)
+    end
 
     local is_unary = false
     if kind == "operator" and (value == "-" or value == "#" or value == "*"

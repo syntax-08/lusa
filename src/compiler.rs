@@ -42,6 +42,9 @@ pub struct Chunk {
     pub name: Option<Arc<str>>,
     pub nparams: usize,
     pub has_vararg: bool,
+    /// `async function` bodies produce a task handle instead of running
+    /// immediately when called.
+    pub is_async: bool,
     pub nlocals: usize,
     pub consts: Vec<Value>,
     pub code: Vec<Instr>,
@@ -148,6 +151,12 @@ pub enum Instr {
     CloneV,
     /// `expr?`: unwraps `Ok`/`Some` or returns `Err`/`None` from this frame.
     Try,
+    /// `await expr`: pops a task handle and drives it to completion, then
+    /// pushes the task result.
+    Await,
+    /// `task.yield_now()`: suspends the current task.  On resume the VM
+    /// pushes `nil` as the call result (one-value semantics).
+    YieldNow,
     /// Wraps TOS in a dynamic-engine `Box<T>` (idempotent for existing boxes).
     MakeBox,
     BorrowErr, // borrow is rejected in bytecode mode
@@ -300,6 +309,7 @@ struct Frame {
     loop_unsafe_depths: Vec<usize>,
     nparams: usize,
     has_vararg: bool,
+    is_async: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Hash, Eq)]
@@ -364,6 +374,7 @@ impl Frame {
             loop_unsafe_depths: Vec::new(),
             nparams: 0,
             has_vararg: false,
+            is_async: false,
         }
     }
 
@@ -889,6 +900,12 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
             c.set_line(e.span);
             c.em(Instr::Try);
         }
+        ExprKind::Await { value: inner } => {
+            compile_expr(c, inner)?;
+            truncate_if_expansion(c, inner);
+            c.set_line(e.span);
+            c.em(Instr::Await);
+        }
         ExprKind::Move { e: inner } => {
             let dest = crate::eval::label_of(inner);
             let took = compile_take_value(c, inner, &dest, false)?;
@@ -976,6 +993,18 @@ fn compile_call(
     span: Span,
     _end: Span,
 ) -> LResult<()> {
+    if is_direct_task_yield(c, callee) {
+        if !args.is_empty() {
+            return Err(LusaError::new(
+                crate::error::E_CALL,
+                Some(span),
+                "`task.yield_now` does not take arguments".to_string(),
+            ));
+        }
+        c.set_line(span);
+        c.em(Instr::YieldNow);
+        return Ok(());
+    }
     if is_direct_coroutine_yield(c, callee) {
         let n = args.len();
         let mut nt = 0usize;
@@ -1032,6 +1061,25 @@ fn is_direct_coroutine_yield(c: &mut Compiler, callee: &Expr) -> bool {
         return false;
     };
     root.as_str() == "coroutine" && matches!(resolve(c, "coroutine"), Resolved::Global)
+}
+
+/// `true` for a direct `task.yield_now()` call inside an async function whose
+/// `task` root resolves to the standard-library global.  Outside async code
+/// the call remains an ordinary builtin call and reports a runtime error.
+fn is_direct_task_yield(c: &mut Compiler, callee: &Expr) -> bool {
+    if !c.cur().is_async {
+        return false;
+    }
+    let ExprKind::Field { obj, name } = &callee.kind else {
+        return false;
+    };
+    if name.as_str() != "yield_now" {
+        return false;
+    }
+    let ExprKind::Var(root) = &obj.kind else {
+        return false;
+    };
+    root.as_str() == "task" && matches!(resolve(c, "task"), Resolved::Global)
 }
 
 /// Compiles a function literal that must be callable without a surrounding
@@ -1332,12 +1380,14 @@ fn emit_struct_default_value(
 fn compile_nested_fn(c: &mut Compiler, lit: &FuncLit, name: &str) -> LResult<()> {
     let parent = c.top();
     let has_vararg = lit.has_vararg;
+    let is_async = lit.is_async;
     c.frames.push(Frame::new(format!("{}::{}", c.frames[parent].name, name), Some(parent)));
     c.set_line(lit.span_body);
     {
         let f = c.cur();
         f.has_vararg = has_vararg;
         f.nparams = lit.params.len();
+        f.is_async = is_async;
     }
     for p in &lit.params {
         c.declare(p);
@@ -1352,6 +1402,7 @@ fn compile_nested_fn(c: &mut Compiler, lit: &FuncLit, name: &str) -> LResult<()>
             name: Some(Arc::from(frame.name.as_str())),
             nparams: frame.nparams,
             has_vararg: frame.has_vararg,
+            is_async: frame.is_async,
             nlocals: frame.slots.len(),
             consts: frame.consts.iter().map(|k| k.to_value()).collect(),
             code: frame.code,
@@ -1937,6 +1988,7 @@ pub fn compile_program_with_base(src: &str, base: Option<&Path>) -> LResult<Rc<C
             name: Some(Arc::from(f.name.as_str())),
             nparams: f.nparams,
             has_vararg: f.has_vararg,
+            is_async: false,
             nlocals: f.slots.len(),
             consts: f.consts.iter().map(|k| k.to_value()).collect(),
             code: f.code,

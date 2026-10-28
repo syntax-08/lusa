@@ -26,6 +26,10 @@ pub enum TokenKind {
     // keywords
     Local,
     Function,
+    /// `async function ... end` / `async function(...) ... end`
+    Async,
+    /// `await expr` and the postfix `expr.await`
+    Await,
     End,
     If,
     Then,
@@ -92,6 +96,9 @@ pub enum TokenKind {
     Comma,
     Semi,
     Colon,
+    /// `::` path separator; `task::spawn` and `obj::await` are aliases for
+    /// the corresponding dot forms.
+    ColonColon,
     Eof,
 }
 
@@ -108,6 +115,8 @@ impl TokenKind {
         Some(match self {
             TokenKind::Local => "local",
             TokenKind::Function => "function",
+            TokenKind::Async => "async",
+            TokenKind::Await => "await",
             TokenKind::End => "end",
             TokenKind::If => "if",
             TokenKind::Then => "then",
@@ -150,6 +159,8 @@ impl Token {
             TokenKind::False => "false".into(),
             TokenKind::Local => "`local`".into(),
             TokenKind::Function => "`function`".into(),
+            TokenKind::Async => "`async`".into(),
+            TokenKind::Await => "`await`".into(),
             TokenKind::End => "`end`".into(),
             TokenKind::If => "`if`".into(),
             TokenKind::Then => "`then`".into(),
@@ -208,6 +219,7 @@ impl Token {
             TokenKind::Comma => "`,`".into(),
             TokenKind::Semi => "`;`".into(),
             TokenKind::Colon => "`:`".into(),
+            TokenKind::ColonColon => "`::`".into(),
             TokenKind::Eof => "end of input".into(),
         }
     }

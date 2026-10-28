@@ -57,6 +57,11 @@ pub fn option_annotation(ann: &str) -> Option<&str> {
     ann.strip_prefix("option<")?.strip_suffix('>')
 }
 
+/// Splits a canonical `task<T>` annotation into the awaited result spelling.
+pub fn task_annotation(ann: &str) -> Option<&str> {
+    ann.strip_prefix("task<")?.strip_suffix('>')
+}
+
 #[derive(Clone, Debug)]
 pub struct St {
     pub kind: StKind,
@@ -211,6 +216,8 @@ pub enum ExprKind {
     Paren(Box<Expr>),
     /// `expr?` — propagates `Err`/`None` from the current function.
     Try { value: Box<Expr> },
+    /// `await expr` / `expr.await` — drives a task until it settles.
+    Await { value: Box<Expr> },
 }
 
 #[derive(Clone, Debug)]
@@ -241,6 +248,7 @@ pub struct StructLitField {
 pub struct FuncLit {
     pub params: Vec<String>,
     pub has_vararg: bool,
+    pub is_async: bool,
     pub body: Block,
     pub span_body: Span,
 }

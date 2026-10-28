@@ -42,6 +42,7 @@ pub fn key_hash_loose(v: &Value) -> Option<u64> {
         Value::Func(f) => Some(f.vid.wrapping_mul(0x9E3779B97F4A7C15) | 2),
         Value::Iter(i) => Some((Rc::as_ptr(i) as *const () as u64).wrapping_mul(0x9E3779B97F4A7C15) | 3),
         Value::Coroutine(c) => Some((Rc::as_ptr(c) as *const () as u64).wrapping_mul(0x9E3779B97F4A7C15) | 4),
+        Value::Task(t) => Some((Rc::as_ptr(t) as *const () as u64).wrapping_mul(0x9E3779B97F4A7C15) | 5),
         Value::Alias(a) => key_hash_loose(&a.base),
     }
 }
@@ -307,8 +308,7 @@ pub fn eval_expr(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr
         }
         ExprKind::Paren(inner) => eval_expr(interp, frame, inner),
         ExprKind::Try { value } => {
-            let v = eval_expr(interp, frame, value)?;
-            let Some((kind, tag, payload)) = v.base_value().sum_parts() else {
+            let v = eval_expr(interp, frame, value)?;            let Some((kind, tag, payload)) = v.base_value().sum_parts() else {
                 return Err(LusaError::new(
                     E_CALL,
                     Some(e.span),
@@ -342,6 +342,10 @@ pub fn eval_expr(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr
                     "internal: `?` propagation",
                 ))
             }
+        }
+        ExprKind::Await { value } => {
+            let v = eval_expr(interp, frame, value)?;
+            crate::task::await_value(interp, &v, e.span)
         }
         ExprKind::Vararg => {
             let first = frame.varargs.get(0).map(|v| v.clone()).unwrap_or(Value::Nil);

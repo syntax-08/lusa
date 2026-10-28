@@ -156,7 +156,7 @@ emits `Import` or `Mod` AST nodes.
 | `Compiler.self_compile(lexer, parser, path)` | consumes handles and reads `path` | success/error descriptor |
 | `Compiler.memory_layout()` | none | ABI/schema description |
 
-`Compiler.Version = 2` and `Compiler.Targets = { c = "c11" }`.
+`Compiler.Version = 4` and `Compiler.Targets = { c = "c11" }`.
 
 ### Static types
 

@@ -63,15 +63,17 @@ Download `lusa-setup.zip` or the platform tarball.
 
 ## Current release
 
-The v1.7.0 body is [`.github/release-notes/v1.7.0.md`](../.github/release-notes/v1.7.0.md).
-It follows this structure and documents built-in `Result<T, E>` and
-`Option<T>`, the `Ok`/`Err`/`Some`/`None` constructors, combinators,
-constructor `match` patterns, the `?` operator in every engine, sum ownership
-and RAII helpers, freestanding scalar payloads, and the `E0301`/`E0311`/`E0312`
-diagnostics.
+The v1.8.0 body is [`.github/release-notes/v1.8.0.md`](../.github/release-notes/v1.8.0.md).
+It follows this structure and documents `async function`/`async fn`, lazy
+`task<T>` handles, `await`/`.await`/`::await`/`task.await`, the
+`task.spawn`/`run`/`yield_now`/`is_done`/`status` executor surface, stackless
+C11 state-machine lowering, the freestanding static-arena executor, and the
+`E0301`/`E0312`/`E0325` diagnostics.
 
-The previous v1.6.0 body remains at
-[`.github/release-notes/v1.6.0.md`](../.github/release-notes/v1.6.0.md).
+The previous v1.7.0 body remains at
+[`.github/release-notes/v1.7.0.md`](../.github/release-notes/v1.7.0.md) and
+documents built-in `Result<T, E>`/`Option<T>`, constructors, combinators,
+constructor `match` patterns, and the `?` operator.
 
 Every verified release must also publish a GitHub Release (with the annotated
 tag and curated notes), not only push the commit and tag to `origin/main`.

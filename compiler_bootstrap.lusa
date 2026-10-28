@@ -31,7 +31,7 @@
 
 local Compiler = {}
 
-local COMPILER_VERSION = 3
+local COMPILER_VERSION = 4
 Compiler.Version = COMPILER_VERSION
 Compiler.Targets = { c = "c11" }
 
@@ -235,7 +235,7 @@ local function opt_expr(expr)
         }
     end
 
-    if tag == "Clone" or tag == "Borrow" or tag == "Move" then
+    if tag == "Clone" or tag == "Borrow" or tag == "Move" or tag == "Await" then
         local value = opt_expr(expr.value)
         return {
             tag = tag, value = value, line = line, column = column
@@ -345,6 +345,7 @@ opt_stmt = function(stmt)
             body = opt_block(stmt.body),
             entry = stmt.entry,
             global_allocator = stmt.global_allocator,
+            is_async = stmt.is_async,
             link_section = stmt.link_section,
             line = line, column = column
         }
@@ -596,6 +597,25 @@ local function is_result_type(type_name)
     return result_info(type_name) ~= nil
 end
 
+-- Canonical async task annotations are `task<T>`; async calls return one and
+-- `await` unwraps the result.  The C ABI represents every task handle as a
+-- uniform `LusaTask *` pointer.
+local function task_info(type_name)
+    if type_name == nil or string.sub(type_name, 1, 5) ~= "task<"
+        or string.sub(type_name, #type_name, #type_name) ~= ">" then
+        return nil
+    end
+    local inner = string.sub(type_name, 6, #type_name - 1)
+    if inner == "" then
+        return nil
+    end
+    return inner
+end
+
+local function is_task_type(type_name)
+    return task_info(type_name) ~= nil
+end
+
 local function is_option_type(type_name)
     return option_info(type_name) ~= nil
 end
@@ -808,6 +828,19 @@ local function canonical_type(name, line, column)
         local canonical = "option<" .. inner .. ">"
         register_sum_type(canonical)
         return canonical
+    end
+    local task_inner = task_info(name)
+    if task_inner ~= nil then
+        local inner = canonical_type(task_inner, line, column)
+        if inner == "auto" or inner == "nil" then
+            type_fail("E0301", line, column,
+                "invalid Task payload type `" .. tostring(inner) .. "`")
+        end
+        if is_array_type(inner) or is_vec_type(inner) or is_struct_type(inner) then
+            type_fail("E0301", line, column,
+                "native async task results must be scalar, string, table, or a pointer")
+        end
+        return "task<" .. inner .. ">"
     end
     if is_pointer_type(name) then
         local element = pointer_element(name)
@@ -1174,6 +1207,7 @@ local check_loop_depth = 0
 local check_unsafe_depth = 0
 local check_return_type = "i32"
 local check_in_function = false
+local check_in_async = false
 local check_current_function = nil
 local check_no_std = false
 local check_entry_key = nil
@@ -2221,12 +2255,98 @@ local function sum_printable_payload(type_name)
     return false
 end
 
+local function check_task_call(expr, method)
+    local args = expr.args or {}
+    local checked_args = {}
+    if method == "spawn" then
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`task.spawn` takes one task")
+        end
+        local checked, actual = check_expr(args[1])
+        if task_info(actual) == nil then
+            check_mismatch(checked.line, checked.column,
+                "`task.spawn` argument", "task<T>", actual)
+        end
+        checked_args[1] = checked
+        expr.builtin = "task_spawn"
+        expr.ctype = actual
+        expr.args = checked_args
+        return expr, actual
+    end
+    if method == "run" then
+        if #args ~= 0 then
+            type_fail("E0311", expr.line, expr.column,
+                "`task.run` takes no arguments")
+        end
+        expr.builtin = "task_run"
+        expr.ctype = "i32"
+        expr.args = {}
+        return expr, "i32"
+    end
+    if method == "yield_now" then
+        if #args ~= 0 then
+            type_fail("E0311", expr.line, expr.column,
+                "`task.yield_now` takes no arguments")
+        end
+        if not check_in_async then
+            type_fail("E0312", expr.line, expr.column,
+                "`task.yield_now` can only be used inside an `async function`")
+        end
+        expr.builtin = "task_yield_now"
+        expr.ctype = "void"
+        expr.args = {}
+        return expr, "void"
+    end
+    if method == "is_done" or method == "status" or method == "await" then
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`task." .. method .. "` takes one task")
+        end
+        local checked, actual = check_expr(args[1])
+        local result_type = task_info(actual)
+        if result_type == nil then
+            check_mismatch(checked.line, checked.column,
+                "`task." .. method .. "` argument", "task<T>", actual)
+        end
+        checked_args[1] = checked
+        expr.args = checked_args
+        if method == "is_done" then
+            expr.builtin = "task_is_done"
+            expr.ctype = "bool"
+            return expr, "bool"
+        end
+        if method == "status" then
+            if check_no_std then
+                type_fail("E0312", expr.line, expr.column,
+                    "`task.status` is unavailable in `#[no_std]` programs; use `task.is_done`")
+            end
+            expr.builtin = "task_status"
+            expr.ctype = "string"
+            return expr, "string"
+        end
+        if result_type == "void" or result_type == "nil" then
+            type_fail("E0312", expr.line, expr.column,
+                "cannot await a task without a result")
+        end
+        expr.builtin = "task_await"
+        expr.ctype = result_type
+        expr.own = is_heap_type(result_type)
+        return expr, result_type
+    end
+    type_fail("E0319", expr.line, expr.column,
+        "unsupported native task operation `" .. tostring(method) .. "`")
+end
+
 local function check_call(expr)
     local callee = borrow expr.callee
     if callee.tag == "Field" then
         local receiver = borrow callee.table
         if receiver.tag == "Name" and receiver.name == "coroutine" then
             return check_coroutine_call(expr, callee.field_name)
+        end
+        if receiver.tag == "Name" and receiver.name == "task" then
+            return check_task_call(expr, callee.field_name)
         end
         if receiver.tag == "Name" and receiver.name == "string" then
             if string_methods[callee.field_name] ~= true then
@@ -3247,6 +3367,27 @@ check_expr = function(expr)
         return expr, "bool"
     end
 
+    if tag == "Await" then
+        local checked, inner = check_expr(expr.value)
+        local result_type = task_info(inner)
+        if result_type == nil then
+            check_mismatch(checked.line, checked.column, "await",
+                "task<T>", inner)
+        end
+        if result_type == "void" then
+            type_fail("E0312", line, column,
+                "cannot await a `task<void>` value")
+        end
+        if result_type == "nil" then
+            type_fail("E0312", line, column,
+                "cannot await a task with a `nil` result")
+        end
+        expr.value = checked
+        expr.ctype = result_type
+        expr.own = is_heap_type(result_type)
+        return expr, result_type
+    end
+
     if tag == "Try" then
         return check_try(expr)
     end
@@ -3860,6 +4001,10 @@ local function check_local(stmt)
             type_fail("E0301", stmt.line, stmt.column,
                 "local `" .. names[i] .. "` cannot have type `void`")
         end
+        if check_in_async and is_array_type(final_type) then
+            type_fail("E0312", stmt.line, stmt.column,
+                "fixed arrays cannot be locals in an `async function`; the task state machine hoists locals into a heap struct")
+        end
         local own = is_heap_type(final_type)
         if is_borrow then
             -- `borrow x` never owns its referent.
@@ -4127,12 +4272,14 @@ local function check_function(signature)
     local previous_loop = check_loop_depth
     local previous_unsafe = check_unsafe_depth
     local previous_in_function = check_in_function
+    local previous_async = check_in_async
     local previous_function = check_current_function
 
-    check_return_type = signature.ret
+    check_return_type = signature.async_ret or signature.ret
     check_loop_depth = 0
     check_unsafe_depth = 0
     check_in_function = true
+    check_in_async = signature.is_async == true
     check_current_function = signature
     if signature.receiver ~= nil then
         local receiver = value_lookup(signature.receiver)
@@ -4172,6 +4319,7 @@ local function check_function(signature)
     check_loop_depth = previous_loop
     check_unsafe_depth = previous_unsafe
     check_in_function = previous_in_function
+    check_in_async = previous_async
     check_current_function = previous_function
     return signature
 end
@@ -4338,6 +4486,31 @@ local function scan_functions(body)
                 type_fail("E0312", fline, fcolumn,
                     "`Vec<T>` cannot be returned by value yet; return a raw pointer instead")
             end
+            local async_result = nil
+            if stmt.is_async == true then
+                if receiver ~= nil then
+                    type_fail("E0312", fline, fcolumn,
+                        "native async methods are not supported; declare a free `async function`")
+                end
+                if stmt.entry == true then
+                    type_fail("E0325", fline, fcolumn,
+                        "`#[entry]` functions cannot be `async`; spawn tasks from the entry function")
+                end
+                if stmt.global_allocator == true then
+                    type_fail("E0325", fline, fcolumn,
+                        "a `#[global_allocator]` cannot be `async`")
+                end
+                if is_struct_type(ret) then
+                    type_fail("E0312", fline, fcolumn,
+                        "native async functions cannot return a struct by value yet; return a pointer or a scalar")
+                end
+                async_result = ret
+                if ret == "void" then
+                    ret = "task<void>"
+                else
+                    ret = "task<" .. ret .. ">"
+                end
+            end
             local link_section = stmt.link_section
             if link_section ~= nil then
                 validate_link_section(link_section, fline, fcolumn)
@@ -4406,6 +4579,8 @@ local function scan_functions(body)
                 key = key,
                 params = params,
                 ret = ret,
+                is_async = stmt.is_async == true,
+                async_ret = async_result,
                 entry = stmt.entry == true,
                 link_section = link_section,
                 node = stmt
@@ -4809,6 +4984,7 @@ local function check_program(ast)
     check_unsafe_depth = 0
     check_return_type = "i32"
     check_in_function = false
+    check_in_async = false
     check_current_function = nil
     check_no_std = false
     check_entry_key = nil
@@ -4926,6 +5102,11 @@ local emit_loop_stack = {}
 local emit_is_main = false
 local emit_return_type = "i32"
 local emit_no_std = false
+local emit_async_mode = false
+local emit_async_state = 0
+local emit_async_has = false
+local emit_async_function_names = {}
+local emit_async_for_depth = 0
 
 local function reset_emitter()
     emit_out = {}
@@ -4945,6 +5126,11 @@ local function reset_emitter()
     emit_is_main = false
     emit_return_type = "i32"
     emit_no_std = false
+    emit_async_mode = false
+    emit_async_state = 0
+    emit_async_has = false
+    emit_async_function_names = {}
+    emit_async_for_depth = 0
 end
 
 local function put(text)
@@ -4985,6 +5171,7 @@ local function c_type(type_name)
     if type_name == "bool" then return "bool" end
     if type_name == "string" then return "LusaString *" end
     if type_name == "coroutine" then return "LusaCoro *" end
+    if is_task_type(type_name) then return "LusaTask *" end
     if type_name == "gmatch" then return "LusaGmatch *" end
     if type_name == "nil" then return "void *" end
     if type_name == "void" then return "void" end
@@ -5033,7 +5220,8 @@ local function default_c(type_name)
     end
     if type_name == "string" or type_name == "nil"
         or type_name == "table" or type_name == "coroutine"
-        or type_name == "gmatch" or table_element(type_name) ~= nil then
+        or type_name == "gmatch" or table_element(type_name) ~= nil
+        or is_task_type(type_name) then
         return "NULL"
     end
     if type_name == "value" then
@@ -5194,6 +5382,26 @@ local function emit_scope_declare(name, type_name, own, borrowed)
     return entry
 end
 
+-- Registers a name that already lives at a stable C location.  Async task
+-- state machines use this to bind hoisted locals to `self->field` accesses.
+local function emit_scope_declare_named(name, cname, type_name, own, borrowed)
+    local entry = {
+        name = name,
+        cname = cname,
+        type = type_name,
+        own = own == true,
+        borrowed = borrowed == true,
+        moved = false
+    }
+    local scope = emit_scopes[emit_scope_count]
+    scope.vars[name] = clone entry
+    local order = scope.order
+    order[#order + 1] = clone entry
+    scope.order = order
+    emit_scopes[emit_scope_count] = scope
+    return entry
+end
+
 local function emit_scope_pop_without_drops()
     emit_scopes[emit_scope_count] = nil
     emit_scope_count = emit_scope_count - 1
@@ -5267,6 +5475,9 @@ local function emit_drop_entry(entry)
 end
 
 local function emit_scope_drops(scope_index)
+    if emit_async_mode then
+        return
+    end
     local scope = emit_scopes[scope_index]
     if scope == nil then
         return
@@ -5291,6 +5502,9 @@ local function emit_leave_scope()
 end
 
 local function emit_all_drops()
+    if emit_async_mode then
+        return
+    end
     local i = emit_scope_count
     while i >= 1 do
         emit_scope_drops(i)
@@ -5314,6 +5528,18 @@ end
 -- so every owned local is released exactly once.  `pcall` clears the flag
 -- before its protected call and inspects it afterwards.
 local function emit_error_check()
+    if emit_async_mode then
+        -- A failed runtime call inside a task marks the task failed instead
+        -- of unwinding the generated step function.
+        line("if (lusa_error_pending) {")
+        emit_indent = emit_indent + 1
+        line("base->status = 2;")
+        line('base->error = "runtime error";')
+        line("return LUSA_TASK_FAIL;")
+        emit_indent = emit_indent - 1
+        line("}")
+        return
+    end
     line("if (lusa_error_pending) {")
     emit_indent = emit_indent + 1
     emit_all_drops()
@@ -5333,7 +5559,7 @@ end
 -- boundary unwinds its ordinary stack frame.  Every generated function has
 -- the hidden `lusa_co` parameter, so helpers clean up just like the entry.
 local function emit_coro_closing_check()
-    if emit_is_main then
+    if emit_is_main or emit_async_mode then
         return
     end
     line("if (lusa_coro_closing(lusa_co)) {")
@@ -6402,6 +6628,382 @@ local HEAP_RUNTIME = {
     ""
 }
 
+-- ---- cooperative async task runtime --------------------------------------
+
+-- Every `async function` lowers to a stackless state-machine step function.
+-- Tasks are heap-allocated handles linked through a cooperative run queue;
+-- there are no OS threads.  `lusa_task_run` is the minimal freestanding
+-- executor used by hosted and `#[no_std]` programs.
+local TASK_RUNTIME = {
+    "static void *lusa_heap_alloc(uint32_t size, uint32_t align);",
+    "",
+    "typedef struct LusaTask LusaTask;",
+    "typedef int (*LusaTaskStep)(LusaTask *);",
+    "",
+    "enum {",
+    "    LUSA_TASK_DONE = 0,",
+    "    LUSA_TASK_YIELD = 1,",
+    "    LUSA_TASK_WAIT = 2,",
+    "    LUSA_TASK_FAIL = 3",
+    "};",
+    "",
+    "struct LusaTask {",
+    "    LusaTaskStep step;",
+    "    int state;",
+    "    int status; /* 0 pending, 1 done, 2 failed */",
+    "    int queued;",
+    "    LusaTask *awaiting;",
+    "    LusaTask *next;",
+    "    const char *error;",
+    "    union {",
+    "        int32_t i32;",
+    "        uint32_t u32;",
+    "        float f32;",
+    "        bool boolean;",
+    "        lusa_i128 i128;",
+    "        void *ptr;",
+    "    } value;",
+    "};",
+    "",
+    "static LusaTask *lusa_task_queue_head = NULL;",
+    "static LusaTask *lusa_task_queue_tail = NULL;",
+    "",
+    "static LusaTask *lusa_task_new(uint32_t size, LusaTaskStep step) {",
+    "    LusaTask *task = (LusaTask *)lusa_heap_alloc(size, 16u);",
+    "    unsigned char *bytes = (unsigned char *)task;",
+    "    uint32_t i = 0u;",
+    "    if (task == NULL) return NULL;",
+    "    while (i < size) { bytes[i] = 0u; i = i + 1u; }",
+    "    task->step = step;",
+    "    task->state = 0;",
+    "    task->status = 0;",
+    "    task->queued = 0;",
+    "    task->awaiting = NULL;",
+    "    task->next = NULL;",
+    "    task->error = NULL;",
+    "    return task;",
+    "}",
+    "",
+    "static void lusa_task_push(LusaTask *task) {",
+    "    if (task == NULL || task->queued) return;",
+    "    task->queued = 1;",
+    "    task->next = NULL;",
+    "    if (lusa_task_queue_tail == NULL) {",
+    "        lusa_task_queue_head = task;",
+    "        lusa_task_queue_tail = task;",
+    "    } else {",
+    "        lusa_task_queue_tail->next = task;",
+    "        lusa_task_queue_tail = task;",
+    "    }",
+    "}",
+    "",
+    "static LusaTask *lusa_task_pop(void) {",
+    "    LusaTask *task = lusa_task_queue_head;",
+    "    if (task == NULL) return NULL;",
+    "    lusa_task_queue_head = task->next;",
+    "    if (lusa_task_queue_head == NULL) lusa_task_queue_tail = NULL;",
+    "    task->next = NULL;",
+    "    task->queued = 0;",
+    "    return task;",
+    "}",
+    "",
+    "static LusaTask *lusa_task_spawn(LusaTask *task) {",
+    "    if (task != NULL && task->status == 0) lusa_task_push(task);",
+    "    return task;",
+    "}",
+    "",
+    "static bool lusa_task_done(LusaTask *task) {",
+    "    return task != NULL && task->status == 1;",
+    "}",
+    "",
+    "static bool lusa_task_failed(LusaTask *task) {",
+    "    return task != NULL && task->status == 2;",
+    "}",
+    "",
+    "static int32_t lusa_task_result_i32(LusaTask *task) {",
+    "    return task == NULL ? 0 : task->value.i32;",
+    "}",
+    "",
+    "static uint32_t lusa_task_result_u32(LusaTask *task) {",
+    "    return task == NULL ? 0u : task->value.u32;",
+    "}",
+    "",
+    "static float lusa_task_result_f32(LusaTask *task) {",
+    "    return task == NULL ? 0.0f : task->value.f32;",
+    "}",
+    "",
+    "static bool lusa_task_result_bool(LusaTask *task) {",
+    "    return task == NULL ? false : task->value.boolean;",
+    "}",
+    "",
+    "static lusa_i128 lusa_task_result_i128(LusaTask *task) {",
+    "    return task == NULL ? (lusa_i128)0 : task->value.i128;",
+    "}",
+    "",
+    "static void *lusa_task_result_ptr(LusaTask *task) {",
+    "    return task == NULL ? NULL : task->value.ptr;",
+    "}",
+    "",
+    "static LusaString *lusa_task_status(LusaTask *task) {",
+    "    if (task == NULL || task->status == 2) {",
+    '        return lusa_string_new("failed", 6u);',
+    "    }",
+    "    if (task->status == 1) {",
+    '        return lusa_string_new("done", 4u);',
+    "    }",
+    "    if (task->state != 0 || task->queued) {",
+    '        return lusa_string_new("running", 7u);',
+    "    }",
+    '    return lusa_string_new("pending", 7u);',
+    "}",
+    "",
+    "static void lusa_task_drive(LusaTask *task) {",
+    "    while (task != NULL && task->status == 0) {",
+    "        int rc = task->step(task);",
+    "        if (rc == LUSA_TASK_WAIT) {",
+    "            if (task->awaiting == NULL) {",
+    "                task->status = 2;",
+    '                task->error = "await has no child task";',
+    "                return;",
+    "            }",
+    "            lusa_task_drive(task->awaiting);",
+    "            if (task->awaiting->status == 2) {",
+    "                task->status = 2;",
+    "                task->error = task->awaiting->error;",
+    "                return;",
+    "            }",
+    "            continue;",
+    "        }",
+    "        if (rc == LUSA_TASK_YIELD) continue;",
+    "        if (rc == LUSA_TASK_FAIL) {",
+    "            task->status = 2;",
+    '            if (task->error == NULL) task->error = "task failed";',
+    "            return;",
+    "        }",
+    "        task->status = 1;",
+    "        return;",
+    "    }",
+    "}",
+    "",
+    "static int32_t lusa_task_run(void) {",
+    "    int32_t ran = 0;",
+    "    while (lusa_task_queue_head != NULL) {",
+    "        LusaTask *task = lusa_task_pop();",
+    "        int rc;",
+    "        if (task->status != 0) continue;",
+    "        if (task->state == 0) ran = ran + 1;",
+    "        rc = task->step(task);",
+    "        if (rc == LUSA_TASK_WAIT) {",
+    "            if (task->awaiting == NULL) {",
+    "                task->status = 2;",
+    '                task->error = "await has no child task";',
+    "            } else {",
+    "                lusa_task_drive(task->awaiting);",
+    "                if (task->awaiting->status == 2) {",
+    "                    task->status = 2;",
+    "                    task->error = task->awaiting->error;",
+    "                } else if (task->status == 0) {",
+    "                    lusa_task_push(task);",
+    "                }",
+    "            }",
+    "        } else if (rc == LUSA_TASK_YIELD) {",
+    "            lusa_task_push(task);",
+    "        } else if (rc == LUSA_TASK_FAIL) {",
+    "            task->status = 2;",
+    '            if (task->error == NULL) task->error = "task failed";',
+    "        } else {",
+    "            task->status = 1;",
+    "        }",
+    "    }",
+    "    return ran;",
+    "}",
+    ""
+}
+
+local NO_STD_TASK_RUNTIME = {
+    "#ifndef LUSA_TASK_ARENA_BYTES",
+    "#define LUSA_TASK_ARENA_BYTES 16384u",
+    "#endif",
+    "static unsigned char lusa_task_arena[LUSA_TASK_ARENA_BYTES];",
+    "static size_t lusa_task_arena_used = 0u;",
+    "",
+    "static void *lusa_task_alloc(uint32_t size, uint32_t align) {",
+    "    size_t start;",
+    "    size_t mask;",
+    "    if (align < 1u) align = 1u;",
+    "    mask = (size_t)align - 1u;",
+    "    start = (lusa_task_arena_used + mask) & ~mask;",
+    "    if (start + (size_t)size > (size_t)LUSA_TASK_ARENA_BYTES) return NULL;",
+    "    lusa_task_arena_used = start + (size_t)size;",
+    "    return (void *)&lusa_task_arena[start];",
+    "}",
+    "",
+    "typedef struct LusaTask LusaTask;",
+    "typedef int (*LusaTaskStep)(LusaTask *);",
+    "",
+    "enum {",
+    "    LUSA_TASK_DONE = 0,",
+    "    LUSA_TASK_YIELD = 1,",
+    "    LUSA_TASK_WAIT = 2,",
+    "    LUSA_TASK_FAIL = 3",
+    "};",
+    "",
+    "struct LusaTask {",
+    "    LusaTaskStep step;",
+    "    int state;",
+    "    int status;",
+    "    int queued;",
+    "    LusaTask *awaiting;",
+    "    LusaTask *next;",
+    "    const char *error;",
+    "    union {",
+    "        int32_t i32;",
+    "        uint32_t u32;",
+    "        float f32;",
+    "        bool boolean;",
+    "        lusa_i128 i128;",
+    "        void *ptr;",
+    "    } value;",
+    "};",
+    "",
+    "static LusaTask *lusa_task_queue_head = NULL;",
+    "static LusaTask *lusa_task_queue_tail = NULL;",
+    "",
+    "static LusaTask *lusa_task_new(uint32_t size, LusaTaskStep step) {",
+    "    LusaTask *task = (LusaTask *)lusa_task_alloc(size, 16u);",
+    "    unsigned char *bytes = (unsigned char *)task;",
+    "    uint32_t i = 0u;",
+    "    if (task == NULL) return NULL;",
+    "    while (i < size) { bytes[i] = 0u; i = i + 1u; }",
+    "    task->step = step;",
+    "    task->state = 0;",
+    "    task->status = 0;",
+    "    return task;",
+    "}",
+    "",
+    "static void lusa_task_push(LusaTask *task) {",
+    "    if (task == NULL || task->queued) return;",
+    "    task->queued = 1;",
+    "    task->next = NULL;",
+    "    if (lusa_task_queue_tail == NULL) {",
+    "        lusa_task_queue_head = task;",
+    "        lusa_task_queue_tail = task;",
+    "    } else {",
+    "        lusa_task_queue_tail->next = task;",
+    "        lusa_task_queue_tail = task;",
+    "    }",
+    "}",
+    "",
+    "static LusaTask *lusa_task_pop(void) {",
+    "    LusaTask *task = lusa_task_queue_head;",
+    "    if (task == NULL) return NULL;",
+    "    lusa_task_queue_head = task->next;",
+    "    if (lusa_task_queue_head == NULL) lusa_task_queue_tail = NULL;",
+    "    task->next = NULL;",
+    "    task->queued = 0;",
+    "    return task;",
+    "}",
+    "",
+    "static LusaTask *lusa_task_spawn(LusaTask *task) {",
+    "    if (task != NULL && task->status == 0) lusa_task_push(task);",
+    "    return task;",
+    "}",
+    "",
+    "static bool lusa_task_done(LusaTask *task) {",
+    "    return task != NULL && task->status == 1;",
+    "}",
+    "",
+    "static bool lusa_task_failed(LusaTask *task) {",
+    "    return task != NULL && task->status == 2;",
+    "}",
+    "",
+    "static int32_t lusa_task_result_i32(LusaTask *task) {",
+    "    return task == NULL ? 0 : task->value.i32;",
+    "}",
+    "",
+    "static uint32_t lusa_task_result_u32(LusaTask *task) {",
+    "    return task == NULL ? 0u : task->value.u32;",
+    "}",
+    "",
+    "static float lusa_task_result_f32(LusaTask *task) {",
+    "    return task == NULL ? 0.0f : task->value.f32;",
+    "}",
+    "",
+    "static bool lusa_task_result_bool(LusaTask *task) {",
+    "    return task == NULL ? false : task->value.boolean;",
+    "}",
+    "",
+    "static lusa_i128 lusa_task_result_i128(LusaTask *task) {",
+    "    return task == NULL ? (lusa_i128)0 : task->value.i128;",
+    "}",
+    "",
+    "static void *lusa_task_result_ptr(LusaTask *task) {",
+    "    return task == NULL ? NULL : task->value.ptr;",
+    "}",
+    "",
+    "static void lusa_task_drive(LusaTask *task) {",
+    "    while (task != NULL && task->status == 0) {",
+    "        int rc = task->step(task);",
+    "        if (rc == LUSA_TASK_WAIT) {",
+    "            if (task->awaiting == NULL) {",
+    "                task->status = 2;",
+    '                task->error = "await has no child task";',
+    "                return;",
+    "            }",
+    "            lusa_task_drive(task->awaiting);",
+    "            if (task->awaiting->status == 2) {",
+    "                task->status = 2;",
+    "                task->error = task->awaiting->error;",
+    "                return;",
+    "            }",
+    "            continue;",
+    "        }",
+    "        if (rc == LUSA_TASK_YIELD) continue;",
+    "        if (rc == LUSA_TASK_FAIL) {",
+    "            task->status = 2;",
+    '            if (task->error == NULL) task->error = "task failed";',
+    "            return;",
+    "        }",
+    "        task->status = 1;",
+    "        return;",
+    "    }",
+    "}",
+    "",
+    "static int32_t lusa_task_run(void) {",
+    "    int32_t ran = 0;",
+    "    while (lusa_task_queue_head != NULL) {",
+    "        LusaTask *task = lusa_task_pop();",
+    "        int rc;",
+    "        if (task->status != 0) continue;",
+    "        if (task->state == 0) ran = ran + 1;",
+    "        rc = task->step(task);",
+    "        if (rc == LUSA_TASK_WAIT) {",
+    "            if (task->awaiting == NULL) {",
+    "                task->status = 2;",
+    '                task->error = "await has no child task";',
+    "            } else {",
+    "                lusa_task_drive(task->awaiting);",
+    "                if (task->awaiting->status == 2) {",
+    "                    task->status = 2;",
+    "                    task->error = task->awaiting->error;",
+    "                } else if (task->status == 0) {",
+    "                    lusa_task_push(task);",
+    "                }",
+    "            }",
+    "        } else if (rc == LUSA_TASK_YIELD) {",
+    "            lusa_task_push(task);",
+    "        } else if (rc == LUSA_TASK_FAIL) {",
+    "            task->status = 2;",
+    '            if (task->error == NULL) task->error = "task failed";',
+    "        } else {",
+    "            task->status = 1;",
+    "        }",
+    "    }",
+    "    return ran;",
+    "}",
+    ""
+}
+
 -- ---- coroutine runtime ---------------------------------------------------
 
 -- Native coroutines use platform-supported stacks: Windows fibers and
@@ -6676,7 +7278,8 @@ collect_strings_expr = function(expr)
         return
     end
     if tag == "Paren" or tag == "Unary" or tag == "Clone"
-        or tag == "Borrow" or tag == "Move" or tag == "AddrOf" then
+        or tag == "Borrow" or tag == "Move" or tag == "AddrOf"
+        or tag == "Await" or tag == "Try" or tag == "Deref" then
         collect_strings_expr(expr.value)
         return
     end
@@ -6712,7 +7315,13 @@ collect_strings_expr = function(expr)
     end
     if tag == "Field" then
         -- Struct fields lower to C member access and never need a table key.
-        if expr.struct_access ~= true then
+        -- Builtin namespaces (`task`, `coroutine`, `string`) lower to direct
+        -- runtime calls, so their method names must not allocate strings
+        -- either -- especially in `#[no_std]`, which has no string runtime.
+        local namespace = expr.table ~= nil and expr.table.tag == "Name"
+            and (expr.table.name == "task" or expr.table.name == "coroutine"
+                or expr.table.name == "string")
+        if expr.struct_access ~= true and namespace ~= true then
             add_string(expr.field_name)
         end
         collect_strings_expr(expr.table)
@@ -6900,6 +7509,23 @@ local function format_float(value)
 end
 
 local emit_expr
+
+-- Native async tasks carry one typed result in a union.  Scalars use their
+-- natural member; strings, tables, pointers, tasks, and coroutines share
+-- `ptr`.  The helper suffix names the runtime accessor for that member.
+local function task_result_suffix(type_name)
+    if type_name == "i32" then return "i32" end
+    if type_name == "u32" then return "u32" end
+    if type_name == "i128" then return "i128" end
+    if type_name == "f32" then return "f32" end
+    if type_name == "bool" then return "bool" end
+    return "ptr"
+end
+
+local function task_value_member(type_name)
+    if type_name == "bool" then return "boolean" end
+    return task_result_suffix(type_name)
+end
 
 local function emit_value_payload(expr, value)
     local type_name = expr.ctype
@@ -8213,6 +8839,23 @@ emit_expr = function(expr)
         fail(0, 0, "internal: nil expression reached the C emitter")
     end
     local tag = expr.tag
+    if tag == "Await" then
+        if emit_async_mode then
+            fail(expr.line, expr.column,
+                "native `await` must be the whole initializer, assignment value, or return value")
+        end
+        -- Outside an async function (top level or a synchronous helper) the
+        -- executor drives the lazy task to completion inline.  Bind the
+        -- handle once: evaluating a lazy constructor twice would await a
+        -- fresh, unstarted task.
+        local target = emit_expr(expr.value)
+        local holder = fresh("await_task")
+        line("LusaTask *" .. holder .. " = " .. target .. ";")
+        line("lusa_task_drive(" .. holder .. ");")
+        local result = "lusa_task_result_" .. task_result_suffix(expr.ctype)
+            .. "(" .. holder .. ")"
+        return emit_cast_to(expr.ctype, result)
+    end
     if tag == "Try" then
         return emit_try_expr(expr)
     end
@@ -8380,12 +9023,44 @@ emit_expr = function(expr)
             return '(( ' .. condition .. ') ? (void)0 : (lusa_throw('
                 .. '"E9100", ' .. message .. '), (void)0))'
         end
+        if expr.builtin == "task_spawn" then
+            return "lusa_task_spawn(" .. emit_expr(expr.args[1]) .. ")"
+        end
+        if expr.builtin == "task_run" then
+            return "lusa_task_run()"
+        end
+        if expr.builtin == "task_is_done" then
+            return "lusa_task_done(" .. emit_expr(expr.args[1]) .. ")"
+        end
+        if expr.builtin == "task_status" then
+            return "lusa_task_status(" .. emit_expr(expr.args[1]) .. ")"
+        end
+        if expr.builtin == "task_yield_now" then
+            fail(expr.line, expr.column,
+                "`task.yield_now()` must be used as a standalone statement")
+        end
+        if expr.builtin == "task_await" then
+            local target = emit_expr(expr.args[1])
+            local holder = fresh("await_task")
+            line("LusaTask *" .. holder .. " = " .. target .. ";")
+            line("lusa_task_drive(" .. holder .. ");")
+            local result = "lusa_task_result_"
+                .. task_result_suffix(expr.ctype) .. "(" .. holder .. ")"
+            return emit_cast_to(expr.ctype, result)
+        end
         local cname = emit_function_cnames[expr.fn_name]
         if cname == nil then
             fail(expr.line, expr.column, "internal: call has no function name")
         end
-        local args = { emit_no_std and "NULL" or "lusa_current_coro" }
+        local args = {}
+        if emit_async_function_names[expr.fn_name] ~= true then
+            args[1] = emit_no_std and "NULL" or "lusa_current_coro"
+        end
         local param_types = expr.param_types or {}
+        local arg_start = 1
+        if emit_async_function_names[expr.fn_name] ~= true then
+            arg_start = 2
+        end
         local i = 1
         while i <= #expr.args do
             local arg = expr.args[i]
@@ -8398,7 +9073,8 @@ emit_expr = function(expr)
                     null_moved_source(arg, nil)
                 end
             end
-            args[#args + 1] = rendered
+            args[arg_start] = rendered
+            arg_start = arg_start + 1
             i = i + 1
         end
         return cname .. "(" .. table.concat(args, ", ") .. ")"
@@ -9554,6 +10230,195 @@ emit_stmt = function(stmt)
         "internal: unsupported statement node `" .. tostring(tag) .. "`")
 end
 
+-- ---- async statement lowering -------------------------------------------
+
+local function emit_async_store_result(type_name, value)
+    if type_name == "void" then
+        return
+    end
+    local member = task_value_member(type_name)
+    if member == "ptr" then
+        line("base->value.ptr = (void *)(" .. value .. ");")
+    else
+        line("base->value." .. member .. " = "
+            .. emit_cast_to(type_name, value) .. ";")
+    end
+end
+
+-- Emits one suspension point and returns a C expression for the awaited
+-- result.  The lazy child constructor runs only on the first pass; resuming
+-- jumps straight to the `case` label below the wait block.
+local function emit_async_await(await_expr)
+    if emit_async_for_depth > 0 then
+        fail(await_expr.line, await_expr.column,
+            "`await` is not supported inside a `for ... in` loop in the native backend; use a `while` loop")
+    end
+    emit_async_state = emit_async_state + 1
+    local state = emit_async_state
+    local child = emit_expr(clone await_expr.value)
+    line("base->awaiting = " .. child .. ";")
+    line("if (base->awaiting == NULL) {")
+    emit_indent = emit_indent + 1
+    line("base->status = 2;")
+    line('base->error = "await received a null task";')
+    line("return LUSA_TASK_FAIL;")
+    emit_indent = emit_indent - 1
+    line("}")
+    line("if (!lusa_task_done(base->awaiting)) {")
+    emit_indent = emit_indent + 1
+    line("base->state = " .. tostring(state) .. ";")
+    line("return LUSA_TASK_WAIT;")
+    emit_indent = emit_indent - 1
+    line("}")
+    line("case " .. tostring(state) .. ":")
+    line("if (lusa_task_failed(base->awaiting)) {")
+    emit_indent = emit_indent + 1
+    line("base->status = 2;")
+    line("base->error = base->awaiting->error;")
+    line("return LUSA_TASK_FAIL;")
+    emit_indent = emit_indent - 1
+    line("}")
+    local result = "lusa_task_result_" .. task_result_suffix(await_expr.ctype)
+        .. "(base->awaiting)"
+    return emit_cast_to(await_expr.ctype, result)
+end
+
+local function emit_async_local(stmt)
+    if stmt.string_result ~= nil or stmt.pcall ~= nil
+        or stmt.coroutine_resume ~= nil then
+        fail(stmt.line, stmt.column,
+            "this local initializer is not supported inside an async function")
+    end
+    local names = stmt.names
+    local types = stmt.types
+    local values = stmt.values or {}
+    local fields = stmt.async_fields or {}
+    local i = 1
+    while i <= #names do
+        local field = fields[i]
+        if field == nil then
+            fail(stmt.line, stmt.column,
+                "internal: async local `" .. tostring(names[i])
+                .. "` has no task field")
+        end
+        local entry = emit_scope_declare_named(names[i], "self->" .. field,
+            types[i], false, false)
+        local value = values[i]
+        if value == nil then
+            line(entry.cname .. " = " .. default_c(types[i]) .. ";")
+        elseif value.tag == "Await" then
+            local result = emit_async_await(value)
+            line(entry.cname .. " = " .. emit_cast_to(types[i], result) .. ";")
+        else
+            local rendered = emit_expr(clone value)
+            line(entry.cname .. " = " .. emit_cast_to(types[i], rendered)
+                .. ";")
+        end
+        i = i + 1
+    end
+end
+
+local function emit_async_assign(stmt)
+    local targets = stmt.targets
+    local values = stmt.values or {}
+    local awaits = false
+    local i = 1
+    while i <= #values do
+        if values[i] ~= nil and values[i].tag == "Await" then
+            awaits = true
+        end
+        i = i + 1
+    end
+    if not awaits then
+        -- Restore the fields read above; `emit_assign` takes ownership.
+        stmt.targets = targets
+        stmt.values = values
+        emit_assign(stmt)
+        return
+    end
+    if #targets ~= 1 or #values ~= 1 then
+        fail(stmt.line, stmt.column,
+            "an `await` assignment must have exactly one target and one value")
+    end
+    local target = targets[1]
+    if target.tag ~= "Name" then
+        fail(target.line, target.column,
+            "native `await` assignment supports a plain name target")
+    end
+    local entry = emit_value_lookup(target.name)
+    if entry == nil then
+        fail(target.line, target.column,
+            "internal: assignment target `" .. target.name
+            .. "` was not declared")
+    end
+    local result = emit_async_await(values[1])
+    local target_type = stmt.target_types[1]
+    line(entry.cname .. " = " .. emit_cast_to(target_type, result) .. ";")
+end
+
+local function emit_async_return(stmt)
+    local values = stmt.values or {}
+    if #values == 0 then
+        line("base->status = 1;")
+        line("return LUSA_TASK_DONE;")
+        return
+    end
+    local value = values[1]
+    local rendered
+    if value.tag == "Await" then
+        rendered = emit_async_await(value)
+    else
+        rendered = emit_expr(clone value)
+    end
+    emit_async_store_result(emit_return_type, rendered)
+    line("base->status = 1;")
+    line("return LUSA_TASK_DONE;")
+end
+
+local function emit_async_stmt(stmt)
+    local tag = stmt.tag
+    if tag == "Local" then
+        emit_async_local(stmt)
+        return
+    end
+    if tag == "Assign" then
+        emit_async_assign(stmt)
+        return
+    end
+    if tag == "Return" then
+        emit_async_return(stmt)
+        return
+    end
+    if tag == "ForIn" then
+        emit_async_for_depth = emit_async_for_depth + 1
+        emit_stmt(stmt)
+        emit_async_for_depth = emit_async_for_depth - 1
+        return
+    end
+    if tag == "CallStmt" then
+        local value = stmt.value
+        if value ~= nil and value.tag == "Await" then
+            local result = emit_async_await(value)
+            line("(void)(" .. result .. ");")
+            return
+        end
+        if value ~= nil and value.builtin == "task_yield_now" then
+            if emit_async_for_depth > 0 then
+                fail(stmt.line, stmt.column,
+                    "`task.yield_now()` is not supported inside a `for ... in` loop in the native backend; use a `while` loop")
+            end
+            emit_async_state = emit_async_state + 1
+            local state = emit_async_state
+            line("base->state = " .. tostring(state) .. ";")
+            line("return LUSA_TASK_YIELD;")
+            line("case " .. tostring(state) .. ": ;")
+            return
+        end
+        stmt.value = value
+    end
+    emit_stmt(stmt)
+end
+
 emit_block_statements = function(body)
     if body == nil then
         fail(0, 0, "internal: nil statement block reached the C emitter")
@@ -9563,7 +10428,11 @@ emit_block_statements = function(body)
     while i <= count do
         local stmt = body[i]
         local tag = stmt.tag
-        emit_stmt(stmt)
+        if emit_async_mode then
+            emit_async_stmt(stmt)
+        else
+            emit_stmt(stmt)
+        end
         if tag ~= "Return" and tag ~= "Break"
             and tag ~= "Function" and tag ~= "Struct" and tag ~= "NoStd" then
             emit_error_check()
@@ -9574,6 +10443,48 @@ emit_block_statements = function(body)
 end
 
 -- ---- program assembly ----------------------------------------------------
+
+local async_pending_locals = {}
+
+local function collect_async_locals(body)
+    if body == nil then
+        return body
+    end
+    local i = 1
+    while i <= #body do
+        local stmt = body[i]
+        local tag = stmt.tag
+        if tag == "Local" then
+            local fields = {}
+            local j = 1
+            while j <= #stmt.names do
+                local field = fresh("v")
+                fields[j] = field
+                async_pending_locals[#async_pending_locals + 1] = {
+                    cname = field,
+                    type = stmt.types[j]
+                }
+                j = j + 1
+            end
+            stmt.async_fields = fields
+        elseif tag == "If" then
+            local j = 1
+            while j <= #stmt.branches do
+                local branch = stmt.branches[j]
+                branch.body = collect_async_locals(branch.body)
+                stmt.branches[j] = branch
+                j = j + 1
+            end
+            stmt.else_body = collect_async_locals(stmt.else_body)
+        elseif tag == "While" or tag == "Repeat" or tag == "Do"
+            or tag == "Unsafe" or tag == "ForIn" then
+            stmt.body = collect_async_locals(stmt.body)
+        end
+        body[i] = stmt
+        i = i + 1
+    end
+    return body
+end
 
 local function setup_symbols(ast)
     local i = 1
@@ -9601,6 +10512,16 @@ local function setup_symbols(ast)
             j = j + 1
         end
         emit_function_cnames[name] = cname
+        if signature.is_async == true then
+            emit_async_has = true
+            emit_async_function_names[name] = true
+            signature.async_struct = "LusaTaskState_" .. cname
+            async_pending_locals = {}
+            local node = signature.node
+            node.body = collect_async_locals(node.body)
+            signature.node = node
+            signature.async_locals = async_pending_locals
+        end
         emit_functions[#emit_functions + 1] = signature
         i = i + 1
     end
@@ -9740,11 +10661,45 @@ local function emit_globals_declarations()
     end
 end
 
+local function emit_async_task_structs()
+    local i = 1
+    while i <= #emit_functions do
+        local signature = clone emit_functions[i]
+        if signature.is_async == true then
+            local struct_name = signature.async_struct
+            line("typedef struct " .. struct_name .. " {")
+            emit_indent = emit_indent + 1
+            line("LusaTask base;")
+            local j = 1
+            while j <= #signature.params do
+                line(c_type(signature.params[j].type) .. " "
+                    .. signature.param_cnames[j] .. ";")
+                j = j + 1
+            end
+            local locals = signature.async_locals or {}
+            j = 1
+            while j <= #locals do
+                line(c_type(locals[j].type) .. " " .. locals[j].cname .. ";")
+                j = j + 1
+            end
+            emit_indent = emit_indent - 1
+            line("} " .. struct_name .. ";")
+            line("static int lusa_task_step_" .. signature.cname
+                .. "(LusaTask *base);")
+            line("")
+        end
+        i = i + 1
+    end
+end
+
 local function emit_function_prototypes()
     local i = 1
     while i <= #emit_functions do
         local signature = clone emit_functions[i]
-        local params = { "LusaCoro *lusa_co" }
+        local params = {}
+        if signature.is_async ~= true then
+            params[1] = "LusaCoro *lusa_co"
+        end
         local j = 1
         while j <= #signature.params do
             params[#params + 1] = c_type(signature.params[j].type) .. " "
@@ -9752,7 +10707,11 @@ local function emit_function_prototypes()
             j = j + 1
         end
         local param_text = table.concat(params, ", ")
-        line("static " .. c_type(signature.ret) .. " " .. signature.cname
+        local ret = c_type(signature.ret)
+        if signature.is_async == true then
+            ret = "LusaTask *"
+        end
+        line("static " .. ret .. " " .. signature.cname
             .. "(" .. param_text .. ");")
         i = i + 1
     end
@@ -9827,6 +10786,82 @@ local function emit_function_definition(signature)
     emit_return_type = previous_return
     emit_is_main = previous_main
     emit_loop_stack = previous_loops
+end
+
+local function emit_async_function_definition(signature)
+    local struct_name = signature.async_struct
+    local params = {}
+    local j = 1
+    while j <= #signature.params do
+        params[#params + 1] = c_type(signature.params[j].type) .. " "
+            .. signature.param_cnames[j]
+        j = j + 1
+    end
+    local param_text = table.concat(params, ", ")
+    if param_text == "" then
+        param_text = "void"
+    end
+
+    line("static LusaTask *" .. signature.cname .. "(" .. param_text .. ") {")
+    emit_indent = emit_indent + 1
+    line(struct_name .. " *self = (" .. struct_name
+        .. " *)lusa_task_new((uint32_t)sizeof(" .. struct_name
+        .. "), lusa_task_step_" .. signature.cname .. ");")
+    line("if (self == NULL) return NULL;")
+    j = 1
+    while j <= #signature.params do
+        line("self->" .. signature.param_cnames[j] .. " = "
+            .. signature.param_cnames[j] .. ";")
+        j = j + 1
+    end
+    line("return &self->base;")
+    emit_indent = emit_indent - 1
+    line("}")
+    line("")
+
+    line("static int lusa_task_step_" .. signature.cname
+        .. "(LusaTask *base) {")
+    emit_indent = emit_indent + 1
+    line(struct_name .. " *self = (" .. struct_name .. " *)base;")
+    line("(void)self;")
+    line("switch (base->state) {")
+    line("case 0:")
+    emit_indent = emit_indent + 1
+
+    local previous_return = emit_return_type
+    local previous_main = emit_is_main
+    local previous_loops = emit_loop_stack
+    local previous_async = emit_async_mode
+    emit_return_type = signature.async_ret or "void"
+    emit_is_main = false
+    emit_loop_stack = {}
+    emit_async_mode = true
+    emit_async_state = 0
+    emit_async_for_depth = 0
+
+    emit_scope_enter()
+    j = 1
+    while j <= #signature.params do
+        local param = signature.params[j]
+        emit_scope_declare_named(param.name,
+            "self->" .. signature.param_cnames[j], param.type, false, true)
+        j = j + 1
+    end
+    emit_block_statements(signature.node.body)
+    emit_leave_scope()
+
+    emit_indent = emit_indent - 1
+    line("}")
+    line("base->status = 1;")
+    line("return LUSA_TASK_DONE;")
+    emit_indent = emit_indent - 1
+    line("}")
+    line("")
+
+    emit_return_type = previous_return
+    emit_is_main = previous_main
+    emit_loop_stack = previous_loops
+    emit_async_mode = previous_async
 end
 
 local function emit_main(ast)
@@ -9950,10 +10985,22 @@ local function emit_c_impl(ast)
         put(HEAP_RUNTIME[i])
         i = i + 1
     end
+    if emit_async_has then
+        local task_runtime = TASK_RUNTIME
+        if ast.no_std then
+            task_runtime = NO_STD_TASK_RUNTIME
+        end
+        i = 1
+        while i <= #task_runtime do
+            put(task_runtime[i])
+            i = i + 1
+        end
+    end
     put("")
     emit_static_strings()
     emit_static_ints()
     emit_struct_declarations(borrow ast)
+    emit_async_task_structs()
     emit_globals_declarations()
     emit_function_prototypes()
     emit_allocator_dispatch(borrow ast)
@@ -9963,7 +11010,11 @@ local function emit_c_impl(ast)
     while i <= #emit_functions do
         -- Pass a clone: function arguments move, and the entry wrapper later
         -- needs the signature table to find the entry name.
-        emit_function_definition(clone emit_functions[i])
+        if emit_functions[i].is_async == true then
+            emit_async_function_definition(clone emit_functions[i])
+        else
+            emit_function_definition(clone emit_functions[i])
+        end
         i = i + 1
     end
     if ast.has_entry then

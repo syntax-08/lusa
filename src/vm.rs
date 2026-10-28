@@ -1092,6 +1092,14 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             interp.vm.last_ret = 1;
             StepOutcome::Continue
         }
+        Instr::Await => {
+            let value = pop1(interp);
+            let result = crate::task::await_value(interp, &value, current_span(interp))?;
+            interp.vm.stack.push(result);
+            interp.vm.last_ret = 1;
+            StepOutcome::Continue
+        }
+        Instr::YieldNow => yield_values(interp, 0, 0, true)?,
         Instr::Try => {
             let value = pop1(interp);
             let Some((kind, tag, payload)) = value.base_value().sum_parts() else {
@@ -1637,6 +1645,17 @@ fn call_plain(
     if n_takes != 0 {
         finalize_args(interp, callee.is_builtin(), n_takes)?;
     }
+    // Async functions never run inline: the call returns a lazy task handle.
+    let callee_value = interp.vm.stack.get(func_pos).cloned().unwrap_or(Value::Nil);
+    if crate::task::is_async_value(&callee_value) {
+        let start = (func_pos + 1).min(interp.vm.stack.len());
+        let args: Vec<Value> = interp.vm.stack.drain(start..).collect();
+        interp.vm.stack.truncate(func_pos.min(interp.vm.stack.len()));
+        let task = crate::task::spawn_value(interp, &callee_value, args, span)?;
+        interp.vm.stack.push(Value::Task(task));
+        interp.vm.last_ret = 1;
+        return Ok(StepOutcome::Continue);
+    }
     match callee {
         Callee::Vm(compiled, upvals) => {
             // Push the callee frame and let the interpreter loop step it. The
@@ -1784,6 +1803,15 @@ fn call_method(
     let callee = classify(&f);
     if n_takes != 0 {
         finalize_args(interp, callee.is_builtin(), n_takes)?;
+    }
+    if crate::task::is_async_value(&f) {
+        let start = obj_pos.min(interp.vm.stack.len());
+        let args: Vec<Value> = interp.vm.stack.drain(start..).collect();
+        interp.vm.stack.truncate(obj_pos.min(interp.vm.stack.len()));
+        let task = crate::task::spawn_value(interp, &f, args, span)?;
+        interp.vm.stack.push(Value::Task(task));
+        interp.vm.last_ret = 1;
+        return Ok(StepOutcome::Continue);
     }
     match callee {
         Callee::Vm(compiled, upvals) => {

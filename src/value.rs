@@ -128,6 +128,8 @@ pub enum Value {
     Iter(Rc<RefCell<IterState>>),
     /// cooperative coroutine: a suspended bytecode VM plus its entry data
     Coroutine(Rc<RefCell<CoroutineObj>>),
+    /// cooperative async task handle (module 22)
+    Task(Rc<RefCell<TaskObj>>),
     /// result of `borrow x` — an alias to a heap value
     Alias(Box<AliasBox>),
 }
@@ -202,6 +204,30 @@ impl CoroutineObj {
     }
 }
 
+/// Lifecycle of an async task.  A task wraps a private coroutine VM; `await`
+/// polls it until it settles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskState {
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
+/// A cooperative async task handle.  It owns no OS thread: stepping the task
+/// resumes its private VM until the next `task.yield_now` or completion.
+pub struct TaskObj {
+    pub id: u64,
+    pub state: TaskState,
+    pub coroutine: Option<Rc<RefCell<CoroutineObj>>>,
+    pub result: Vec<Value>,
+    pub error: Option<String>,
+    pub started: bool,
+    pub queued: bool,
+    /// call arguments supplied on the first resume
+    pub args: Vec<Value>,
+}
+
 pub struct AliasBox {
     pub base: Value,
     pub tag: u64,
@@ -256,6 +282,7 @@ impl Clone for Value {
             Value::Func(f) => Value::Func(Rc::clone(f)),
             Value::Iter(i) => Value::Iter(Rc::clone(i)),
             Value::Coroutine(c) => Value::Coroutine(Rc::clone(c)),
+            Value::Task(t) => Value::Task(Rc::clone(t)),
         }
     }
 }
@@ -290,6 +317,7 @@ impl Value {
             Value::Func(_) => "function",
             Value::Iter(_) => "iterator",
             Value::Coroutine(_) => "coroutine",
+            Value::Task(_) => "task",
             Value::Alias(a) => a.base.type_name(),
         }
     }
@@ -356,6 +384,7 @@ impl Value {
             Value::Func(f) => format!("function: 0x{:x}", f.vid),
             Value::Iter(_) => "iterator".into(),
             Value::Coroutine(c) => format!("coroutine: 0x{:x}", c.borrow().id),
+            Value::Task(t) => format!("task: 0x{:x}", t.borrow().id),
             Value::Alias(_) => self.type_name().into(),
         }
     }

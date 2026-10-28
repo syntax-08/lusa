@@ -1,0 +1,45 @@
+-- Module 22: cooperative async functions, `await`, and the task executor.
+--
+--   lusalang run examples/async_cooperative.lusa
+--   lusalang run examples/async_cooperative.lusa --vm
+--   lusalang run examples/async_cooperative.lusa --native
+--
+-- Calling an async function creates a lazy task. `await` drives that task to
+-- completion, `task.yield_now()` returns to the executor, and `task.run()`
+-- polls every queued task in rounds until the queue is empty. Everything is
+-- cooperative and runs on one thread.
+
+async function countdown(ticks: i32): i32
+    local elapsed: i32 = 0
+    while elapsed < ticks do
+        task.yield_now()
+        elapsed = elapsed + 1
+    end
+    return elapsed * 10
+end
+
+-- A parent task awaits child tasks; the parent stays pending until each child
+-- finishes, even though every child yields at least once.
+async function pipeline(): i32
+    local first: i32 = await countdown(2)
+    local second: i32 = await countdown(1)
+    return first + second
+end
+
+local pipeline_task = pipeline()
+print("before await:", task.status(pipeline_task), task.is_done(pipeline_task))
+local pipeline_result: i32 = await pipeline_task
+print("pipeline result:", pipeline_result)
+print("after await:", task.status(pipeline_task), task.is_done(pipeline_task))
+
+-- `task.spawn` queues lazy tasks; `task.run` is the cooperative executor.
+local a = task.spawn(countdown(2))
+local b = task.spawn(countdown(1))
+local polls: i32 = task.run()
+print("executor polls:", polls)
+print("spawned results:", await a, await b)
+print("executor idle:", task.run())
+
+-- `.await` is the postfix spelling and evaluates to the task result.
+local postfix: i32 = countdown(1).await
+print("postfix await:", postfix)

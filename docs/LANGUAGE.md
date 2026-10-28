@@ -306,6 +306,73 @@ fails. `coroutine.isyieldable()` is `true` while executing inside a coroutine.
 Captured upvalues are shared with their closures; each coroutine has its own
 operand stack and local variables.
 
+### Tasks - `async function`, `await`, and `task`
+
+Async functions are declared with `async function name(...) ... end` or the
+compact `async fn name(...) ... end` alias. Calling one does **not** run the
+body; it creates a lazy `task<T>` handle:
+
+```lusa
+async function add(a: i32, b: i32): i32
+    task.yield_now()
+    return a + b
+end
+
+local t = add(2, 3)
+print(task.status(t))      -- pending
+print(task.is_done(t))     -- false
+print(await t)             -- 5
+print(task.is_done(t))     -- true
+```
+
+`await expr` drives the task until it settles and evaluates to its first
+result. `.await` and `::await` are postfix aliases, and `task.await(t)` is the
+method form. Awaiting a completed task returns the stored result again without
+re-running the body:
+
+```lusa
+print(add(7, 8).await)     -- 15
+print(add(9, 1)::await)    -- 10
+print(task.await(add(1, 2))) -- 3
+```
+
+Inside an async function, `await` suspends the parent cooperatively while the
+child task runs. A failed child marks the parent failed and propagates the
+error:
+
+```lusa
+async function parent(): i32
+    local value: i32 = await add(20, 22)
+    return value
+end
+
+print(await parent()) -- 42
+```
+
+The executor surface is:
+
+| call | behavior |
+|---|---|
+| `task.spawn(t)` | enqueue a task (or a plain function wrapped as one) and return it |
+| `task.run()` | drain the queue in rounds; returns how many distinct tasks received their first poll |
+| `task.yield_now()` | suspend the current task at an instruction boundary |
+| `task.is_done(t)` | true after success or failure |
+| `task.status(t)` | `pending`, `running`, `done`, or `failed` (hosted only) |
+| `task.await(t)` | drive to completion and return the result |
+
+```lusa
+local a = task.spawn(add(1, 2))
+local b = task.spawn(add(3, 4))
+print(task.run())       -- 2
+print(await a, await b) -- 3 7
+```
+
+Tasks are cooperative and single-threaded: they never create OS threads, and
+`task.yield_now()` is the only preemption point. Calling an async function
+creates a fresh task whose arguments are captured at the call site. A task
+cannot await itself (`E9999`). Awaiting a non-task value is `E2005`, and
+`task.yield_now()` outside an async function is `E0312`/`E9999`.
+
 `string`: `len upper lower sub rep reverse char byte find match gmatch gsub
 format`. `find`, `match`, `gmatch`, and `gsub` use the Lua-style pattern
 language described below. `gsub` returns `(new text, count)` and keeps its
@@ -424,7 +491,7 @@ Codes `E{category}{n}`, like rustc:
 | E0308  | static   | C11 backend: mismatched types (assignment, return, call, condition) |
 | E0309  | static   | C11 backend: struct/table has no such field |
 | E0311  | static   | C11 backend: wrong argument/initializer count |
-| E0312  | static   | C11 backend: unsupported construct (struct field type, whole-array or `Vec<T>`-by-value call/return, invalid `&` place, non-scalar volatile element, or invalid inline-assembly text) |
+| E0312  | static   | C11 backend: unsupported construct (struct field type, whole-array or `Vec<T>`-by-value call/return, invalid `&` place, non-scalar volatile element, invalid inline-assembly text, invalid async result/local, or `task.status` in `#[no_std]`) |
 | E0313  | static   | C11 backend: zero or one return value only; void/value return mismatch |
 | E0316  | unsafe   | C11 backend: raw pointer, volatile, or inline-assembly intrinsic used outside `unsafe` |
 | E0317  | static   | C11 backend: `pcall`, `coroutine.resume`, or `string.gmatch` used outside its required local/loop form |
@@ -435,7 +502,7 @@ Codes `E{category}{n}`, like rustc:
 | E0322  | unsafe   | write through a `*const` pointer |
 | E0323  | static   | C11 backend: statically evaluable malformed string pattern or replacement |
 | E0324  | static   | C11 backend: replacement capture or `gmatch` binding exceeds the pattern's captures |
-| E0325  | static   | C11 backend: invalid `#[no_std]`/`#[entry]`/`#[global_allocator]`/`#[link_section]` placement, duplicate entry/allocator/`#[no_std]`, invalid allocator signature, sectioned existing global, or incomplete promoted-local initialization |
+| E0325  | static   | C11 backend: invalid `#[no_std]`/`#[entry]`/`#[global_allocator]`/`#[link_section]` placement, duplicate entry/allocator/`#[no_std]`, invalid allocator signature, async entry/allocator, sectioned existing global, or incomplete promoted-local initialization |
 | E9000  | runtime  | `error(msg)` |
 | E9100  | runtime  | `assert(false, msg)` |
 | E9999  | runtime  | internal error (umbrella; includes stack overflow for calls > 200 — catchable with `pcall`) |
@@ -1448,7 +1515,75 @@ and loops, struct/`Vec`/`Box`/nested payloads, sum parameters and fields,
 `match` binding and returns, freestanding scalar sums, typed diagnostics,
 runtime wrong-variant errors, and native + dynamic parity.
 
-### 9.15 Native subset limits
+### 9.15 Async tasks and stackless coroutines (Module 22)
+
+Both parsers accept `async function` and the compact `async fn` alias. Inside
+the checker an async signature returns `task<T>` (or `task<void>`), and every
+call site sees that handle type. The C11 backend lowers it without threads:
+
+- A constructor `static LusaTask *f(...)` allocates a
+  `LusaTaskState_f` struct through `lusa_task_new`, copies the arguments into
+  the hoisted parameter fields, and returns `&self->base` **without running the
+  body**.
+- Every local in the async body is hoisted into the task struct. A generated
+  `lusa_task_step_f(LusaTask *base)` enters through `switch (base->state)` and
+  jumps back to saved `case N:` labels on resume.
+- `await e` evaluates the child constructor once, stores it in
+  `base->awaiting`, and returns `LUSA_TASK_WAIT` until the child reports done.
+  The resumed case reads the typed result through `lusa_task_result_*`, and a
+  failed child copies its error and returns `LUSA_TASK_FAIL`.
+- `task.yield_now()` stores the next state and returns `LUSA_TASK_YIELD`.
+  `return value` fills the `base->value` union and returns `LUSA_TASK_DONE`.
+- `task.spawn(t)` enqueues a task, `task.run()` drains the queue in rounds, and
+  `task.is_done(t)`/`task.status(t)` query the state. `task.status` is omitted
+  in `#[no_std]` because it returns a string.
+- `task.await(t)` and top-level/synchronous `await` use `lusa_task_drive`,
+  which runs a task to completion inline. Parent tasks awaiting children are
+  driven cooperatively, so no call blocks an OS thread.
+
+Statement-level await forms supported by the emitter are:
+
+```lusa
+local value: i32 = await child()   -- Local initializer
+value = await child()              -- assignment to a name
+return await child()               -- return value
+await child()                      -- standalone call statement
+```
+
+Repeated await in `while` loops works; the state machine keeps all hoisted
+locals across suspensions. Async functions may return scalars, `string`,
+tables, and pointers (the result union stores them in `ptr`). The current
+limits are:
+
+- async methods, async `#[entry]` functions, and async
+  `#[global_allocator]` functions report `E0312`/`E0325`;
+- struct-by-value async results report `E0312`;
+- fixed-array locals inside async functions report `E0312`;
+- `await` and `task.yield_now()` inside `for ... in` loops report `E0312`
+  (use `while`), because the native iterator state is a stack temporary;
+- the state machine does not emit drops for hoisted owned locals or parameters
+  yet, so async bodies should prefer scalars and pointers for long-lived work.
+
+In hosted builds the task runtime uses the module 20 heap contract
+(`lusa_heap_alloc`/`lusa_heap_dealloc`) and the string helpers.
+`#[no_std]` builds instead include `LUSA_TASK_ARENA_BYTES` (16 KiB by default),
+a static bump arena, and the same cooperative queue. No `malloc`, libc,
+`pthread`, fibers, or `CreateThread` calls are emitted.
+
+```sh
+lusalang run examples/async_cooperative.lusa
+lusalang run examples/async_cooperative.lusa --vm
+lusalang run examples/async_cooperative.lusa --native
+lusalang build examples/async_cooperative.lusa --emit-c
+```
+
+`tests/module22.rs` checks the generated `LusaTaskState_*` structs and
+`switch (base->state)` step functions, absence of thread primitives, lazy
+execution, awaited children, `.await`/`::await`/`task.await`, `task.run` polling
+counts, freestanding arena emission, typed diagnostics, and native + dynamic
+parity.
+
+### 9.16 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 table literals, fixed-size `[T; N]` arrays and array literals, nested keyed
@@ -1470,7 +1605,9 @@ dereferences inside `unsafe`, the raw intrinsics above (`unsafe_ptr_cast`,
 element assignment) and `Box<T>` (implicit and `Box(value)` construction,
 safe `*b` reads/writes, `nil` clearing) with their RAII drop helpers,
 `Result<T,E>`/`Option<T>` (`Ok`/`Err`/`Some`/`None`, combinators, constructor
-`match` arms, and `?`) with their RAII helpers, the
+`match` arms, and `?`) with their RAII helpers, `async function`/`async fn`
+with lazy `task<T>` handles, `await`/`.await`/`::await`, and the
+`task.spawn`/`run`/`yield_now`/`is_done`/`status` executor surface, the
 string-pattern surface in
 section 9.7, and the restricted
 `coroutine.create/resume/yield/status/close/isyieldable` surface described in

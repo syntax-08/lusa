@@ -15,6 +15,7 @@ pub mod lsp;
 pub mod parser;
 pub mod pattern;
 pub mod scope;
+pub mod task;
 pub mod tokens;
 pub mod update;
 pub mod value;

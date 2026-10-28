@@ -334,13 +334,14 @@ impl Parser {
                 .help("imports are resolved before parsing; check the path and that the driver received a base directory"));
             }
             TK::Function => self.parse_func_st()?,
+            TK::Async => self.parse_async_func_st()?,
             TK::Break => {
                 self.bump();
                 St { kind: StKind::Break, span: tk.span }
             }
             TK::Borrow | TK::Clone | TK::Move | TK::LParen | TK::Num(_) | TK::Int(_) | TK::Str(_)
             | TK::Nil | TK::True | TK::False | TK::Minus | TK::Not | TK::Len
-            | TK::DotDotDot | TK::LBrace | TK::LBracket | TK::Amp => {
+            | TK::DotDotDot | TK::LBrace | TK::LBracket | TK::Amp | TK::Await => {
                 let e = self.parse_expr()?;
                 St { kind: StKind::ExprSt(e), span: tk.span }
             }
@@ -400,7 +401,7 @@ impl Parser {
         }
         // otherwise it must be a call/method expression statement
         match &first.kind {
-            ExprKind::Call { .. } | ExprKind::Method { .. } => {}
+            ExprKind::Call { .. } | ExprKind::Method { .. } | ExprKind::Await { .. } => {}
             _ => {
                 return Err(LusaError::new(
                     E_PARSE,
@@ -467,6 +468,11 @@ impl Parser {
             let inner = self.parse_type_annotation()?;
             self.expect(TK::Gt, "`>` to close the `Option` type")?;
             return Ok(format!("option<{inner}>"));
+        }
+        if matches!(name.as_str(), "Task" | "task") && self.eat(TK::Lt) {
+            let inner = self.parse_type_annotation()?;
+            self.expect(TK::Gt, "`>` to close the `Task` type")?;
+            return Ok(format!("task<{inner}>"));
         }
         Ok(name)
     }
@@ -722,7 +728,7 @@ impl Parser {
             return self.parse_struct_st(attrs.packed, attrs.align);
         }
 
-        if self.at(TK::Function) {
+        if self.at(TK::Function) || self.at(TK::Async) {
             if attrs.packed || attrs.align.is_some() {
                 return Err(LusaError::new(
                     E_PARSE,
@@ -730,7 +736,11 @@ impl Parser {
                     "`#[packed]` and `#[repr(align(N))]` are only supported on structs",
                 ));
             }
-            let mut st = self.parse_func_st()?;
+            let mut st = if self.at(TK::Async) {
+                self.parse_async_func_st()?
+            } else {
+                self.parse_func_st()?
+            };
             if let StKind::FuncSt {
                 entry,
                 global_allocator,
@@ -1175,6 +1185,33 @@ impl Parser {
 
     /// `function name(.name)*(m) params body end`
     fn parse_func_st(&mut self) -> LResult<St> {
+        self.parse_func_st_inner(false)
+    }
+
+    /// `async function name(...) ... end`.  `async fn name(...)` is accepted
+    /// as a compact alias and produces the same AST.
+    fn parse_async_func_st(&mut self) -> LResult<St> {
+        let async_kw = self.bump();
+        let is_fn_alias = matches!(&self.peek().kind, TK::Name(n) if n == "fn");
+        if !self.at(TK::Function) && !is_fn_alias {
+            return Err(LusaError::new(
+                E_PARSE,
+                Some(self.peek().span),
+                format!(
+                    "expected `function` after `async`, found {}",
+                    self.peek().desc()
+                ),
+            )
+            .help("write `async function name(...) ... end`"));
+        }
+        // The shared function parser consumes one leading token before the
+        // name, so `fn` plays the same role as the `function` keyword here.
+        let mut st = self.parse_func_st_inner(true)?;
+        st.span = merge(async_kw.span, st.span);
+        Ok(st)
+    }
+
+    fn parse_func_st_inner(&mut self, is_async: bool) -> LResult<St> {
         let kw = self.bump();
         let (n0, sp0) = self.expect_name()?;
         let mut target = expr_var(n0, sp0);
@@ -1185,7 +1222,7 @@ impl Parser {
                 let (m, _) = self.expect_member_name()?;
                 method_name = Some(m);
                 break;
-            } else if self.at(TK::Dot) {
+            } else if self.at(TK::Dot) || self.at(TK::ColonColon) {
                 self.bump();
                 let (n, nsp) = self.expect_member_name()?;
                 target = expr_field(target, n, merge(sp0, nsp));
@@ -1197,7 +1234,7 @@ impl Parser {
         if method_name.is_some() {
             params.push("self".to_string());
         }
-        let mut func = self.parse_funclit_from(params)?;
+        let mut func = self.parse_funclit_from(params, is_async)?;
         if let Some(m) = method_name {
             target = expr_field(target, m, sp0);
         }
@@ -1210,10 +1247,10 @@ impl Parser {
 
     /// parses `(params) body end` â€” the `function` keyword and optional name were consumed.
     fn parse_funclit(&mut self) -> LResult<FuncLit> {
-        self.parse_funclit_from(Vec::new())
+        self.parse_funclit_from(Vec::new(), false)
     }
 
-    fn parse_funclit_from(&mut self, mut params: Vec<String>) -> LResult<FuncLit> {
+    fn parse_funclit_from(&mut self, mut params: Vec<String>, is_async: bool) -> LResult<FuncLit> {
         self.expect(TK::LParen, "`(` to open the parameter list")?;
         let mut has_vararg = false;
         if !self.at(TK::RParen) {
@@ -1239,7 +1276,7 @@ impl Parser {
         }
         let body = self.parse_block()?;
         let end = self.expect(TK::End, "`end` to close the `function`")?;
-        Ok(FuncLit { params, has_vararg, body, span_body: end.span })
+        Ok(FuncLit { params, has_vararg, is_async, body, span_body: end.span })
     }
 
     // ===== expressions =====
@@ -1325,6 +1362,19 @@ impl Parser {
     fn parse_prefix(&mut self) -> LResult<Expr> {
         let tk = self.peek().clone();
         match tk.kind {
+            TK::Await => {
+                self.bump();
+                // `await` binds tighter than binary operators; `.await` is the
+                // postfix spelling and is handled in the suffix loop.
+                let e = self.subexpr(PREC_UNARY)?;
+                let span = merge(tk.span, e.span);
+                let mut ex = Expr {
+                    kind: ExprKind::Await { value: Box::new(e) },
+                    span,
+                };
+                ex = self.parse_suffixes_applicable(ex)?;
+                Ok(ex)
+            }
             TK::Not
             | TK::Minus
             | TK::Len
@@ -1364,8 +1414,21 @@ impl Parser {
         loop {
             let t = self.peek().clone();
             match t.kind {
-                TK::Dot => {
+                TK::Dot | TK::ColonColon => {
                     self.bump();
+                    if self.at(TK::Await)
+                        && self.peek_at(1).kind != TK::LParen
+                    {
+                        // Postfix `task.await` / `task::await`.  The call form
+                        // `task.await(t)` keeps `await` as a member name.
+                        let tok = self.bump();
+                        let span = merge(e.span, tok.span);
+                        e = Expr {
+                            kind: ExprKind::Await { value: Box::new(e) },
+                            span,
+                        };
+                        continue;
+                    }
                     let (n, nsp) = self.expect_member_name()?;
                     let span = merge(e.span, nsp);
                     e = expr_field(e, n, span);
@@ -1578,6 +1641,24 @@ impl Parser {
             }
             TK::Function => {
                 let f = self.parse_funclit()?;
+                ExprKind::Func(f)
+            }
+            TK::Async => {
+                let is_fn_alias =
+                    matches!(&self.peek().kind, TK::Name(n) if n == "fn");
+                if !self.at(TK::Function) && !is_fn_alias {
+                    return Err(LusaError::new(
+                        E_PARSE,
+                        Some(self.peek().span),
+                        format!(
+                            "expected `function` after `async`, found {}",
+                            self.peek().desc()
+                        ),
+                    )
+                    .help("write `async function(...) ... end`"));
+                }
+                self.bump();
+                let f = self.parse_funclit_from(Vec::new(), true)?;
                 ExprKind::Func(f)
             }
             other => {

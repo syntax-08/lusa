@@ -20,6 +20,11 @@ type BF = Box<dyn Fn(&mut Interp, Vec<Value>, Span) -> LResult<Vec<Value>>>;
 
 static NEXT_COROUTINE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Allocates a coroutine/task VM id.
+pub fn next_id() -> u64 {
+    NEXT_COROUTINE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 fn one(v: Value) -> LResult<Vec<Value>> {
     Ok(vec![v])
 }
@@ -133,6 +138,59 @@ fn b_create(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>>
             E_CALL,
             Some(span),
             "builtin functions cannot be used as coroutine entries".to_string(),
+        )),
+    }
+}
+
+/// Builds a coroutine object from a function value.  Async tasks reuse this
+/// machinery so a suspended coroutine VM becomes a suspended task.
+pub fn object_from_function(
+    i: &mut Interp,
+    callee: &Value,
+    span: Span,
+) -> LResult<Rc<RefCell<CoroutineObj>>> {
+    let func = match callee.base_value() {
+        Value::Func(f) => f.clone(),
+        other => {
+            return Err(LusaError::new(
+                E_CALL,
+                Some(span),
+                format!(
+                    "expected a function for a task, got {} ({})",
+                    other.type_name(),
+                    other.fmt_value()
+                ),
+            ))
+        }
+    };
+    match &func.body {
+        FuncBody::Vm(compiled, upvals) => Ok(Rc::new(RefCell::new(CoroutineObj::new(
+            NEXT_COROUTINE_ID.fetch_add(1, Ordering::Relaxed),
+            Some((compiled.clone(), upvals.clone())),
+            Some(upvals.clone()),
+            Vec::new(),
+        )))),
+        FuncBody::Lusa(lit) => {
+            let structs: std::collections::HashMap<String, Vec<(String, String)>> = i
+                .struct_defs
+                .iter()
+                .map(|(name, def)| (name.clone(), def.fields.clone()))
+                .collect();
+            let runtime =
+                crate::compiler::compile_runtime_function(lit, &func.env, &structs, None)?;
+            let upvals = runtime.upvals.clone();
+            let captures = runtime.captures.clone();
+            Ok(Rc::new(RefCell::new(CoroutineObj::new(
+                NEXT_COROUTINE_ID.fetch_add(1, Ordering::Relaxed),
+                Some((runtime.compiled, upvals.clone())),
+                Some(upvals),
+                captures,
+            ))))
+        }
+        FuncBody::Builtin(_) => Err(LusaError::new(
+            E_CALL,
+            Some(span),
+            "builtin functions cannot be used as async task entries".to_string(),
         )),
     }
 }

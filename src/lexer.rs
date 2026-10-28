@@ -14,6 +14,8 @@ pub fn lex(src: &str) -> LResult<Vec<Token>> {
 const KEYWORDS: &[(&str, TokenKind)] = &[
     ("local", TokenKind::Local),
     ("function", TokenKind::Function),
+    ("async", TokenKind::Async),
+    ("await", TokenKind::Await),
     ("end", TokenKind::End),
     ("if", TokenKind::If),
     ("then", TokenKind::Then),
@@ -271,7 +273,14 @@ impl Lexer {
             ']' => TokenKind::RBracket,
             ',' => TokenKind::Comma,
             ';' => TokenKind::Semi,
-            ':' => TokenKind::Colon,
+            ':' => {
+                if self.peek() == ':' {
+                    self.pos += 1;
+                    TokenKind::ColonColon
+                } else {
+                    TokenKind::Colon
+                }
+            }
             '"' | '\'' => return self.scan_string(c),
             other => {
                 return Err(self.err_char(&format!(
