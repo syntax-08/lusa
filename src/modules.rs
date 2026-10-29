@@ -15,7 +15,8 @@ use crate::error::{LResult, LusaError, Span, E_MODULE, E_PARSE};
 use crate::lexer;
 use crate::tokens::{Token, TokenKind as TK};
 
-/// Resolves namespaced modules in `src`.
+/// Resolves namespaced modules in `src` for the host (`lusa::hal` uses the
+/// host simulation drivers).
 ///
 /// `base` is the directory used for top-level `mod name;` lookups.  When the
 /// source came from a file, `root_file` lets the resolver reject recursive
@@ -25,37 +26,194 @@ pub fn expand_modules(
     base: Option<&Path>,
     root_file: Option<&Path>,
 ) -> LResult<String> {
-    let mut resolver = Resolver::new();
-    let base_dir = match base {
-        Some(path) => path.to_path_buf(),
-        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    };
-    let source = Rc::new(SourceText::new(src));
+    expand_modules_for(src, base, root_file, &crate::targets::HOST)
+}
+
+/// Resolves namespaced modules for `target`.  A program that mentions
+/// `lusa::` receives the target's `lusa::hal` driver crate (Module 27),
+/// spliced onto its first line so the program's line numbers do not move.
+pub fn expand_modules_for(
+    src: &str,
+    base: Option<&Path>,
+    root_file: Option<&Path>,
+    target: &crate::targets::TargetSpec,
+) -> LResult<String> {
     let tokens = lexer::lex(src)?;
-    let root = resolver.collect_module(
-        Vec::new(),
-        None,
-        source,
-        tokens,
-        (0, src.chars().count()),
-        base_dir.clone(),
-        base_dir,
-    )?;
-    if let Some(path) = root_file {
-        if let Ok(canonical) = std::fs::canonicalize(path) {
-            resolver.loaded_files.insert(canonical, root);
+    let inject = mentions_lusa_crate(&tokens);
+    match expand_once(src, &tokens, base, root_file, target, inject) {
+        // A file module used `lusa::` although the root did not mention it.
+        Err((_, true)) if !inject => {
+            expand_once(src, &tokens, base, root_file, target, true).map_err(|(err, _)| err)
+        }
+        result => result.map_err(|(err, _)| err),
+    }
+}
+
+/// True when the root mentions a `lusa::` path and does not declare its own
+/// `lusa` module.
+fn mentions_lusa_crate(tokens: &[Token]) -> bool {
+    let mut mentioned = false;
+    for (i, token) in tokens.iter().enumerate() {
+        if !is_name(token, "lusa") {
+            continue;
+        }
+        if i > 0 && matches!(tokens[i - 1].kind, TK::Mod) {
+            return false;
+        }
+        if matches!(tokens.get(i + 1).map(|t| &t.kind), Some(TK::ColonColon)) {
+            mentioned = true;
         }
     }
-    resolver.build_symbols();
-    resolver.resolve_uses()?;
-    let structs = resolver.render_hoisted_structs()?;
-    let body = resolver.render_module(root)?;
-    let mut out = structs;
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
+    mentioned
+}
+
+/// Character offset just past a leading `#[no_std]` statement, if any.
+fn no_std_end(tokens: &[Token]) -> Option<usize> {
+    if tokens.len() >= 4
+        && matches!(tokens[0].kind, TK::Len)
+        && matches!(tokens[1].kind, TK::LBracket)
+        && is_name(&tokens[2], "no_std")
+        && matches!(tokens[3].kind, TK::RBracket)
+    {
+        return Some(tokens[3].span.end);
     }
-    out.push_str(&body);
-    Ok(out)
+    None
+}
+
+/// Byte offset of character number `chars` in `text`.
+fn byte_offset(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map(|(offset, _)| offset)
+        .unwrap_or(text.len())
+}
+
+/// One resolution pass.  The error side reports whether a module asked for
+/// the `lusa` crate while it was not spliced in.
+fn expand_once(
+    src: &str,
+    tokens: &[Token],
+    base: Option<&Path>,
+    root_file: Option<&Path>,
+    target: &crate::targets::TargetSpec,
+    inject: bool,
+) -> Result<String, (LusaError, bool)> {
+    let mut spliced = String::new();
+    let mut src = src;
+    // (character offset of the splice, characters inserted)
+    let mut splice = (0usize, 0usize);
+    if inject {
+        let source = crate::hal::crate_source(target.hal).ok_or_else(|| {
+            let err = LusaError::new(
+                E_MODULE,
+                None,
+                format!("`lusa::hal` has no drivers for target `{}`", target.name),
+            )
+            .help(format!(
+                "the HAL supports {}; pick one of them with `--target`",
+                crate::hal::families().join(", ")
+            ));
+            (err, false)
+        })?;
+        let line = crate::hal::collapse(&source).map_err(|err| (err, false))?;
+        let at_chars = no_std_end(tokens).unwrap_or(0);
+        splice = (at_chars, line.chars().count() + 2);
+        let at = byte_offset(src, at_chars);
+        spliced.push_str(&src[..at]);
+        spliced.push(' ');
+        spliced.push_str(&line);
+        spliced.push(' ');
+        spliced.push_str(&src[at..]);
+        src = &spliced;
+    }
+    let mut resolver = Resolver::new();
+    resolver.hal_injected = inject;
+    let result = resolver.expand(src, base, root_file);
+    let missing = resolver.missing_lusa.get();
+    result.map_err(|mut err| {
+        // Resolver diagnostics point into the spliced root; move them back to
+        // the program's own text.
+        if splice.1 > 0 {
+            let unsplice = |span: &mut Span| {
+                let (at, len) = splice;
+                if span.start >= at + len {
+                    span.start -= len;
+                    span.end = span.end.saturating_sub(len).max(span.start);
+                } else if span.start >= at {
+                    span.start = at;
+                    span.end = at;
+                }
+            };
+            if let Some(span) = err.span.as_mut() {
+                unsplice(span);
+            }
+            for (_, span) in err.notes.iter_mut() {
+                if let Some(span) = span.as_mut() {
+                    unsplice(span);
+                }
+            }
+        }
+        (err, missing)
+    })
+}
+
+impl Resolver {
+    fn expand(
+        &mut self,
+        src: &str,
+        base: Option<&Path>,
+        root_file: Option<&Path>,
+    ) -> LResult<String> {
+        let resolver = self;
+        let base_dir = match base {
+            Some(path) => path.to_path_buf(),
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        let source = Rc::new(SourceText::new(src));
+        let tokens = lexer::lex(src)?;
+        let root = resolver.collect_module(
+            Vec::new(),
+            None,
+            source,
+            tokens,
+            (0, src.chars().count()),
+            base_dir.clone(),
+            base_dir,
+        )?;
+        if let Some(path) = root_file {
+            if let Ok(canonical) = std::fs::canonicalize(path) {
+                resolver.loaded_files.insert(canonical, root);
+            }
+        }
+        resolver.build_symbols();
+        resolver.resolve_uses()?;
+        let (bundled, structs) = resolver.render_hoisted_structs()?;
+        let body = resolver.render_module(root)?;
+        // Hoisted structs follow a leading `#[no_std]`, which must stay the first
+        // statement.  Bundled-crate structs share that line, so the program's
+        // line numbers are unchanged.
+        let split = no_std_end(&resolver.modules[root].tokens)
+            .map(|chars| byte_offset(&body, chars))
+            .unwrap_or(0);
+        let mut out = String::new();
+        out.push_str(&body[..split]);
+        if !bundled.is_empty() {
+            out.push(' ');
+            out.push_str(&bundled);
+            out.push(' ');
+        }
+        if !structs.is_empty() {
+            if split > 0 {
+                out.push('\n');
+            }
+            out.push_str(&structs);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        out.push_str(&body[split..]);
+        Ok(out)
+    }
 }
 
 struct SourceText {
@@ -235,6 +393,10 @@ struct Resolver {
     by_path: HashMap<String, usize>,
     loaded_files: HashMap<PathBuf, usize>,
     loading_files: HashSet<PathBuf>,
+    /// The `lusa` driver crate was spliced into the root source.
+    hal_injected: bool,
+    /// Set when a `lusa::` path found no `lusa` crate to resolve against.
+    missing_lusa: std::cell::Cell<bool>,
 }
 
 impl Resolver {
@@ -244,7 +406,16 @@ impl Resolver {
             by_path: HashMap::new(),
             loaded_files: HashMap::new(),
             loading_files: HashSet::new(),
+            hal_injected: false,
+            missing_lusa: std::cell::Cell::new(false),
         }
+    }
+
+    /// True for modules of the spliced `lusa` crate, which are rendered on a
+    /// single line.
+    fn is_bundled(&self, id: usize) -> bool {
+        self.hal_injected
+            && self.modules[id].path.first().map(String::as_str) == Some("lusa")
     }
 
     fn collect_module(
@@ -310,7 +481,11 @@ impl Resolver {
 
             if stack.is_empty() {
                 if is_attr_start(&tokens, i) {
-                    if pending_attr.is_none() {
+                    // `#[no_std]` is a standalone statement, never part of the
+                    // next declaration: hoisting it with a struct would move
+                    // it away from the head of the program.
+                    let standalone = tokens.get(i + 2).is_some_and(|t| is_name(t, "no_std"));
+                    if pending_attr.is_none() && !standalone {
                         pending_attr = Some(i);
                     }
                     i = skip_attribute(&tokens, i)?;
@@ -845,6 +1020,20 @@ impl Resolver {
                 start = from;
                 index = 1;
             }
+            // `lusa::` names the bundled driver crate from any module, like
+            // an external crate in Rust.
+            "lusa" if !self.modules[from].symbols.contains_key("lusa") => {
+                let crate_root = self.modules[0].symbols.get("lusa");
+                if !matches!(crate_root.map(|s| &s.kind), Some(SymbolKind::Module { .. })) {
+                    self.missing_lusa.set(true);
+                    return Err(LusaError::new(
+                        E_MODULE,
+                        Some(span),
+                        format!("cannot resolve `{}`: the `lusa` crate is not available", segments.join("::")),
+                    ));
+                }
+                start = 0;
+            }
             "super" => {
                 let mut current = from;
                 while segments.get(index).map(String::as_str) == Some("super") {
@@ -928,7 +1117,7 @@ impl Resolver {
     /// keep working.
     fn path_starts_known(&self, from: usize, segments: &[String]) -> bool {
         match segments.first().map(String::as_str) {
-            Some("crate") | Some("self") | Some("super") => true,
+            Some("crate") | Some("self") | Some("super") | Some("lusa") => true,
             Some(first) => match self.modules[from].symbols.get(first) {
                 Some(symbol) => matches!(symbol.kind, SymbolKind::Module { .. }),
                 None => false,
@@ -1187,7 +1376,10 @@ impl Resolver {
         Ok(plan)
     }
 
-    fn render_hoisted_structs(&self) -> LResult<String> {
+    /// Renders every module struct declaration.  Returns the bundled-crate
+    /// structs (one line) and the program's own structs separately.
+    fn render_hoisted_structs(&self) -> LResult<(String, String)> {
+        let mut bundled = String::new();
         let mut out = String::new();
         for id in 0..self.modules.len() {
             let module = &self.modules[id];
@@ -1201,11 +1393,18 @@ impl Resolver {
                 if text.trim().is_empty() {
                     continue;
                 }
-                out.push_str(text);
-                out.push_str("\n\n");
+                if self.is_bundled(id) {
+                    if !bundled.is_empty() {
+                        bundled.push(' ');
+                    }
+                    bundled.push_str(text.trim());
+                } else {
+                    out.push_str(text);
+                    out.push_str("\n\n");
+                }
             }
         }
-        Ok(out)
+        Ok((bundled, out))
     }
 
     /// Renders a token range with the same declaration/reference rewriting as
@@ -1294,11 +1493,18 @@ impl Resolver {
             if let Some(decl) = mods_at.get(&i) {
                 out.push_str(&source.gap(last, tokens[i].span.start));
                 let child = self.render_module(decl.child)?;
-                if !out.is_empty() && !out.ends_with('\n') {
+                if self.is_bundled(decl.child) {
+                    // The spliced crate stays on its single line.
+                    out.push(' ');
+                    out.push_str(child.trim());
+                    out.push(' ');
+                } else {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str(child.trim_end_matches(['\r', '\n']));
                     out.push('\n');
                 }
-                out.push_str(child.trim_end_matches(['\r', '\n']));
-                out.push('\n');
                 let skipped_end = tokens[decl.header_end - 1].span.end;
                 last = skipped_end;
                 i = decl.header_end;

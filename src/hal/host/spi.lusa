@@ -1,0 +1,56 @@
+-- Host SPI controller (simulation).
+--
+-- MISO is wired back to MOSI: the modelled device answers each byte with
+-- `(byte + offset) % 256`, where `sim_reply_offset` sets the offset (0 by
+-- default), so a test can tell sent and received bytes apart.  The model raises its
+-- interrupt while a received byte waits in the data register.
+
+local sim_data: u32 = 0
+local sim_full: bool = false
+local sim_offset_value: u32 = 0
+local sim_frame_count: u32 = 0
+
+function ll_configure(frequency_hz: u32, mode: u32): void
+    sim_full = false
+    sim_frame_count = 0
+end
+
+-- Writing the data register clocks one frame; the reply is latched at once.
+function ll_send(byte: u32): void
+    sim_data = (byte + sim_offset_value) % 256
+    sim_full = true
+    sim_frame_count = sim_frame_count + 1
+end
+
+function ll_rx_ready(): bool
+    return sim_full
+end
+
+function ll_receive(): u32
+    sim_full = false
+    return sim_data
+end
+
+function ll_stop(): void
+end
+
+function ll_idle(): void
+    if sim_full then
+        on_interrupt()
+    end
+end
+
+-- Simulation: the device answers each byte with `(byte + offset) % 256`.
+pub function sim_reply_offset(offset: u32): void
+    sim_offset_value = offset % 256
+end
+
+-- Simulation: true while the modelled controller asserts its interrupt.
+pub function sim_irq_pending(): bool
+    return sim_full
+end
+
+-- Simulation: frames clocked since `configure`.
+pub function sim_frames(): u32
+    return sim_frame_count
+end

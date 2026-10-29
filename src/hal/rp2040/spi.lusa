@@ -1,0 +1,62 @@
+-- RP2040 SPI0 (PL022 at 0x4003C000): GP16 = MISO, GP17 = CSn, GP18 = SCK,
+-- GP19 = MOSI.  NVIC IRQ 18; install the handler with `#[interrupt("SPI0")]`.
+--
+-- Registers (word offsets): CR0 +0, CR1 +1, DR +2, SR +3, CPSR +4, IMSC +5,
+-- ICR +8.  RXIM | RTIM (0x06) stay unmasked: with one frame in flight the
+-- receive FIFO never reaches half full, so the receive-timeout interrupt is
+-- what reports a completed frame.
+
+function spi0(word: u32): u32
+    return 1073987584 + word * 4
+end
+
+function ll_configure(frequency_hz: u32, mode: u32): void
+    super::unreset(65536)         -- SPI0 (bit 16)
+    super::unreset(32)            -- IO_BANK0
+    super::gpio_function(16, 1)
+    super::gpio_function(17, 1)
+    super::gpio_function(18, 1)
+    super::gpio_function(19, 1)
+    local clock: u32 = super::clk_peri()
+    super::mmio_write(spi0(1), 0)
+    -- SCK = clk_peri / (CPSDVSR * (1 + SCR)), CPSDVSR even in 2..254: the
+    -- smallest prescaler that can reach the request, then the post-divider.
+    local prescale: u32 = 2
+    while prescale < 254 and clock // (prescale * 256) > frequency_hz do
+        prescale = prescale + 2
+    end
+    local post: u32 = (clock + prescale * frequency_hz - 1) // (prescale * frequency_hz)
+    if post < 1 then
+        post = 1
+    end
+    if post > 256 then
+        post = 256
+    end
+    super::mmio_write(spi0(4), prescale)
+    -- DSS = 8 bits (7) | SPO << 6 | SPH << 7 | SCR << 8
+    super::mmio_write(spi0(0), 7 + (mode // 2) * 64 + (mode % 2) * 128 + (post - 1) * 256)
+    super::mmio_write(spi0(8), 3)         -- clear overrun and timeout
+    super::mmio_write(spi0(5), 6)         -- RTIM | RXIM
+    super::mmio_write(spi0(1), 2)         -- SSE, master
+    super::nvic_enable(18)
+end
+
+function ll_send(byte: u32): void
+    super::mmio_write(spi0(2), byte)
+end
+
+function ll_rx_ready(): bool
+    return super::has_bit(super::mmio_read(spi0(3)), 4)   -- RNE
+end
+
+function ll_receive(): u32
+    local value: u32 = super::mmio_read(spi0(2)) % 256
+    super::mmio_write(spi0(8), 2)         -- clear the receive timeout
+    return value
+end
+
+function ll_stop(): void
+end
+
+function ll_idle(): void
+end

@@ -1,0 +1,48 @@
+-- STM32F4 SPI1 (0x40013000): PA5 = SCK, PA6 = MISO, PA7 = MOSI (AF5).
+-- NVIC IRQ 35; install the handler with `#[interrupt("SPI1")]`.
+--
+-- Registers (word offsets): CR1 +0, CR2 +1, SR +2, DR +3.  Master with
+-- software slave management (SSM | SSI); RXNEIE stays enabled, so every
+-- completed frame raises an interrupt.
+
+function spi(word: u32): u32
+    return 1073819648 + word * 4
+end
+
+function ll_configure(frequency_hz: u32, mode: u32): void
+    super::clock_ahb1(1)          -- GPIOAEN
+    super::clock_apb2(4096)       -- SPI1EN (bit 12)
+    super::gpio_alternate(1073872896, 5, 5)
+    super::gpio_alternate(1073872896, 6, 5)
+    super::gpio_alternate(1073872896, 7, 5)
+    -- Baud rate: PCLK / 2^(BR + 1), the fastest that does not exceed the
+    -- request.
+    local divider: u32 = 0
+    while divider < 7 and super::pclk() // super::pow2(divider + 1) > frequency_hz do
+        divider = divider + 1
+    end
+    -- MSTR (4) | SSI (256) | SSM (512) | BR << 3 | CPOL << 1 | CPHA
+    local cr1: u32 = 4 + 256 + 512 + divider * 8 + (mode // 2) * 2 + mode % 2
+    super::mmio_write(spi(0), cr1)
+    super::mmio_write(spi(1), 64)           -- RXNEIE
+    super::mmio_write(spi(0), cr1 + 64)     -- SPE
+    super::nvic_enable(35)
+end
+
+function ll_send(byte: u32): void
+    super::mmio_write(spi(3), byte)
+end
+
+function ll_rx_ready(): bool
+    return super::has_bit(super::mmio_read(spi(2)), 1)   -- RXNE
+end
+
+function ll_receive(): u32
+    return super::mmio_read(spi(3)) % 256
+end
+
+function ll_stop(): void
+end
+
+function ll_idle(): void
+end

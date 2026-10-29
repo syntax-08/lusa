@@ -1,0 +1,51 @@
+-- ESP32-C3 UART0 (0x60000000): GPIO21 = TX, GPIO20 = RX (IO MUX defaults).
+-- Interrupt source 21, routed to CPU interrupt 11; install the handler with
+-- `#[interrupt("machine_external")]`, shared with the other drivers.
+--
+-- Registers (word offsets): FIFO +0, INT_RAW +1, INT_ST +2, INT_ENA +3,
+-- INT_CLR +4, CLKDIV +5, STATUS +7, CONF0 +8, CONF1 +9, CLK_CONF +30.
+-- RXFIFO_FULL (threshold 1) stays enabled; TXFIFO_EMPTY (bit 1) is enabled
+-- only while the transmit ring holds data.
+
+function uart0(word: u32): u32
+    return 1610612736 + word * 4
+end
+
+function ll_configure(baud: u32): void
+    super::peripheral_on(4)       -- UART0 (bit 2)
+    -- SCLK_SEL = APB | SCLK_EN | TX_SCLK_EN | RX_SCLK_EN
+    super::mmio_write(uart0(30), 55574528)
+    -- CLKDIV holds APB / baud in 1/16ths: integer part plus FRAG << 20.
+    local divisor: u32 = super::apb() // baud * 16 + super::apb() % baud * 16 // baud
+    super::mmio_write(uart0(5), divisor // 16 + (divisor % 16) * 1048576)
+    super::mmio_write(uart0(8), 28)               -- 8 data bits, 1 stop bit
+    super::mmio_write(uart0(9), 1 + 8 * 512)      -- RX full at 1, TX empty below 8
+    super::mmio_write(uart0(4), 524287)           -- clear every interrupt
+    super::mmio_write(uart0(3), 1)                -- RXFIFO_FULL
+    super::route_interrupt(21)
+end
+
+function ll_start_tx(): void
+    super::mmio_write(uart0(3), 3)                -- + TXFIFO_EMPTY
+end
+
+function ll_service(): void
+    while super::mmio_read(uart0(7)) % 1024 > 0 do     -- RXFIFO_CNT
+        rx_push(super::mmio_read(uart0(0)) % 256)
+    end
+    super::mmio_write(uart0(4), 1)
+    if tx_busy then
+        if super::has_bit(super::mmio_read(uart0(2)), 2) then   -- TXFIFO_EMPTY
+            if tx_len() > 0 then
+                super::mmio_write(uart0(0), tx_pop())
+            else
+                super::mmio_write(uart0(3), 1)        -- TXFIFO_EMPTY off
+                tx_busy = false
+            end
+            super::mmio_write(uart0(4), 2)
+        end
+    end
+end
+
+function ll_idle(): void
+end

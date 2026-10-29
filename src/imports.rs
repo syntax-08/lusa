@@ -30,6 +30,17 @@ pub fn expand_imports(src: &str, base: Option<&Path>) -> LResult<String> {
     crate::modules::expand_modules(&legacy, base, None)
 }
 
+/// Like `expand_imports`, but splices the `lusa::hal` drivers of `target`
+/// (Module 27) instead of the host simulation drivers.
+pub fn expand_imports_for(
+    src: &str,
+    base: Option<&Path>,
+    target: &crate::targets::TargetSpec,
+) -> LResult<String> {
+    let legacy = expand_legacy(src, base)?;
+    crate::modules::expand_modules_for(&legacy, base, None, target)
+}
+
 /// Expands imports and modules from a file, treating that file as already
 /// visited.
 pub fn expand_imports_file(src: &str, path: &Path) -> LResult<String> {

@@ -224,7 +224,10 @@ fn cmd_run(args: &[String]) -> i32 {
             Err(e) => {
                 let _ = std::io::stdout().flush();
                 let _ = std::io::stderr().flush();
-                eprint!("{}(bytecode vm)", render(&e, &src, &path));
+                eprint!(
+                    "{}(bytecode vm)",
+                    render(&e, &diagnostic_source(&src, Path::new(&path).parent()), &path)
+                );
                 return 1;
             }
         }
@@ -337,7 +340,7 @@ fn cmd_build(args: &[String]) -> i32 {
 
     if emit_c {
         let c_path = output.unwrap_or_else(|| input.with_extension("c"));
-        return match cbackend::emit_c_file_with_base(&src, &c_path, input.parent()) {
+        return match cbackend::emit_c_file_for_target(&src, &c_path, input.parent(), target) {
             Ok(()) => {
                 println!("C11 emitted: {}", c_path.display());
                 0
@@ -429,7 +432,7 @@ fn cmd_check(args: &[String]) -> i32 {
             0
         }
         Err(e) => {
-            eprint!("{}", render(&e, &src, &path));
+            eprint!("{}", render(&e, &diagnostic_source(&src, Path::new(&path).parent()), &path));
             1
         }
     }
@@ -743,10 +746,17 @@ pub fn run_vm_source(src: &str, filename: &str) -> i32 {
         }
         Err(e) => {
             let _ = std::io::stdout().flush();
-            eprint!("{}(bytecode vm)", render(&e, src, filename));
+            eprint!("{}(bytecode vm)", render(&e, &diagnostic_source(src, None), filename));
             1
         }
     }
+}
+
+/// Text that diagnostic spans refer to.  Spans index the program after import
+/// and module expansion (including a spliced `lusa::hal` crate); for programs
+/// without modules that is `src` itself.
+fn diagnostic_source(src: &str, base: Option<&Path>) -> String {
+    lusa::imports::expand_imports(src, base).unwrap_or_else(|_| src.to_string())
 }
 
 /// Runs a complete program; 0 on success, 1 on error.
@@ -767,7 +777,7 @@ pub fn run_source_with_base(src: &str, filename: &str, base: Option<&Path>) -> i
         Err(e) => {
             let _ = std::io::stdout().flush();
             let _ = std::io::stderr().flush();
-            eprint!("{}", render(&e, src, filename));
+            eprint!("{}", render(&e, &diagnostic_source(src, base), filename));
             1
         }
     }

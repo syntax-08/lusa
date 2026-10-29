@@ -300,6 +300,7 @@ pub fn eval_expr(interp: &mut Interp, frame: &mut crate::interp::Frame, e: &Expr
         }
         ExprKind::Clone { e } => {
             let v = eval_expr(interp, frame, e)?;
+            interp.reject_peripheral_clone(&v, e.span)?;
             Ok(interp.deep_clone_value(&v))
         }
         ExprKind::Move { e } => {
@@ -398,7 +399,7 @@ fn eval_un(interp: &mut Interp, op: UnOp, v: Value, span: Span) -> LResult<Value
             )),
         },
         UnOp::Len => match v {
-            Value::Str(s) => Ok(Value::Number(s.chars().count() as f64)),
+            Value::Str(s) => Ok(Value::Number(crate::value::char_len(&s) as f64)),
             Value::Table(t) => Ok(Value::Number(t.len() as f64)),
             other => Err(LusaError::new(
                 E_LEN,
@@ -846,6 +847,7 @@ pub fn eval_take_single(
         }
         ExprKind::Clone { e } => {
             let v = eval_expr(interp, frame, e)?;
+            interp.reject_peripheral_clone(&v, e.span)?;
             let c = interp.deep_clone_value(&v);
             rename_owner(&c, label, span);
             Ok(c)

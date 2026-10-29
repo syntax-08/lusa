@@ -643,6 +643,9 @@ pub fn run_source_vm_with_base(src: &str, base: Option<&std::path::Path>) -> LRe
                 debug_dump(&compiled);
                 let mut interp = Interp::new();
                 interp.install_stdlib();
+                for def in &compiled.structs {
+                    interp.struct_defs.insert(def.name.clone(), def.clone());
+                }
                 let result = run_main(&mut interp, compiled);
                 let out = std::mem::take(&mut interp.out);
                 result.map(|_| out)
@@ -1069,7 +1072,7 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
         Instr::Len => {
             let v = pop1(interp);
             let n = match v.base_value() {
-                Value::Str(s) => s.chars().count(),
+                Value::Str(s) => crate::value::char_len(s),
                 Value::Table(t) => t.len(),
                 other => {
                     return Err(err(
@@ -1087,6 +1090,7 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
         }
         Instr::CloneV => {
             let v = pop1(interp);
+            interp.reject_peripheral_clone(&v, current_span(interp))?;
             let c = interp.deep_clone_value(&v.base_value());
             interp.vm.stack.push(c);
             interp.vm.last_ret = 1;

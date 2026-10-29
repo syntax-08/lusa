@@ -1,0 +1,92 @@
+-- Host serial controller (simulation).
+--
+-- The host has no UART registers, so this backend models one in software:
+-- `sim_receive` puts bytes on the receive line as if a peer sent them, and
+-- every byte the transmitter shifts out is captured on the output line,
+-- readable with `sim_sent`.  With `sim_loopback(true)` the transmitter is
+-- wired back to the receiver instead.  The model raises its interrupt line
+-- (`sim_irq_pending`) while received data is waiting or the transmit-empty
+-- interrupt is enabled; `on_interrupt()` services it exactly as a board
+-- handler would.  Busy-wait helpers (`flush`) deliver pending interrupts
+-- themselves, standing in for the interrupt controller.
+
+local sim_rx_enabled: bool = false
+local sim_tx_irq: bool = false
+local sim_loopback_on: bool = false
+local sim_shifted: u32 = 0
+
+function ll_configure(baud: u32): void
+    line_in_clear()
+    line_out_clear()
+    sim_rx_enabled = true
+    sim_tx_irq = false
+    sim_shifted = 0
+end
+
+-- Transmit-empty interrupt on: the controller asks for the first byte.
+function ll_start_tx(): void
+    sim_tx_irq = true
+end
+
+function ll_service(): void
+    if sim_rx_enabled then
+        while line_in_len() > 0 do
+            rx_push(line_in_pop())
+        end
+    end
+    if sim_tx_irq then
+        if tx_len() > 0 then
+            local byte: u32 = tx_pop()
+            sim_shifted = sim_shifted + 1
+            if sim_loopback_on then
+                line_in_push(byte)
+            else
+                line_out_push(byte)
+            end
+        else
+            -- Nothing left: mask the transmit interrupt and release the port.
+            sim_tx_irq = false
+            tx_busy = false
+        end
+    end
+end
+
+function ll_idle(): void
+    if sim_irq_pending() then
+        ll_service()
+    end
+end
+
+-- Simulation: a peer sends `byte` to this port.
+pub function sim_receive(byte: u32): bool
+    return line_in_push(byte % 256)
+end
+
+-- Simulation: next byte the transmitter put on the line, or `None`.
+pub function sim_sent(): Option<u32>
+    if line_out_len() > 0 then
+        return Some(line_out_pop())
+    end
+    return None
+end
+
+-- Simulation: route the transmitter back into the receiver.
+pub function sim_loopback(enabled: bool): void
+    sim_loopback_on = enabled
+end
+
+-- Simulation: true while the modelled controller asserts its interrupt.
+pub function sim_irq_pending(): bool
+    if sim_tx_irq then
+        return true
+    end
+    if sim_rx_enabled then
+        return line_in_len() > 0
+    end
+    return false
+end
+
+-- Simulation: bytes shifted out by the transmitter since `configure`.
+pub function sim_transmitted(): u32
+    return sim_shifted
+end

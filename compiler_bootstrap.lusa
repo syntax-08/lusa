@@ -136,10 +136,10 @@ local function opt_expr(expr)
         local rhs = opt_expr(expr.rhs)
 
         if lhs.tag == "Number" and rhs.tag == "Number"
-            and not exact_big_int(lhs) and not exact_big_int(rhs) then
+            and not exact_big_int(borrow lhs) and not exact_big_int(borrow rhs) then
             local a = lhs.value
             local b = rhs.value
-            local float_kind = node_float(lhs) or node_float(rhs)
+            local float_kind = node_float(borrow lhs) or node_float(borrow rhs)
             if op == "+" then
                 return number_node(a + b, line, column, float_kind)
             end
@@ -884,6 +884,11 @@ local function struct_owns_heap(type_name)
             seen[current] = true
             local layout = borrow check_structs[current]
             if layout ~= nil then
+                -- A `#[peripheral]` token is move-only even though its
+                -- fields are scalars: copying it would alias the hardware.
+                if layout.peripheral == true then
+                    return true
+                end
                 local i = 1
                 while i <= #layout.order do
                     local field_name = clone layout.order[i]
@@ -910,6 +915,39 @@ local function struct_owns_heap(type_name)
         end
     end
     return false
+end
+
+-- Name of the `#[peripheral]` struct reachable from `type_name` through
+-- nested struct fields, or nil.  `clone` of such a value is rejected.
+local function struct_peripheral_inside(type_name)
+    local pending = {type_name}
+    local seen = {}
+    local cursor = 1
+    while cursor <= #pending do
+        local current = pending[cursor]
+        cursor = cursor + 1
+        if seen[current] ~= true then
+            seen[current] = true
+            local layout = borrow check_structs[current]
+            if layout ~= nil then
+                if layout.peripheral == true then
+                    return current
+                end
+                local i = 1
+                while i <= #layout.order do
+                    local field_name = clone layout.order[i]
+                    local field_slot = borrow layout.fields[field_name]
+                    local field_type = field_slot.type
+                    if check_structs[field_type] ~= nil
+                        and seen[field_type] ~= true then
+                        pending[#pending + 1] = field_type
+                    end
+                    i = i + 1
+                end
+            end
+        end
+    end
+    return nil
 end
 
 local function is_heap_type(type_name)
@@ -3420,7 +3458,7 @@ check_expr = function(expr)
     end
 
     if tag == "Logical" then
-        if expr_has_try(expr.lhs) or expr_has_try(expr.rhs) then
+        if expr_has_try(borrow expr.lhs) or expr_has_try(borrow expr.rhs) then
             type_fail("E0312", line, column,
                 "`?` cannot be used inside `and` or `or`; bind the value first")
         end
@@ -3467,6 +3505,14 @@ check_expr = function(expr)
 
     if tag == "Clone" then
         local checked_inner, inner = check_expr(expr.value)
+        if inner ~= nil and check_structs[inner] ~= nil then
+            local token = struct_peripheral_inside(inner)
+            if token ~= nil then
+                type_fail("E1006", expr.line, expr.column,
+                    "cannot clone `" .. inner .. "`: `" .. token
+                    .. "` is a `#[peripheral]` resource token")
+            end
+        end
         local inner_schema = checked_inner.schema
         local inner_elem = checked_inner.elem_type
         expr.value = checked_inner
@@ -4451,7 +4497,8 @@ local function check_struct_decl(stmt)
         fields = layout,
         order = order,
         packed = packed,
-        align = align
+        align = align,
+        peripheral = stmt.peripheral == true
     }
     check_struct_order[#check_struct_order + 1] = stmt.name
     stmt.struct_checked = true

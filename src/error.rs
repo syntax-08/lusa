@@ -129,6 +129,8 @@ pub const E_MUT_IMMUT: &str = "E1004"; // mutate through immutable borrow
 /// reserved: aliases are Copy (shared refs), so moving through them is allowed
 #[allow(dead_code)]
 pub const E_MOVE_ALIAS: &str = "E1005";
+/// `clone` of a `#[peripheral]` resource token (or a struct that holds one)
+pub const E_PERIPHERAL_CLONE: &str = "E1006";
 
 // raw pointer rules (C11 backend and dynamic emulation)
 /// raw pointer arithmetic outside an `unsafe` block

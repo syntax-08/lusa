@@ -44,6 +44,7 @@ const STMT_ENDS: &[TK] = &[TK::End, TK::Else, TK::Elseif, TK::Until, TK::Eof];
 struct Attributes {
     packed: bool,
     align: Option<u32>,
+    peripheral: bool,
     no_std: bool,
     entry: bool,
     global_allocator: bool,
@@ -364,7 +365,7 @@ impl Parser {
                 self.expect(TK::End, "`end` to close the `unsafe` block")?;
                 St { kind: StKind::Unsafe { body }, span: tk.span }
             }
-            TK::Struct => self.parse_struct_st(false, None)?,
+            TK::Struct => self.parse_struct_st(false, None, false)?,
             TK::Len if self.peek_at(1).kind == TK::LBracket => self.parse_attributed_stmt()?,
             TK::Match => self.parse_match()?,
             TK::Import | TK::Mod => {
@@ -551,7 +552,7 @@ impl Parser {
     /// Parses zero or more `#[...]` attributes.
     ///
     /// Supported attributes are `#[packed]`, `#[repr(align(N))]`,
-    /// `#[no_std]`, `#[entry]`, `#[global_allocator]`, `#[interrupt]`,
+    /// `#[peripheral]`, `#[no_std]`, `#[entry]`, `#[global_allocator]`, `#[interrupt]`,
     /// `#[interrupt("VECTOR")]`, and `#[link_section = "..."]`.  The values are
     /// validated here, before the AST reaches either backend, so the dynamic
     /// engines and the C emitter agree on what is legal.
@@ -573,6 +574,16 @@ impl Parser {
                         ));
                     }
                     attrs.packed = true;
+                }
+                "peripheral" => {
+                    if attrs.peripheral {
+                        return Err(LusaError::new(
+                            E_PARSE,
+                            Some(attr_span),
+                            "duplicate `#[peripheral]` attribute",
+                        ));
+                    }
+                    attrs.peripheral = true;
                 }
                 "no_std" => {
                     if attrs.no_std {
@@ -767,7 +778,7 @@ impl Parser {
                         format!("unsupported attribute `#{other}`"),
                     )
                     .help(
-                        "supported attributes are `#[packed]`, `#[repr(align(N))]`, \
+                        "supported attributes are `#[packed]`, `#[repr(align(N))]`, `#[peripheral]`, \
                          `#[no_std]`, `#[entry]`, `#[global_allocator]`, \
                          `#[interrupt]`, `#[interrupt(\"VECTOR\")]`, and \
                          `#[link_section = \"...\"]`",
@@ -793,6 +804,7 @@ impl Parser {
         if attrs.no_std {
             if attrs.packed
                 || attrs.align.is_some()
+                || attrs.peripheral
                 || attrs.entry
                 || attrs.global_allocator
                 || attrs.interrupt.is_some()
@@ -820,7 +832,16 @@ impl Parser {
                     "`#[entry]` and `#[link_section]` are only supported on functions or globals; `#[global_allocator]` and `#[interrupt]` are only supported on functions",
                 ));
             }
-            return self.parse_struct_st(attrs.packed, attrs.align);
+            return self.parse_struct_st(attrs.packed, attrs.align, attrs.peripheral);
+        }
+
+        if attrs.peripheral {
+            return Err(LusaError::new(
+                E_PARSE,
+                Some(start),
+                "`#[peripheral]` is only supported on structs",
+            )
+            .help("mark the hardware token type: `#[peripheral] struct Uart { base: u32 }`"));
         }
 
         if self.at(TK::Function) || self.at(TK::Async) {
@@ -907,7 +928,12 @@ impl Parser {
         ))
     }
 
-    fn parse_struct_st(&mut self, packed: bool, align: Option<u32>) -> LResult<St> {
+    fn parse_struct_st(
+        &mut self,
+        packed: bool,
+        align: Option<u32>,
+        peripheral: bool,
+    ) -> LResult<St> {
         let kw = self.bump();
         let (name, name_span) = self.expect_name()?;
         let mut fields = Vec::new();
@@ -939,7 +965,10 @@ impl Parser {
         }
         self.structs.insert(name.clone());
         let span = merge(kw.span, name_span);
-        Ok(St { kind: StKind::Struct { name, fields, packed, align }, span })
+        Ok(St {
+            kind: StKind::Struct { name, fields, packed, align, peripheral },
+            span,
+        })
     }
 
     /// `Point{x: 1, y: 2}` — the current token is `{`.

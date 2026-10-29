@@ -136,7 +136,18 @@ fn format_backend_error(err: LusaError) -> String {
 /// Compiles Lusa source to a C11 translation unit, resolving imports relative
 /// to `base` (or the current directory when absent).
 pub fn emit_c_with_base(source: &str, base: Option<&Path>) -> Result<String, String> {
-    let expanded = crate::imports::expand_imports(source, base).map_err(format_backend_error)?;
+    emit_c_for_target(source, base, &crate::targets::HOST)
+}
+
+/// Compiles Lusa source for `target`: `lusa::hal` resolves to that board's
+/// drivers.
+pub fn emit_c_for_target(
+    source: &str,
+    base: Option<&Path>,
+    target: &TargetSpec,
+) -> Result<String, String> {
+    let expanded = crate::imports::expand_imports_for(source, base, target)
+        .map_err(format_backend_error)?;
     let program = backend_program(&expanded)?;
     let output = crate::run_source(&program).map_err(format_backend_error)?;
     if output.is_empty() {
@@ -169,7 +180,17 @@ pub fn emit_c_file_with_base(
     path: &Path,
     base: Option<&Path>,
 ) -> Result<(), String> {
-    let c = emit_c_with_base(source, base)?;
+    emit_c_file_for_target(source, path, base, &crate::targets::HOST)
+}
+
+/// Writes the generated C for `target` to `path`.
+pub fn emit_c_file_for_target(
+    source: &str,
+    path: &Path,
+    base: Option<&Path>,
+    target: &TargetSpec,
+) -> Result<(), String> {
+    let c = emit_c_for_target(source, base, target)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -858,7 +879,7 @@ pub fn build_with_target(
     base: Option<&Path>,
     target: &TargetSpec,
 ) -> Result<CCompiler, String> {
-    let c = emit_c_with_base(source, base)?;
+    let c = emit_c_for_target(source, base, target)?;
     if target.is_host() {
         build_c_source(&c, output, cc, None)
     } else {

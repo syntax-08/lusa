@@ -1,0 +1,93 @@
+-- RP2040 board support shared by the drivers (`super::` from each driver).
+--
+-- Lusa has no bitwise operators, so register fields are updated with
+-- arithmetic: a power-of-two `mask` selects one bit, and a field is described
+-- by its lowest bit value `unit` and its number of states `span`.  Addresses
+-- are decimal; the hexadecimal value is in the comment.  RP2040 peripherals
+-- also have atomic SET (+0x2000) and CLR (+0x3000) register aliases.
+
+function mmio_read(address: u32): u32
+    local value: u32 = 0
+    unsafe do
+        local reg: *mut u32 = unsafe_ptr_cast(address)
+        value = reg.read_volatile()
+    end
+    return value
+end
+
+function mmio_write(address: u32, value: u32): void
+    unsafe do
+        local reg: *mut u32 = unsafe_ptr_cast(address)
+        reg.write_volatile(value)
+    end
+end
+
+function has_bit(value: u32, mask: u32): bool
+    return (value // mask) % 2 ~= 0
+end
+
+function with_bit(value: u32, mask: u32): u32
+    if has_bit(value, mask) then
+        return value
+    end
+    return value + mask
+end
+
+function without_bit(value: u32, mask: u32): u32
+    if has_bit(value, mask) then
+        return value - mask
+    end
+    return value
+end
+
+-- `value` with the field [unit, unit * span) replaced by `field`.
+function with_field(value: u32, unit: u32, span: u32, field: u32): u32
+    local old: u32 = (value // unit) % span
+    return value - old * unit + (field % span) * unit
+end
+
+function mmio_set(address: u32, mask: u32): void
+    mmio_write(address, with_bit(mmio_read(address), mask))
+end
+
+function mmio_field(address: u32, unit: u32, span: u32, field: u32): void
+    mmio_write(address, with_field(mmio_read(address), unit, span, field))
+end
+
+function pow2(exponent: u32): u32
+    local value: u32 = 1
+    local i: u32 = 0
+    while i < exponent do
+        value = value * 2
+        i = i + 1
+    end
+    return value
+end
+
+-- NVIC_ISERn (0xE000E100) is write-one-to-set, so other lines are untouched.
+function nvic_enable(irq: u32): void
+    mmio_write(3758153984 + (irq // 32) * 4, pow2(irq % 32))
+end
+
+-- Takes the blocks in `mask` out of reset (RESETS 0x4000C000, CLR alias
+-- 0x4000F000) and waits, bounded, for RESET_DONE (+0x08).
+function unreset(mask: u32): void
+    mmio_write(1073803264, mask)
+    local tries: u32 = 0
+    while tries < 1000 and not has_bit(mmio_read(1073790984), mask) do
+        tries = tries + 1
+    end
+end
+
+-- Routes GPIO `pin` to peripheral function `func` (IO_BANK0 0x40014000,
+-- GPIOn_CTRL at +8n+4; 1 = SPI, 2 = UART, 3 = I2C).
+function gpio_function(pin: u32, func: u32): void
+    mmio_write(1073823748 + pin * 8, func)
+end
+
+-- clk_peri drives UART and SPI.  The drivers assume the usual 125 MHz system
+-- clock and enable clk_peri from clk_sys (CLK_PERI_CTRL 0x40008048, ENABLE).
+function clk_peri(): u32
+    mmio_write(1073774664, 2048)
+    return 125000000
+end

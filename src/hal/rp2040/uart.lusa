@@ -1,0 +1,59 @@
+-- RP2040 UART0 (PL011 at 0x40034000): GP0 = TX, GP1 = RX.
+-- NVIC IRQ 20; install the handler with `#[interrupt("UART0")]`.
+--
+-- Registers (word offsets): DR +0, FR +6, IBRD +9, FBRD +10, LCR_H +11,
+-- CR +12, IMSC +14, MIS +16, ICR +17.  The FIFOs stay disabled, so the
+-- receive interrupt fires per character and the transmit interrupt means
+-- "holding register empty".  RXIM | RTIM (0x50) stay unmasked; TXIM (0x20) is
+-- unmasked only while the transmit ring holds data.
+
+function uart0(word: u32): u32
+    return 1073954816 + word * 4
+end
+
+function ll_configure(baud: u32): void
+    super::unreset(4194304)       -- UART0 (bit 22)
+    super::unreset(32)            -- IO_BANK0 (bit 5)
+    super::gpio_function(0, 2)
+    super::gpio_function(1, 2)
+    super::mmio_write(uart0(12), 0)
+    -- Baud divisor in 1/64ths: 8 * clk_peri / baud = IBRD * 128 + 2 * FBRD.
+    local divisor: u32 = 8 * super::clk_peri() // baud
+    super::mmio_write(uart0(9), divisor // 128)
+    super::mmio_write(uart0(10), (divisor % 128 + 1) // 2)
+    super::mmio_write(uart0(11), 96)      -- WLEN = 8 bits, FIFOs off
+    super::mmio_write(uart0(17), 2047)    -- clear every interrupt
+    super::mmio_write(uart0(14), 80)      -- RXIM | RTIM
+    super::mmio_write(uart0(12), 769)     -- UARTEN | TXE | RXE
+    super::nvic_enable(20)
+end
+
+-- The PL011 raises its transmit interrupt when the holding register empties,
+-- not while it stays empty, so the first byte of a burst is written here.
+function ll_start_tx(): void
+    if not super::has_bit(super::mmio_read(uart0(6)), 32) then   -- TXFF
+        super::mmio_write(uart0(0), tx_pop())
+    end
+    super::mmio_write(uart0(14), 112)     -- + TXIM
+end
+
+function ll_service(): void
+    while not super::has_bit(super::mmio_read(uart0(6)), 16) do   -- RXFE
+        rx_push(super::mmio_read(uart0(0)) % 256)
+    end
+    super::mmio_write(uart0(17), 80)      -- clear RX and RX-timeout
+    if tx_busy then
+        if super::has_bit(super::mmio_read(uart0(16)), 32) then   -- TXMIS
+            if tx_len() > 0 then
+                super::mmio_write(uart0(0), tx_pop())
+            else
+                super::mmio_write(uart0(14), 80)   -- TXIM off
+                super::mmio_write(uart0(17), 32)
+                tx_busy = false
+            end
+        end
+    end
+end
+
+function ll_idle(): void
+end

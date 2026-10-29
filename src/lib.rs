@@ -8,6 +8,7 @@ pub mod compiler;
 pub mod coroutine;
 pub mod error;
 pub mod eval;
+pub mod hal;
 pub mod imports;
 pub mod interp;
 pub mod lexer;

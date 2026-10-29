@@ -31,6 +31,8 @@ pub struct StructDef {
     pub name: String,
     /// (field name, type annotation)
     pub fields: Vec<(String, String)>,
+    /// `#[peripheral]`: a move-only hardware resource token.
+    pub peripheral: bool,
 }
 
 /// A storage location for a variable name.
@@ -512,10 +514,11 @@ impl Interp {
                 self.exec_local(frame, targets, values, annotations, st.span)
             }
             StKind::Assign { targets, values, .. } => self.exec_assign(frame, targets, values),
-            StKind::Struct { name, fields, .. } => {
+            StKind::Struct { name, fields, peripheral, .. } => {
                 let def = StructDef {
                     name: name.clone(),
                     fields: fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
+                    peripheral: *peripheral,
                 };
                 self.struct_defs.insert(name.clone(), def);
                 Ok(true)
@@ -932,6 +935,9 @@ impl Interp {
             let Some(def) = self.struct_defs.get(&current) else {
                 continue;
             };
+            if def.peripheral {
+                return true;
+            }
             for (_, ty) in &def.fields {
                 if ty == "string"
                     || ty == "table"
@@ -947,6 +953,48 @@ impl Interp {
             }
         }
         false
+    }
+
+    /// Name of the `#[peripheral]` struct reachable from struct `name` through
+    /// nested struct fields, if any.  Such values must never be duplicated.
+    fn peripheral_inside(&self, name: &str) -> Option<String> {
+        let mut pending = vec![name.to_string()];
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            let Some(def) = self.struct_defs.get(&current) else {
+                continue;
+            };
+            if def.peripheral {
+                return Some(current);
+            }
+            for (_, ty) in &def.fields {
+                if self.struct_defs.contains_key(ty) {
+                    pending.push(ty.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Rejects an explicit `clone` of a value that contains a
+    /// `#[peripheral]` token: cloning would hand out a second owner of the
+    /// same hardware block.
+    pub(crate) fn reject_peripheral_clone(&self, value: &Value, span: Span) -> LResult<()> {
+        let Some(name) = self.struct_table_name(&value.base_value()) else {
+            return Ok(());
+        };
+        if let Some(token) = self.peripheral_inside(&name) {
+            return Err(LusaError::new(
+                crate::error::E_PERIPHERAL_CLONE,
+                Some(span),
+                format!("cannot clone `{name}`: `{token}` is a `#[peripheral]` resource token"),
+            )
+            .help("peripheral tokens have a single owner; pass `borrow value` to share it for a call"));
+        }
+        Ok(())
     }
 
     /// Returns an independent copy when `value` is a scalar-only struct

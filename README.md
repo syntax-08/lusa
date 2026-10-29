@@ -45,6 +45,10 @@ in Renode and asserts the UART output. Module 25 extends the same pipeline to
 modern microcontrollers: RP2040 (`--target rp2040`), STM32F4
 (`--target stm32f4`), and ESP32-C3 (`--target esp32c3`), each with its own
 linker memory map, startup code, Renode platform, GPIO, timer, and UART.
+Module 26 adds hardware interrupt handlers (`#[interrupt]`), generated vector
+tables, and critical sections. Module 27 bundles `lusa::hal`: interrupt-driven,
+ring-buffered UART, SPI, and I2C drivers for those three boards, claimed once
+through `#[peripheral]` move-only tokens.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -140,6 +144,8 @@ See [`examples/`](examples/):
 | `modern_mcu_peripherals.lusa` | STM32F4 USART2 banner, GPIOA output, TIM2 polling |
 | `modern_mcu_rp2040.lusa` | RP2040 UART0 banner, SIO GPIO, SysTick polling |
 | `modern_mcu_esp32c3.lusa` | ESP32-C3 UART0 banner, GPIO output, TIMG polling |
+| `interrupt_driven_timer.lusa` | STM32F4 TIM2 interrupt and critical sections |
+| `interrupt_uart_echo.lusa` | STM32F4 interrupt-driven UART echo server on `lusa::hal` |
 | `dynamic_heap.lusa`       | `Vec<T>` growth/pop/clear and `Box<T>` owned pointers |
 | `error_handling.lusa`     | `Result`/`Option`, combinators, `?`, and `match` arms |
 | `async_cooperative.lusa`  | lazy tasks, `await`, `task.run`, and postfix `.await` |
@@ -1259,9 +1265,9 @@ The pre-configured Renode environments are:
 
 | platform | emulated peripherals | notes |
 |----------|----------------------|-------|
-| `renode/lusa_rp2040.repl` | dual `CPU.CortexM`, two NVICs, PL011 UART0, SIO window, SysTick | Renode 1.17 has no RP2040 SIO/TIMER models; SIO is backed by `MappedMemory`, timing uses SysTick, and `cortex-m0` stands in for M0+ (`cpu1` is halted by the script) |
-| `renode/lusa_stm32f4.repl` | `UART.STM32_UART`, `GPIOPort.STM32_GPIOPort`, `Timers.STM32_Timer`, NVIC/SysTick | USART2, GPIOA, and TIM2 use their real STM32 models |
-| `renode/lusa_esp32c3.repl` | `CPU.RiscV32` (`rv32imc`), `UART.ESP32_UART`, `Timers.Arm_CMSDK_Timer`, `MappedMemory` GPIO, CLINT machine timer | no ESP32-C3 TIMG/GPIO model in 1.17, so CMSDK sits at the TIMG T0 base and the GPIO block is plain memory; `IRQControllers.CoreLevelInterruptor` at the CLINT base supplies timer interrupts |
+| `renode/lusa_rp2040.repl` | dual `CPU.CortexM`, two NVICs, PL011 UART0, SIO window, SysTick, SPI0 (`LusaRp2040Spi`) with a loopback, `DesignWare_APB_I2C` I2C0 with an echo device at `0x55` | Renode 1.17 has no RP2040 SIO/TIMER/PL022 models; SIO, RESETS, CLOCKS, and IO_BANK0 are `MappedMemory`, timing uses SysTick, SPI0 is a repository model, and `cortex-m0` stands in for M0+ (`cpu1` is halted by the script) |
+| `renode/lusa_stm32f4.repl` | `UART.STM32_UART`, `GPIOPort.STM32_GPIOPort` (A, B), `Timers.STM32_Timer`, `SPI.STM32SPI` with a loopback, `I2C.STM32F1_I2C` with an echo device at `0x55`, NVIC/SysTick | USART2, GPIOA/B, TIM2, SPI1, and I2C1 use their real STM32 models (the F4 I2C block is register-compatible with Renode's F1 model); RCC is plain memory |
+| `renode/lusa_esp32c3.repl` | `CPU.RiscV32` (`rv32imc_zicsr`), `UART.LusaEsp32C3Uart`, `SPI.LusaEsp32C3Spi` with a loopback, `I2C.LusaEsp32C3I2c` with an echo device at `0x55`, `Timers.Arm_CMSDK_Timer`, `MappedMemory` GPIO, CLINT machine timer | the UART, SPI, and I2C blocks are repository models (`renode/models/`) OR-ed onto the external interrupt `cpu@11`; no ESP32-C3 TIMG/GPIO model in 1.17, so CMSDK sits at the TIMG T0 base and the GPIO block is plain memory; `IRQControllers.CoreLevelInterruptor` at the CLINT base supplies timer interrupts |
 
 `examples/modern_mcu_peripherals.lusa` is the STM32F4 reference image. It
 writes `LUSA MODERN MCU OK\nstm32f4 gpio=ok timer=ok\n\n` through USART2,
@@ -1294,8 +1300,8 @@ selects an explicit vector, matched case-insensitively:
 
 | target | default vector | other vectors |
 |--------|----------------|---------------|
-| `stm32f4` | `tim2` (exception 44) | `systick` (15), `usart2` (54) |
-| `rp2040` | `systick` (exception 15) | `uart0` (exception 36) |
+| `stm32f4` | `tim2` (exception 44) | `systick` (15), `i2c1_ev` (47), `i2c1_er` (48), `spi1` (51), `usart2` (54) |
+| `rp2040` | `systick` (exception 15) | `spi0` (34), `uart0` (36), `i2c0` (39) |
 | `esp32c3` | `machine_timer` (`mcause` 7) | `machine_software` (3), `machine_external` (11) |
 | `riscv32-virt` / `riscv64-virt` | `machine_timer` (`mcause` 7) | `machine_software` (3), `machine_external` (11) |
 
@@ -1381,6 +1387,92 @@ does not configure clocks, GPIO alternate functions, or interrupt priorities;
 the example and tests write the raw registers directly. Host builds accept the
 attribute and emit the wrapper, but only cross targets install a vector table.
 
+### Interrupt-driven peripheral drivers (Module 27)
+
+`lusa::hal` is a driver crate bundled with the compiler. A program that names
+a `lusa::` path receives the drivers for its build target (`--target stm32f4`,
+`rp2040`, `esp32c3`, or the host), so the same API runs on every board:
+
+```lusa
+#[no_std]
+use lusa::hal::uart;
+
+#[interrupt("USART2")]              -- `UART0` on RP2040, `machine_external` on ESP32-C3
+function serial_irq(): void
+    uart::on_interrupt()
+end
+
+#[entry]
+function main(): void
+    local port: uart::Uart = uart::take():unwrap()
+    uart::configure(borrow port, 115200)
+    interrupts_enable()
+    while true do
+        match uart::read(borrow port) with
+        | Some(byte) => uart::write(borrow port, byte)   -- echo
+        | None => uart::idle(borrow port)
+        end
+    end
+end
+```
+
+**Ownership.** `take()` returns `Some(token)` once and `None` afterwards, so a
+register block cannot be claimed twice. The token type is a `#[peripheral]`
+struct: `#[peripheral]` makes a struct move-only in every engine even though
+its fields are scalars, and `clone` of it (or of a struct that holds one) is
+`E1006`. Driver calls take the token by `borrow`; passing it by value moves it,
+and a later use is the usual `E1001`.
+
+**Ring buffers.** Each driver owns a 64-byte receive ring and a 64-byte
+transmit ring. Every ring operation runs inside an
+`interrupts_disable`/`interrupts_restore` critical section, which is also a
+compiler barrier, so the handler and the main program share them safely.
+`write`/`transfer`/`queue` never block: they return `false` when the ring is
+full. The handler feeds the transmitter and drains the receiver; `read`
+returns `Option<u32>`; `overruns` counts received bytes dropped on a full ring.
+
+| module | API |
+|--------|-----|
+| `uart` | `take`, `configure(port, baud)`, `write`, `read`, `available`, `pending`, `overruns`, `is_busy`, `flush`, `idle`, `baud`, `on_interrupt` |
+| `spi` | `take`, `configure(bus, frequency_hz, mode)` (mode 0-3: CPOL = mode // 2, CPHA = mode % 2), `transfer`, `read`, `available`, `pending`, `overruns`, `is_busy`, `flush`, `idle`, `mode`, `frequency`, `on_interrupt` |
+| `i2c` | `take`, `configure(bus, frequency_hz)`, `queue`, `start_write(bus, address)`, `start_read(bus, address, count)`, `wait` (0 ok, 1 NACK, 2 bus error), `status`, `is_busy`, `read`, `available`, `max_read`, `max_write`, `idle`, `frequency`, `on_interrupt` |
+
+| board | UART | SPI | I2C |
+|-------|------|-----|-----|
+| `stm32f4` | USART2, PA2/PA3, `usart2` (54) | SPI1, PA5/PA6/PA7, `spi1` (51) | I2C1, PB8/PB9, `i2c1_ev` (47) + `i2c1_er` (48) |
+| `rp2040` | UART0 (PL011), GP0/GP1, `uart0` (36) | SPI0 (PL022), GP16-19, `spi0` (34) | I2C0 (DW_apb_i2c), GP4/GP5, `i2c0` (39) |
+| `esp32c3` | UART0, GPIO21/20 | GP-SPI2, GPIO6/7/2/10 | I2C, GPIO4/5 (GPIO matrix) |
+
+`configure` enables the block's clock, takes it out of reset, routes its pins,
+and unmasks its interrupt line. On ESP32-C3 the drivers program the interrupt
+matrix to CPU interrupt 11, so one `#[interrupt("machine_external")]` handler
+calls each driver's `on_interrupt()`. On the host the drivers are software
+models for testing with `lusalang run`/`--vm`: `uart::sim_receive`,
+`uart::sim_sent`, `spi::sim_reply_offset`, and `i2c::sim_attach` stand in for
+the wire, and `idle`/`flush`/`wait` deliver the simulated interrupt.
+
+`examples/interrupt_uart_echo.lusa` is a STM32F4 echo server: it echoes every
+byte, reports the length of each line, and ends with a summary on `!`.
+
+```sh
+lusalang build examples/interrupt_uart_echo.lusa --target stm32f4
+cargo test --test module27_drivers -- --test-threads=1
+```
+
+The Renode platforms add an SPI loopback (MISO wired to MOSI) and an
+`EchoI2CDevice` at I2C address `0x55` to each board. Renode 1.17 has no
+RP2040 PL022 and no ESP32-C3 SPI or I2C controller, and its ESP32 UART raises
+no receive interrupt, so `renode/models/*.cs` provides those blocks; the
+monitor scripts load them through an `@MODELS@` line, and
+`TargetSpec::write_renode_models` renders it. `tests/module27_drivers.rs` runs
+the echo session and a SPI/I2C/ownership check on all three boards. Limits:
+the drivers expose one instance per block, use 8-bit frames and 7-bit
+addresses, assume the reset clock tree (STM32F4 16 MHz HSI, RP2040 125 MHz
+`clk_sys`, ESP32-C3 80 MHz APB), and leave DMA, chip-select management, and
+interrupt priorities to the application. Renode's DesignWare I2C model does
+not report address NACKs, so the RP2040 NACK path is exercised only on
+hardware.
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -1427,7 +1519,11 @@ wrong-variant errors, and native + dynamic parity. `tests/module26_interrupts.rs
 adds bare and explicit `#[interrupt]` parsing, placement/signature/duplicate
 diagnostics, target vector tables, critical-section parity, wrapper emission,
 cross builds, and exact-banner Renode boots for STM32F4 TIM2, RP2040 SysTick,
-and ESP32-C3 machine timer interrupts. See
+and ESP32-C3 machine timer interrupts. `tests/module27_drivers.rs` adds
+`#[peripheral]` parsing, move and `E1006` clone rules in all engines,
+`lusa::` resolution and line-number stability, the host UART/SPI/I2C models,
+driver vectors and Renode platforms, cross builds, and Renode runs of the UART
+echo server and the SPI/I2C drivers on STM32F4, RP2040, and ESP32-C3. See
 [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
 [`docs/LANGUAGE.md`](docs/LANGUAGE.md) section 9 for details.
 
@@ -1521,6 +1617,11 @@ Near-term milestones:
   default timer vectors, `interrupts_disable`/`interrupts_enable`/
   `interrupts_restore` critical sections, Renode-driven TIM2/SysTick/CLINT
   interrupt tests, and a shared volatile counter example.
+- **v2.3.0 (shipped):** the bundled `lusa::hal` crate with interrupt-driven,
+  ring-buffered UART, SPI, and I2C drivers for STM32F4, RP2040, ESP32-C3, and
+  host simulation; `#[peripheral]` move-only resource tokens with single
+  `take()` claims; Renode SPI loopback and I2C echo devices plus repository
+  models for the blocks Renode 1.17 lacks; and a UART echo server example.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

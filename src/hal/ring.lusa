@@ -1,0 +1,67 @@
+-- Ring buffer `@R@` holding up to @CAP@ bytes.  src/hal.rs instantiates this
+-- template once per direction and driver.  Every operation runs inside a
+-- critical section, so an interrupt handler and the main program can share
+-- the ring without tearing the indices.  The critical-section intrinsics are
+-- compiler barriers in native code, so the indices need no volatile access.
+local @R@_data: [u32; @CAP@]
+local @R@_head: u32 = 0
+local @R@_tail: u32 = 0
+local @R@_count: u32 = 0
+local @R@_dropped: u32 = 0
+
+-- Appends `value`; a full ring drops it and counts the overrun.
+function @R@_push(value: u32): bool
+    local state: u32 = interrupts_disable()
+    local stored: bool = false
+    if @R@_count < @CAP@ then
+        @R@_data[@R@_head] = value
+        @R@_head = (@R@_head + 1) % @CAP@
+        @R@_count = @R@_count + 1
+        stored = true
+    else
+        @R@_dropped = @R@_dropped + 1
+    end
+    interrupts_restore(state)
+    return stored
+end
+
+-- Removes the oldest byte.  Callers check `@R@_len()` first; an empty ring
+-- yields 0.
+function @R@_pop(): u32
+    local state: u32 = interrupts_disable()
+    local value: u32 = 0
+    if @R@_count > 0 then
+        value = @R@_data[@R@_tail]
+        @R@_tail = (@R@_tail + 1) % @CAP@
+        @R@_count = @R@_count - 1
+    end
+    interrupts_restore(state)
+    return value
+end
+
+function @R@_len(): u32
+    local state: u32 = interrupts_disable()
+    local count: u32 = @R@_count
+    interrupts_restore(state)
+    return count
+end
+
+function @R@_capacity(): u32
+    return @CAP@
+end
+
+function @R@_overruns(): u32
+    local state: u32 = interrupts_disable()
+    local count: u32 = @R@_dropped
+    interrupts_restore(state)
+    return count
+end
+
+function @R@_clear(): void
+    local state: u32 = interrupts_disable()
+    @R@_head = 0
+    @R@_tail = 0
+    @R@_count = 0
+    @R@_dropped = 0
+    interrupts_restore(state)
+end

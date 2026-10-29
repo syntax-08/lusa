@@ -63,8 +63,18 @@ Download `lusa-setup.zip` or the platform tarball.
 
 ## Current release
 
-The v2.2.0 body is [`.github/release-notes/v2.2.0.md`](../.github/release-notes/v2.2.0.md).
-It follows this structure and documents bare and explicit `#[interrupt]`
+The v2.3.0 body is [`.github/release-notes/v2.3.0.md`](../.github/release-notes/v2.3.0.md).
+It follows this structure and documents the bundled `lusa::hal` crate with
+interrupt-driven, ring-buffered UART, SPI, and I2C drivers for STM32F4,
+RP2040, ESP32-C3, and host simulation; `#[peripheral]` move-only resource
+tokens and the `E1006` clone diagnostic; the new SPI/I2C vectors; the Renode
+SPI loopback, I2C echo device, and repository peripheral models; the
+`examples/interrupt_uart_echo.lusa` echo server; the module 27 suite; and the
+native `and`/`or`, constant-folding, and long-string performance fixes.
+
+The v2.2.0 body remains at
+[`.github/release-notes/v2.2.0.md`](../.github/release-notes/v2.2.0.md) and
+documents bare and explicit `#[interrupt]`
 registration, target default timer vectors, generated Arm vector tables and
 RISC-V trap tables, linker `PROVIDE` fallbacks, the
 `interrupts_disable`/`interrupts_enable`/`interrupts_restore` critical-section

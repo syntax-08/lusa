@@ -1,0 +1,185 @@
+-- lusa::hal::i2c -- interrupt-driven I2C master.
+--
+-- A transaction is started with `start_write` (sending every byte staged with
+-- `queue`) or `start_read` (receiving `count` bytes into the `rx` ring).  The
+-- handler advances the controller one bus event at a time and records the
+-- outcome; `wait()` returns it:
+--
+--   0  the transaction completed
+--   1  the target did not acknowledge (NACK)
+--   2  bus error or arbitration loss
+
+#[peripheral]
+pub struct I2c { index: u32 }
+
+local claimed: bool = false
+-- Transaction state shared with the handler.
+local busy: bool = false
+local op_read: bool = false
+local target: u32 = 0
+local remaining: u32 = 0
+local result: u32 = 0
+local configured_frequency: u32 = 0
+
+-- Claims the I2C controller once; later calls return `None`.
+pub function take(): Option<I2c>
+    local state: u32 = interrupts_disable()
+    local first: bool = not claimed
+    claimed = true
+    interrupts_restore(state)
+    if first then
+        return Some(I2c{index: 0})
+    end
+    return None
+end
+
+-- Master mode with 7-bit addressing at `frequency_hz` (100000 or 400000).
+pub function configure(bus: I2c, frequency_hz: u32): void
+    local state: u32 = interrupts_disable()
+    rx_clear()
+    tx_clear()
+    busy = false
+    result = 0
+    configured_frequency = frequency_hz
+    ll_configure(frequency_hz)
+    interrupts_restore(state)
+end
+
+pub function frequency(bus: I2c): u32
+    return configured_frequency
+end
+
+-- Stages one byte for the next `start_write`.  Returns false while a
+-- transaction is running or when the transmit ring is full.
+pub function queue(bus: I2c, byte: u32): bool
+    local state: u32 = interrupts_disable()
+    local queued: bool = false
+    if not busy then
+        queued = tx_push(byte % 256)
+    end
+    interrupts_restore(state)
+    return queued
+end
+
+-- Writes every staged byte to the 7-bit `address` in one transaction
+-- (START, address+W, data..., STOP).  Returns false if the bus is busy,
+-- nothing is staged, or more is staged than one transaction carries
+-- (`max_write`).
+pub function start_write(bus: I2c, address: u32): bool
+    local state: u32 = interrupts_disable()
+    local started: bool = false
+    if not busy then
+        if tx_len() > 0 and tx_len() <= ll_max_write() then
+            busy = true
+            op_read = false
+            target = address % 128
+            remaining = 0
+            result = 0
+            started = true
+            ll_start()
+        end
+    end
+    interrupts_restore(state)
+    return started
+end
+
+-- Reads `count` bytes from the 7-bit `address` into the receive ring
+-- (START, address+R, data..., STOP).  Returns false if the bus is busy,
+-- `count` is zero, it exceeds what the controller reads in one transaction
+-- (`max_read`), or the ring cannot hold the answer.
+pub function start_read(bus: I2c, address: u32, count: u32): bool
+    local state: u32 = interrupts_disable()
+    local started: bool = false
+    if not busy then
+        if count > 0 then
+            if count <= ll_max_read() and count + rx_len() <= rx_capacity() then
+                busy = true
+                op_read = true
+                target = address % 128
+                remaining = count
+                result = 0
+                started = true
+                ll_start()
+            end
+        end
+    end
+    interrupts_restore(state)
+    return started
+end
+
+-- Most bytes one `start_write` sends on this board.
+pub function max_write(bus: I2c): u32
+    return ll_max_write()
+end
+
+-- Largest `count` one `start_read` accepts on this board.
+pub function max_read(bus: I2c): u32
+    return ll_max_read()
+end
+
+pub function is_busy(bus: I2c): bool
+    local state: u32 = interrupts_disable()
+    local running: bool = busy
+    interrupts_restore(state)
+    return running
+end
+
+-- Outcome of the last finished transaction (0 ok, 1 NACK, 2 bus error).
+pub function status(bus: I2c): u32
+    local state: u32 = interrupts_disable()
+    local code: u32 = result
+    interrupts_restore(state)
+    return code
+end
+
+-- Lets the driver make progress while the caller waits (see `uart::idle`).
+pub function idle(bus: I2c): void
+    ll_idle()
+end
+
+-- Waits for the running transaction and returns its outcome.
+pub function wait(bus: I2c): u32
+    while is_busy(borrow bus) do
+        ll_idle()
+    end
+    return status(borrow bus)
+end
+
+-- Next received byte, or `None`.
+pub function read(bus: I2c): Option<u32>
+    local state: u32 = interrupts_disable()
+    local ready: bool = rx_len() > 0
+    local value: u32 = 0
+    if ready then
+        value = rx_pop()
+    end
+    interrupts_restore(state)
+    if ready then
+        return Some(value)
+    end
+    return None
+end
+
+pub function available(bus: I2c): u32
+    return rx_len()
+end
+
+-- Interrupt handler body.  Boards with separate event and error vectors call
+-- it from both.
+pub function on_interrupt(): void
+    if busy then
+        ll_service()
+    else
+        ll_quiesce()
+    end
+end
+
+-- Ends the running transaction.  A failed write discards its staged bytes.
+function finish(code: u32): void
+    if code ~= 0 then
+        tx_clear()
+    end
+    result = code
+    remaining = 0
+    busy = false
+end

@@ -1,0 +1,123 @@
+-- lusa::hal::spi -- interrupt-driven, full-duplex SPI master.
+--
+-- `transfer()` queues bytes in the `tx` ring.  The handler clocks one byte at
+-- a time: each receive-complete interrupt stores the byte that came back on
+-- MISO in the `rx` ring and starts the next transfer, so a queued burst runs
+-- without the main program polling the controller.
+
+#[peripheral]
+pub struct Spi { index: u32 }
+
+local claimed: bool = false
+-- True while a byte is on the bus; shared with the handler.
+local active: bool = false
+local configured_frequency: u32 = 0
+local configured_mode: u32 = 0
+
+-- Claims the SPI controller once; later calls return `None`.
+pub function take(): Option<Spi>
+    local state: u32 = interrupts_disable()
+    local first: bool = not claimed
+    claimed = true
+    interrupts_restore(state)
+    if first then
+        return Some(Spi{index: 0})
+    end
+    return None
+end
+
+-- Master mode, 8-bit frames, MSB first.  `mode` is the SPI mode 0-3:
+-- CPOL = mode // 2 and CPHA = mode % 2.  The clock divider is the closest
+-- one that does not exceed `frequency_hz`.
+pub function configure(bus: Spi, frequency_hz: u32, mode: u32): void
+    local state: u32 = interrupts_disable()
+    rx_clear()
+    tx_clear()
+    active = false
+    configured_frequency = frequency_hz
+    configured_mode = mode % 4
+    ll_configure(frequency_hz, mode % 4)
+    interrupts_restore(state)
+end
+
+pub function mode(bus: Spi): u32
+    return configured_mode
+end
+
+pub function frequency(bus: Spi): u32
+    return configured_frequency
+end
+
+-- Queues one byte for a full-duplex exchange.  Returns false when the
+-- transmit ring is full.
+pub function transfer(bus: Spi, byte: u32): bool
+    local state: u32 = interrupts_disable()
+    local queued: bool = tx_push(byte % 256)
+    if queued then
+        if not active then
+            active = true
+            ll_send(tx_pop())
+        end
+    end
+    interrupts_restore(state)
+    return queued
+end
+
+-- Next byte received from the device, or `None`.
+pub function read(bus: Spi): Option<u32>
+    local state: u32 = interrupts_disable()
+    local ready: bool = rx_len() > 0
+    local value: u32 = 0
+    if ready then
+        value = rx_pop()
+    end
+    interrupts_restore(state)
+    if ready then
+        return Some(value)
+    end
+    return None
+end
+
+pub function available(bus: Spi): u32
+    return rx_len()
+end
+
+pub function pending(bus: Spi): u32
+    return tx_len()
+end
+
+pub function overruns(bus: Spi): u32
+    return rx_overruns()
+end
+
+pub function is_busy(bus: Spi): bool
+    local state: u32 = interrupts_disable()
+    local busy: bool = active
+    interrupts_restore(state)
+    return busy
+end
+
+-- Lets the driver make progress while the caller waits (see `uart::idle`).
+pub function idle(bus: Spi): void
+    ll_idle()
+end
+
+-- Waits until every queued byte has been exchanged.
+pub function flush(bus: Spi): void
+    while is_busy(borrow bus) do
+        ll_idle()
+    end
+end
+
+-- Interrupt handler body.
+pub function on_interrupt(): void
+    if ll_rx_ready() then
+        rx_push(ll_receive())
+        if tx_len() > 0 then
+            ll_send(tx_pop())
+        else
+            ll_stop()
+            active = false
+        end
+    end
+end

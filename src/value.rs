@@ -99,6 +99,40 @@ pub fn span0() -> Span {
     Span { start: 0, end: 0 }
 }
 
+thread_local! {
+    /// The most recent string checked by `is_ascii_cached`.
+    static LAST_ASCII: RefCell<Option<(Arc<str>, bool)>> = const { RefCell::new(None) };
+}
+
+/// Whether `text` is pure ASCII, remembered for the most recently checked
+/// string.  String indexing is by character; for ASCII text that equals the
+/// byte index, so `#s`, `string.byte`, and `string.sub` can skip decoding.
+/// Loops such as the self-hosted lexer index one long source string
+/// thousands of times, which made them quadratic.  The cache holds a
+/// reference, so the allocation cannot be reused by a different string.
+pub fn is_ascii_cached(text: &Arc<str>) -> bool {
+    LAST_ASCII.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if let Some((cached, ascii)) = slot.as_ref() {
+            if Arc::ptr_eq(cached, text) {
+                return *ascii;
+            }
+        }
+        let ascii = text.is_ascii();
+        *slot = Some((Arc::clone(text), ascii));
+        ascii
+    })
+}
+
+/// Character count of `text`, constant time for cached ASCII strings.
+pub fn char_len(text: &Arc<str>) -> usize {
+    if is_ascii_cached(text) {
+        text.len()
+    } else {
+        text.chars().count()
+    }
+}
+
 // ===== slots =====
 
 /// A storage slot (a variable, or a table field).

@@ -1,0 +1,140 @@
+-- STM32F4 I2C1 (0x40005400): PB8 = SCL, PB9 = SDA (AF4, open drain).
+-- NVIC IRQ 31 (events) and 32 (errors); install both handlers with
+-- `#[interrupt("I2C1_EV")]` and `#[interrupt("I2C1_ER")]`.
+--
+-- Registers (word offsets): CR1 +0, CR2 +1, DR +4, SR1 +5, SR2 +6, CCR +7,
+-- TRISE +8.  The handler follows the reference-manual event sequence:
+-- SB -> address, ADDR -> clear by reading SR2, TXE/BTF for writes and RXNE
+-- for reads, with ACK cleared and STOP requested before the last byte.
+
+-- CR1 values: PE, PE | START, PE | STOP, PE | ACK.
+local cr1_on: u32 = 1
+local cr2_events: u32 = 1808   -- FREQ = 16 | ITERREN | ITEVTEN | ITBUFEN
+
+function i2c(word: u32): u32
+    return 1073763328 + word * 4
+end
+
+function ll_configure(frequency_hz: u32): void
+    super::clock_ahb1(2)          -- GPIOBEN
+    super::clock_apb1(2097152)    -- I2C1EN (bit 21)
+    super::gpio_alternate(1073873920, 8, 4)
+    super::gpio_alternate(1073873920, 9, 4)
+    super::mmio_set(1073873924, 256)   -- OTYPER: PB8 open drain
+    super::mmio_set(1073873924, 512)   -- OTYPER: PB9 open drain
+    super::mmio_write(i2c(0), 0)
+    super::mmio_write(i2c(1), cr2_events)
+    if frequency_hz > 100000 then
+        -- Fast mode: F/S, CCR = PCLK / (3 * f), TRISE = 300 ns + 1.
+        super::mmio_write(i2c(7), 32768 + super::pclk() // (3 * frequency_hz))
+        super::mmio_write(i2c(8), 6)
+    else
+        -- Standard mode: CCR = PCLK / (2 * f), TRISE = 1000 ns + 1.
+        super::mmio_write(i2c(7), super::pclk() // (2 * frequency_hz))
+        super::mmio_write(i2c(8), 17)
+    end
+    super::mmio_write(i2c(0), cr1_on)
+    super::nvic_enable(31)
+    super::nvic_enable(32)
+end
+
+-- Transfers are byte-by-byte; the rings are the only bound.
+function ll_max_read(): u32
+    return 64
+end
+
+function ll_max_write(): u32
+    return 64
+end
+
+-- START condition; the SB event continues the transaction.
+function ll_start(): void
+    super::mmio_write(i2c(1), cr2_events)
+    if op_read then
+        super::mmio_write(i2c(0), cr1_on + 1024 + 256)   -- ACK | START
+    else
+        super::mmio_write(i2c(0), cr1_on + 256)          -- START
+    end
+end
+
+function stop_with(code: u32): void
+    super::mmio_write(i2c(0), cr1_on + 512)              -- STOP
+    finish(code)
+end
+
+function ll_service(): void
+    local sr1: u32 = super::mmio_read(i2c(5))
+    if super::has_bit(sr1, 1024) then                    -- AF: NACK
+        super::mmio_write(i2c(5), super::without_bit(sr1, 1024))
+        stop_with(1)
+        return
+    end
+    if super::has_bit(sr1, 256) or super::has_bit(sr1, 512) then   -- BERR, ARLO
+        super::mmio_write(i2c(5), 0)
+        stop_with(2)
+        return
+    end
+    if super::has_bit(sr1, 1) then                       -- SB
+        if op_read then
+            super::mmio_write(i2c(4), target * 2 + 1)
+        else
+            super::mmio_write(i2c(4), target * 2)
+        end
+        return
+    end
+    if super::has_bit(sr1, 2) then                       -- ADDR
+        if op_read then
+            if remaining == 1 then
+                -- Single byte: NACK it and request STOP before clearing ADDR.
+                super::mmio_write(i2c(0), cr1_on)
+                super::mmio_read(i2c(6))
+                super::mmio_write(i2c(0), cr1_on + 512)
+            else
+                super::mmio_read(i2c(6))
+            end
+        else
+            super::mmio_read(i2c(6))
+        end
+        return
+    end
+    if op_read then
+        if super::has_bit(sr1, 64) then                  -- RXNE
+            rx_push(super::mmio_read(i2c(4)) % 256)
+            remaining = remaining - 1
+            if remaining == 1 then
+                -- Second-to-last byte read: NACK the last one and request
+                -- STOP after it.
+                super::mmio_write(i2c(0), cr1_on + 512)
+            end
+            if remaining == 0 then
+                finish(0)
+            end
+        end
+        return
+    end
+    if super::has_bit(sr1, 128) then                     -- TXE
+        if tx_len() > 0 then
+            super::mmio_write(i2c(4), tx_pop())
+        else
+            -- Last byte handed over: stop buffer interrupts and wait for BTF.
+            super::mmio_write(i2c(1), cr2_events - 1024)
+            if super::has_bit(sr1, 4) then               -- BTF
+                stop_with(0)
+            end
+        end
+        return
+    end
+    if super::has_bit(sr1, 4) then                       -- BTF
+        stop_with(0)
+    end
+end
+
+-- An event outside a transaction: read the status so a level-sensitive
+-- event cannot fire again.
+function ll_quiesce(): void
+    super::mmio_read(i2c(5))
+    super::mmio_read(i2c(6))
+end
+
+function ll_idle(): void
+end

@@ -1,0 +1,103 @@
+-- ESP32-C3 board support shared by the drivers (`super::` from each driver).
+--
+-- Lusa has no bitwise operators, so register fields are updated with
+-- arithmetic: a power-of-two `mask` selects one bit, and a field is described
+-- by its lowest bit value `unit` and its number of states `span`.  Addresses
+-- are decimal; the hexadecimal value is in the comment.
+
+function mmio_read(address: u32): u32
+    local value: u32 = 0
+    unsafe do
+        local reg: *mut u32 = unsafe_ptr_cast(address)
+        value = reg.read_volatile()
+    end
+    return value
+end
+
+function mmio_write(address: u32, value: u32): void
+    unsafe do
+        local reg: *mut u32 = unsafe_ptr_cast(address)
+        reg.write_volatile(value)
+    end
+end
+
+function has_bit(value: u32, mask: u32): bool
+    return (value // mask) % 2 ~= 0
+end
+
+function with_bit(value: u32, mask: u32): u32
+    if has_bit(value, mask) then
+        return value
+    end
+    return value + mask
+end
+
+function without_bit(value: u32, mask: u32): u32
+    if has_bit(value, mask) then
+        return value - mask
+    end
+    return value
+end
+
+-- `value` with the field [unit, unit * span) replaced by `field`.
+function with_field(value: u32, unit: u32, span: u32, field: u32): u32
+    local old: u32 = (value // unit) % span
+    return value - old * unit + (field % span) * unit
+end
+
+function mmio_set(address: u32, mask: u32): void
+    mmio_write(address, with_bit(mmio_read(address), mask))
+end
+
+function mmio_field(address: u32, unit: u32, span: u32, field: u32): void
+    mmio_write(address, with_field(mmio_read(address), unit, span, field))
+end
+
+function pow2(exponent: u32): u32
+    local value: u32 = 1
+    local i: u32 = 0
+    while i < exponent do
+        value = value * 2
+        i = i + 1
+    end
+    return value
+end
+
+-- Peripheral clock gate and reset (SYSTEM_PERIP_CLK_EN0 0x600C0010,
+-- SYSTEM_PERIP_RST_EN0 0x600C0018): enable the clock, release the reset.
+function peripheral_on(mask: u32): void
+    mmio_set(1611399184, mask)
+    mmio_write(1611399192, without_bit(mmio_read(1611399192), mask))
+end
+
+-- Routes interrupt source `source` through the interrupt matrix
+-- (0x600C2000 + 4 * source) to CPU interrupt 11, which traps with
+-- `mcause` 11: the `machine_external` vector.  Several drivers share it, so
+-- one handler calls each driver's `on_interrupt()`.
+function route_interrupt(source: u32): void
+    mmio_write(1611407360 + source * 4, 11)
+    mmio_write(1611407680, 1)               -- CPU_INT_PRI_11 (0x600C2140)
+    mmio_write(1611407764, 1)               -- CPU_INT_THRESH (0x600C2194)
+    mmio_set(1611407620, 2048)              -- CPU_INT_ENABLE (0x600C2104)
+end
+
+-- IO MUX (0x60009000, GPIOn at +4 + 4n): MCU_SEL (bits 12..14) picks the
+-- pin function; FUN_IE (bit 9) enables the input.
+function iomux_function(pin: u32, func: u32): void
+    local address: u32 = 1610649604 + pin * 4
+    mmio_write(address, with_field(with_bit(mmio_read(address), 512), 4096, 8, func))
+end
+
+-- GPIO matrix (0x60004000): drive `pin` from peripheral output `signal`
+-- (FUNCn_OUT_SEL_CFG at +0x554) and feed input `signal` from `pin`
+-- (FUNCy_IN_SEL_CFG at +0x154, SEL = bit 6).
+function matrix_pin(pin: u32, signal: u32): void
+    mmio_write(1610630484 + pin * 4, signal)
+    mmio_write(1610629460 + signal * 4, 64 + pin)
+    iomux_function(pin, 1)
+end
+
+-- APB clock after the ROM bootloader: 80 MHz.
+function apb(): u32
+    return 80000000
+end

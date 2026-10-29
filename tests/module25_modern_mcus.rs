@@ -117,8 +117,12 @@ fn render_script(target: &TargetSpec, dir: &Path, elf: &Path) -> (PathBuf, PathB
     let platform = dir.join("platform.repl");
     std::fs::write(&platform, target.renode_platform).expect("write Renode platform");
     let uart = dir.join("uart.log");
+    let models = target
+        .write_renode_models(dir)
+        .expect("write Renode peripheral models");
     let script = target
         .renode_script
+        .replace("@MODELS@", &models)
         .replace("@PLATFORM@", &format!("@{}", slash_path(&platform)))
         .replace("@ELF@", &format!("@{}", slash_path(elf)))
         .replace("@UART_LOG@", &slash_path(&uart));
@@ -293,7 +297,7 @@ fn modern_mcu_memory_maps_match_hardware() {
     assert!(targets::ESP32C3.linker_script.contains("LENGTH = 400K"));
     assert!(targets::ESP32C3.renode_platform.contains("CPU.RiscV32"));
     assert!(targets::ESP32C3.renode_platform.contains("rv32imc"));
-    assert!(targets::ESP32C3.renode_platform.contains("UART.ESP32_UART"));
+    assert!(targets::ESP32C3.renode_platform.contains("UART.LusaEsp32C3Uart"));
     assert!(targets::ESP32C3.renode_platform.contains("Timers.Arm_CMSDK_Timer"));
 }
 

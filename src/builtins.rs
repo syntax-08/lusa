@@ -1009,9 +1009,9 @@ fn string_mod() -> Vec<(&'static str, BF)> {
     vec![
         (
             "len",
-            Box::new(|_: &mut Interp, a: Vec<Value>, s: Span| {
-                let v = to_str(get(&a, 0, "s", s)?);
-                one(Value::Number(v.chars().count() as f64))
+            Box::new(|_: &mut Interp, a: Vec<Value>, s: Span| match get(&a, 0, "s", s)?.base_value() {
+                Value::Str(text) => one(Value::Number(crate::value::char_len(&text) as f64)),
+                other => one(Value::Number(to_str(&other).chars().count() as f64)),
             }),
         ),
         (
@@ -1031,8 +1031,21 @@ fn string_mod() -> Vec<(&'static str, BF)> {
         (
             "sub",
             Box::new(|_: &mut Interp, a: Vec<Value>, s: Span| {
-                let src = to_str(get(&a, 0, "s", s)?);
-                let len = src.chars().count() as f64;
+                // ASCII subjects are sliced by byte without decoding them.
+                let subject = get(&a, 0, "s", s)?.base_value();
+                let mut chars: Vec<char> = Vec::new();
+                let ascii = match &subject {
+                    Value::Str(text) if crate::value::is_ascii_cached(text) => Some(Arc::clone(text)),
+                    _ => None,
+                };
+                let count = match &ascii {
+                    Some(text) => text.len(),
+                    None => {
+                        chars = to_str(&subject).chars().collect();
+                        chars.len()
+                    }
+                };
+                let len = count as f64;
                 let norm = |x: f64, dflt: f64| -> usize {
                     if x.is_nan() {
                         dflt as usize
@@ -1046,11 +1059,13 @@ fn string_mod() -> Vec<(&'static str, BF)> {
                     Some(Value::Number(n)) => norm(*n, len),
                     _ => len as usize,
                 };
-                let empty: Vec<char> = src.chars().collect();
                 let (b, e) = if i0 == 0 { (0usize, j0.saturating_sub(1)) } else { (i0 - 1, j0) };
-                let b = b.min(e + 1).min(empty.len());
-                let e = e.min(empty.len());
-                one(Value::Str(Arc::from(empty[b..e].iter().collect::<String>().as_str())))
+                let b = b.min(e + 1).min(count);
+                let e = e.min(count);
+                match &ascii {
+                    Some(text) => one(Value::Str(Arc::from(&text[b..e.max(b)]))),
+                    None => one(Value::Str(Arc::from(chars[b..e].iter().collect::<String>().as_str()))),
+                }
             }),
         ),
         (
@@ -1085,8 +1100,32 @@ fn string_mod() -> Vec<(&'static str, BF)> {
         (
             "byte",
             Box::new(|_: &mut Interp, a: Vec<Value>, s: Span| {
-                let src = to_str(get(&a, 0, "s", s)?);
-                let chars: Vec<char> = src.chars().collect();
+                let subject = get(&a, 0, "s", s)?.base_value();
+                // ASCII subjects: the character code is the byte, no decoding.
+                let chars: Vec<char> = match &subject {
+                    Value::Str(text) if crate::value::is_ascii_cached(text) => {
+                        let bytes = text.as_bytes();
+                        let len = bytes.len();
+                        let i0 = match a.get(1) {
+                            Some(Value::Number(n)) => *n,
+                            _ => 1.0,
+                        };
+                        let j0 = match a.get(2) {
+                            Some(Value::Number(n)) => *n,
+                            _ => i0,
+                        };
+                        let lo = (i0.max(1.0) as usize).min(len);
+                        let hi = (j0.max(lo as f64) as usize).min(len);
+                        let mut out = Vec::new();
+                        if lo >= 1 {
+                            for k in lo..=hi {
+                                out.push(Value::Number(bytes[k - 1] as f64));
+                            }
+                        }
+                        return Ok(out);
+                    }
+                    _ => to_str(&subject).chars().collect(),
+                };
                 let len = chars.len() as f64;
                 let i0 = match a.get(1) {
                     Some(Value::Number(n)) => *n,

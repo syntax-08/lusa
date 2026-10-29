@@ -85,4 +85,4 @@ jobs:
           "$root/bin/arm-none-eabi-gcc" --version | head -n 1
 
       - name: Cross-compile and run Lusa firmware in Renode
-        run: cargo test --test module24_renode --test module25_modern_mcus --test module26_interrupts -- --test-threads=1 --nocapture
+        run: cargo test --test module24_renode --test module25_modern_mcus --test module26_interrupts --test module27_drivers -- --test-threads=1 --nocapture

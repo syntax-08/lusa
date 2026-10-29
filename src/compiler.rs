@@ -27,6 +27,10 @@ use crate::value::{SlotV, Value};
 pub struct Compiled {
     pub proto: Rc<Chunk>,
     pub upvals: Vec<UpDef>,
+    /// Struct declarations of the whole program (root unit only).  The VM
+    /// registers them with the runtime so struct ownership (heap-bearing and
+    /// `#[peripheral]` structs move) matches the interpreter.
+    pub structs: Vec<crate::interp::StructDef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,6 +352,8 @@ struct Compiler {
     /// `struct` declarations seen so far (declaration order matters, like
     /// the interpreter's runtime registration).
     struct_defs: HashMap<String, Vec<(String, String)>>,
+    /// Every struct declaration in source order, with its attributes.
+    struct_list: Vec<crate::interp::StructDef>,
 }
 
 impl Frame {
@@ -1104,6 +1110,7 @@ pub fn compile_runtime_function(
         frames: vec![Frame::new("runtime", None)],
         source,
         struct_defs: structs.clone(),
+        struct_list: Vec::new(),
     };
 
     // Expose every name visible through the closure environment. The compiler
@@ -1415,6 +1422,7 @@ fn compile_nested_fn(c: &mut Compiler, lit: &FuncLit, name: &str) -> LResult<()>
             source_map: Some(c.source.clone()),
         }),
         upvals: frame.upvals,
+        structs: Vec::new(),
     });
     let idx = c.frames.last().expect("parent frame").protos.len() as u16;
     c.frames.last_mut().expect("parent frame").protos.push(compiled);
@@ -1438,11 +1446,16 @@ fn compile_stmt(c: &mut Compiler, st: &St) -> LResult<()> {
         StKind::Local { targets, values, annotations, .. } => {
             compile_local(c, targets, values, annotations, st.span)?
         }
-        StKind::Struct { name, fields, .. } => {
+        StKind::Struct { name, fields, peripheral, .. } => {
             let list = fields
                 .iter()
                 .map(|f| (f.name.clone(), f.ty.clone()))
                 .collect::<Vec<_>>();
+            c.struct_list.push(crate::interp::StructDef {
+                name: name.clone(),
+                fields: list.clone(),
+                peripheral: *peripheral,
+            });
             c.struct_defs.insert(name.clone(), list);
         }
         StKind::Unsafe { body } => {
@@ -1970,6 +1983,7 @@ pub fn compile_program_with_base(src: &str, base: Option<&Path>) -> LResult<Rc<C
         frames: vec![Frame::new("main", None)],
         source,
         struct_defs: HashMap::new(),
+        struct_list: Vec::new(),
     };
     {
         let f = c.cur();
@@ -2001,6 +2015,7 @@ pub fn compile_program_with_base(src: &str, base: Option<&Path>) -> LResult<Rc<C
             source_map: Some(c.source.clone()),
         }),
         upvals: f.upvals,
+        structs: std::mem::take(&mut c.struct_list),
     }))
 }
 

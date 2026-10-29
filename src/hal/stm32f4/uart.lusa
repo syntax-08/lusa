@@ -1,0 +1,46 @@
+-- STM32F4 USART2 (0x40004400): PA2 = TX, PA3 = RX (AF7).
+-- NVIC IRQ 38; install the handler with `#[interrupt("USART2")]`.
+--
+-- Registers (word offsets): SR +0, DR +1, BRR +2, CR1 +3.
+-- CR1 keeps UE | TE | RE | RXNEIE (0x202C) set; TXEIE (0x80) is enabled only
+-- while the transmit ring holds data.
+
+function usart(word: u32): u32
+    return 1073759232 + word * 4
+end
+
+function ll_configure(baud: u32): void
+    super::clock_ahb1(1)          -- GPIOAEN
+    super::clock_apb1(131072)     -- USART2EN (bit 17)
+    super::gpio_alternate(1073872896, 2, 7)
+    super::gpio_alternate(1073872896, 3, 7)
+    super::mmio_write(usart(3), 0)
+    super::mmio_write(usart(2), super::pclk() // baud)
+    super::mmio_write(usart(3), 8236)
+    super::nvic_enable(38)
+end
+
+function ll_start_tx(): void
+    super::mmio_write(usart(3), 8364)   -- + TXEIE
+end
+
+function ll_service(): void
+    local status: u32 = super::mmio_read(usart(0))
+    while super::has_bit(status, 32) do          -- RXNE
+        rx_push(super::mmio_read(usart(1)) % 256)
+        status = super::mmio_read(usart(0))
+    end
+    if tx_busy then
+        if super::has_bit(status, 128) then      -- TXE
+            if tx_len() > 0 then
+                super::mmio_write(usart(1), tx_pop())
+            else
+                super::mmio_write(usart(3), 8236)  -- TXEIE off
+                tx_busy = false
+            end
+        end
+    end
+end
+
+function ll_idle(): void
+end

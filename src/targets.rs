@@ -40,6 +40,15 @@ pub struct InterruptVector {
     pub number: u16,
 }
 
+/// A Renode peripheral model compiled by the monitor at start-up
+/// (`include @Model.cs`).  The platform description then refers to it by its
+/// C# type name.
+#[derive(Clone, Copy, Debug)]
+pub struct RenodeModel {
+    pub file: &'static str,
+    pub source: &'static str,
+}
+
 /// A complete cross-compilation recipe.
 #[derive(Clone, Copy, Debug)]
 pub struct TargetSpec {
@@ -72,6 +81,12 @@ pub struct TargetSpec {
     pub vectors: &'static [InterruptVector],
     /// Vector selected by a bare `#[interrupt]` (empty for host targets).
     pub default_vector: &'static str,
+    /// `lusa::hal` driver family bundled for this target (`host`, `stm32f4`,
+    /// `rp2040`, `esp32c3`), or empty when the board has no HAL drivers.
+    pub hal: &'static str,
+    /// Custom Renode peripheral models (C# sources) loaded by the monitor
+    /// script before the platform, for blocks Renode does not ship.
+    pub renode_models: &'static [RenodeModel],
 }
 
 impl TargetSpec {
@@ -155,6 +170,27 @@ impl TargetSpec {
         source
     }
 
+    /// Writes this board's custom Renode peripheral models into `dir` and
+    /// returns the monitor lines that replace the `@MODELS@` marker of
+    /// `renode_script` (empty when the board needs none).
+    pub fn write_renode_models(&self, dir: &std::path::Path) -> std::io::Result<String> {
+        let mut lines = String::new();
+        for model in self.renode_models {
+            let path = dir.join(model.file);
+            std::fs::write(&path, model.source)?;
+            let shown = path
+                .canonicalize()
+                .unwrap_or(path)
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            lines.push_str("include @");
+            lines.push_str(&shown);
+            lines.push('\n');
+        }
+        Ok(lines.trim_end().to_string())
+    }
+
     /// Renders the embedded linker script, adding a fallback definition for
     /// every generated vector wrapper so unused vectors still link.
     pub fn linker_source(&self) -> String {
@@ -177,18 +213,47 @@ static RISCV_VECTORS: &[InterruptVector] = &[
     InterruptVector { name: "machine_external", number: 11 },
 ];
 
-/// RP2040 exception numbers: SysTick = 15, UART0 IRQ 20 = exception 36.
+/// RP2040 exception numbers: SysTick = 15, SPI0 IRQ 18 = 34, UART0 IRQ 20 =
+/// 36, I2C0 IRQ 23 = 39.
 static RP2040_VECTORS: &[InterruptVector] = &[
     InterruptVector { name: "systick", number: 15 },
+    InterruptVector { name: "spi0", number: 34 },
     InterruptVector { name: "uart0", number: 36 },
+    InterruptVector { name: "i2c0", number: 39 },
 ];
 
-/// STM32F4 exception numbers: SysTick = 15, TIM2 IRQ 28 = 44,
-/// USART2 IRQ 38 = 54.
+/// STM32F4 exception numbers: SysTick = 15, TIM2 IRQ 28 = 44, I2C1 event
+/// IRQ 31 = 47, I2C1 error IRQ 32 = 48, SPI1 IRQ 35 = 51, USART2 IRQ 38 = 54.
 static STM32F4_VECTORS: &[InterruptVector] = &[
     InterruptVector { name: "systick", number: 15 },
     InterruptVector { name: "tim2", number: 44 },
+    InterruptVector { name: "i2c1_ev", number: 47 },
+    InterruptVector { name: "i2c1_er", number: 48 },
+    InterruptVector { name: "spi1", number: 51 },
     InterruptVector { name: "usart2", number: 54 },
+];
+
+/// Renode 1.17 has no PL022, so the RP2040 SPI0 block is a repository model.
+static RP2040_MODELS: &[RenodeModel] = &[RenodeModel {
+    file: "LusaRp2040Spi.cs",
+    source: include_str!("../renode/models/LusaRp2040Spi.cs"),
+}];
+
+/// Renode 1.17 ships an ESP32 UART without RX interrupts or FIFO counts and no
+/// ESP32-C3 SPI or I2C controllers; these repository models fill the gaps.
+static ESP32C3_MODELS: &[RenodeModel] = &[
+    RenodeModel {
+        file: "LusaEsp32C3Uart.cs",
+        source: include_str!("../renode/models/LusaEsp32C3Uart.cs"),
+    },
+    RenodeModel {
+        file: "LusaEsp32C3Spi.cs",
+        source: include_str!("../renode/models/LusaEsp32C3Spi.cs"),
+    },
+    RenodeModel {
+        file: "LusaEsp32C3I2c.cs",
+        source: include_str!("../renode/models/LusaEsp32C3I2c.cs"),
+    },
 ];
 
 /// The host target.  Its toolchain details are resolved by the existing host
@@ -209,6 +274,8 @@ pub static HOST: TargetSpec = TargetSpec {
     renode_script: "",
     vectors: &[],
     default_vector: "",
+    hal: "host",
+    renode_models: &[],
 };
 
 /// Renode's 32-bit RISC-V `virt` machine with an NS16550 UART.
@@ -237,6 +304,8 @@ pub static RISCV32_VIRT: TargetSpec = TargetSpec {
     renode_script: include_str!("../renode/lusa_riscv32_virt.resc"),
     vectors: RISCV_VECTORS,
     default_vector: "machine_timer",
+    hal: "",
+    renode_models: &[],
 };
 
 /// Renode's 64-bit RISC-V `virt` machine with an NS16550 UART.
@@ -265,6 +334,8 @@ pub static RISCV64_VIRT: TargetSpec = TargetSpec {
     renode_script: include_str!("../renode/lusa_riscv64_virt.resc"),
     vectors: RISCV_VECTORS,
     default_vector: "machine_timer",
+    hal: "",
+    renode_models: &[],
 };
 
 /// Raspberry Pi RP2040: dual Cortex-M0+, 2 MiB flash, 264 KiB SRAM.
@@ -288,6 +359,8 @@ pub static RP2040: TargetSpec = TargetSpec {
     renode_script: include_str!("../renode/lusa_rp2040.resc"),
     vectors: RP2040_VECTORS,
     default_vector: "systick",
+    hal: "rp2040",
+    renode_models: RP2040_MODELS,
 };
 
 /// STM32F4: Cortex-M4, 1 MiB flash, 128 KiB SRAM.
@@ -311,6 +384,8 @@ pub static STM32F4: TargetSpec = TargetSpec {
     renode_script: include_str!("../renode/lusa_stm32f4.resc"),
     vectors: STM32F4_VECTORS,
     default_vector: "tim2",
+    hal: "stm32f4",
+    renode_models: &[],
 };
 
 /// Espressif ESP32-C3: RV32IMC, 4 MiB flash, 400 KiB SRAM.
@@ -339,6 +414,8 @@ pub static ESP32C3: TargetSpec = TargetSpec {
     renode_script: include_str!("../renode/lusa_esp32c3.resc"),
     vectors: RISCV_VECTORS,
     default_vector: "machine_timer",
+    hal: "esp32c3",
+    renode_models: ESP32C3_MODELS,
 };
 
 /// Every non-host target offered by `lusalang build --target`.
@@ -432,7 +509,7 @@ mod tests {
         assert!(ESP32C3.linker_script.contains("LENGTH = 400K"));
         assert!(ESP32C3.renode_platform.contains("CPU.RiscV32"));
         assert!(ESP32C3.renode_platform.contains("rv32imc"));
-        assert!(ESP32C3.renode_platform.contains("UART.ESP32_UART"));
+        assert!(ESP32C3.renode_platform.contains("UART.LusaEsp32C3Uart"));
         assert!(ESP32C3.renode_platform.contains("Timers.Arm_CMSDK_Timer"));
 
         for target in CROSS_TARGETS {

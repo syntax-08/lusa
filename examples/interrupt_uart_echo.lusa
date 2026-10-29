@@ -1,0 +1,105 @@
+-- Module 27 example: an interrupt-driven UART echo server on STM32F4.
+--
+--   lusalang build examples/interrupt_uart_echo.lusa --target stm32f4
+--
+-- `uart::take()` claims USART2 once and returns a `#[peripheral]` token, so
+-- no other code can configure the same registers.  The token is lent to each
+-- driver call with `borrow`; passing it by value would move it away.
+--
+-- USART2 raises IRQ 38.  `#[interrupt("USART2")]` installs `serial_irq` at
+-- exception 54, and the handler moves bytes between the controller and the
+-- driver's receive/transmit rings.  The main loop only looks at the rings:
+-- it never polls a status register.  It echoes every byte and, after each
+-- line, reports how many bytes the line held.  Sending `!` ends the session
+-- with a summary.
+--
+-- tests/module27_drivers.rs types `hello lusa`, `ping`, and `!` into the
+-- Renode UART and asserts the transcript byte-for-byte.
+
+#[no_std]
+use lusa::hal::uart;
+
+#[interrupt("USART2")]
+function serial_irq(): void
+    uart::on_interrupt()
+end
+
+-- Queues `count` bytes from `text`.  The transmit ring holds 64 bytes, so a
+-- full ring makes the loop wait for the handler to drain it.
+function send(port: uart::Uart, text: *mut u32, count: u32): void
+    local i: u32 = 0
+    unsafe do
+        local cursor: *mut u32 = text
+        while i < count do
+            if uart::write(borrow port, *cursor) then
+                cursor = cursor + 1
+                i = i + 1
+            end
+        end
+    end
+end
+
+-- Writes `value` in decimal.
+function send_number(port: uart::Uart, value: u32): void
+    local digits: [u32; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    local count: u32 = 0
+    local rest: u32 = value
+    repeat
+        digits[count] = 48 + rest % 10
+        rest = rest // 10
+        count = count + 1
+    until rest == 0
+    while count > 0 do
+        count = count - 1
+        while not uart::write(borrow port, digits[count]) do
+        end
+    end
+end
+
+#[entry]
+function main(): void
+    local port: uart::Uart = uart::take():unwrap()
+    uart::configure(borrow port, 115200)
+    interrupts_enable()
+
+    local banner: [u32; 16] = [
+        76, 85, 83, 65, 32, 69, 67, 72, 79, 32, 82, 69, 65, 68, 89, 10
+    ]
+    send(borrow port, &banner[0], 16)          -- "LUSA ECHO READY\n"
+
+    local open: [u32; 2] = [91, 32]            -- "[ "
+    local close: [u32; 8] = [32, 98, 121, 116, 101, 115, 93, 10]   -- " bytes]\n"
+    local done: [u32; 6] = [98, 121, 101, 32, 108, 61]             -- "bye l="
+
+    local line: u32 = 0
+    local lines: u32 = 0
+    local running: bool = true
+    while running do
+        match uart::read(borrow port) with
+        | Some(byte) =>
+            if byte == 33 then                 -- `!` ends the session
+                running = false
+            else
+                while not uart::write(borrow port, byte) do
+                end
+                if byte == 10 then
+                    send(borrow port, &open[0], 2)
+                    send_number(borrow port, line)
+                    send(borrow port, &close[0], 8)
+                    line = 0
+                    lines = lines + 1
+                else
+                    line = line + 1
+                end
+            end
+        | None => uart::idle(borrow port)
+        end
+    end
+
+    send(borrow port, &done[0], 6)
+    send_number(borrow port, lines)
+    send(borrow port, &banner[15], 1)          -- "\n"
+    uart::flush(borrow port)
+    while true do
+    end
+end

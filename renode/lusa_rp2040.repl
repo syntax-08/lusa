@@ -1,6 +1,10 @@
 // Minimal Raspberry Pi RP2040 platform for Lusa bare-metal images.
 // Renode 1.17 has no RP2040 SIO/TIMER peripherals, so the SIO GPIO output
 // block is backed by MappedMemory and timing uses the architectural SysTick.
+// Renode also lacks the PL022 SPI block; `SPI.LusaRp2040Spi` comes from
+// renode/models/LusaRp2040Spi.cs, which the monitor script includes first
+// (`@MODELS@`).  SPI0 drives an MISO/MOSI loopback and I2C0 (the stock
+// DesignWare model) an echo device at 0x55 for the `lusa::hal` tests.
 // The CPU model is cortex-m0: Renode does not expose cortex-m0plus.
 flash: Memory.MappedMemory @ sysbus 0x10000000
     size: 0x200000
@@ -13,6 +17,28 @@ sio: Memory.MappedMemory @ sysbus 0xD0000000
 
 uart0: UART.PL011 @ sysbus 0x40034000
     -> nvic@20
+
+spi0: SPI.LusaRp2040Spi @ sysbus 0x4003C000
+    -> nvic@18
+
+spiLoopback: SPI.SPILoopback @ spi0
+
+i2c0: I2C.DesignWare_APB_I2C @ sysbus 0x40044000
+    -> nvic@23
+
+i2cEcho: Mocks.EchoI2CDevice @ i2c0 0x55
+
+// RESETS, CLOCKS, and IO_BANK0 are plain memory (each window covers the
+// atomic +0x1000..+0x3000 aliases).  RESET_DONE therefore reads 0; the
+// drivers bound their wait for it.
+resets: Memory.MappedMemory @ sysbus 0x4000C000
+    size: 0x4000
+
+clocks: Memory.MappedMemory @ sysbus 0x40008000
+    size: 0x4000
+
+ioBank0: Memory.MappedMemory @ sysbus 0x40014000
+    size: 0x4000
 
 nvic: IRQControllers.NVIC @ sysbus 0xE000E000
     priorityMask: 0xF0

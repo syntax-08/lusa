@@ -129,6 +129,9 @@ print(temp::sample(72))
 - `crate::` starts at the root, `self::` at the current module, and `super::`
   at the parent module. Plain paths start at the current module, so use one of
   the roots for cross-module access.
+- `lusa::` names the bundled driver crate from any module (`use
+  lusa::hal::uart;`); it is spliced in only when a program mentions it. See
+  section 9.18.
 - `use path::*` imports every public item of a module.
 - Grouped imports (`use a::{b, c}`) are not supported yet; write one `use` per
   name.
@@ -559,6 +562,7 @@ Codes `E{category}{n}`, like rustc:
 | E1003  | reserved | (future) access through a borrow whose owner was moved |
 | E1004  | borrow   | write through an immutable borrow |
 | E1005  | reserved | (future) move out through a borrow |
+| E1006  | ownership | `clone` of a `#[peripheral]` resource token, or of a struct that contains one |
 | E2001  | type     | arithmetic with a non-number |
 | E2002  | type     | concat (`..`) with a non-string/number |
 | E2003  | type     | comparison of incomparable types |
@@ -1875,9 +1879,9 @@ peripherals available in Renode 1.17:
 
 | platform | memory | peripherals |
 |----------|--------|-------------|
-| `renode/lusa_rp2040.repl` | 2 MiB flash `0x10000000`, 264 KiB SRAM `0x20000000`, 4 KiB SIO window `0xD0000000` | `cpu0`/`cpu1` `CPU.CortexM` (`cortex-m0`), `nvic` at `0xE000E000`, `nvic1` at `0xE000F000`, `UART.PL011` at `0x40034000`, SysTick in each NVIC |
-| `renode/lusa_stm32f4.repl` | 1 MiB flash `0x08000000`, 128 KiB SRAM `0x20000000` | `UART.STM32_UART` at `0x40004400`, `GPIOPort.STM32_GPIOPort` at `0x40020000`, `Timers.STM32_Timer` at `0x40000000`, NVIC/SysTick |
-| `renode/lusa_esp32c3.repl` | 4 MiB flash `0x42000000`, 400 KiB SRAM `0x3FC80000`, GPIO window `0x60004000` | `CPU.RiscV32` (`rv32imc`), `UART.ESP32_UART` at `0x60000000`, `Timers.Arm_CMSDK_Timer` at `0x6001F000` |
+| `renode/lusa_rp2040.repl` | 2 MiB flash `0x10000000`, 264 KiB SRAM `0x20000000`, 4 KiB SIO window `0xD0000000` | `cpu0`/`cpu1` `CPU.CortexM` (`cortex-m0`), `nvic` at `0xE000E000`, `nvic1` at `0xE000F000`, `UART.PL011` at `0x40034000`, `SPI.LusaRp2040Spi` at `0x4003C000`, `I2C.DesignWare_APB_I2C` at `0x40044000`, SysTick in each NVIC |
+| `renode/lusa_stm32f4.repl` | 1 MiB flash `0x08000000`, 128 KiB SRAM `0x20000000` | `UART.STM32_UART` at `0x40004400`, `GPIOPort.STM32_GPIOPort` at `0x40020000`, `Timers.STM32_Timer` at `0x40000000`, `SPI.STM32SPI` at `0x40013000`, `I2C.STM32F1_I2C` at `0x40005400`, NVIC/SysTick |
+| `renode/lusa_esp32c3.repl` | 4 MiB flash `0x42000000`, 400 KiB SRAM `0x3FC80000`, GPIO window `0x60004000` | `CPU.RiscV32` (`rv32imc_zicsr`), `UART.LusaEsp32C3Uart` at `0x60000000`, `SPI.LusaEsp32C3Spi` at `0x60024000`, `I2C.LusaEsp32C3I2c` at `0x60013000`, `Timers.Arm_CMSDK_Timer` at `0x6001F000` |
 
 Renode 1.17 does not ship RP2040 SIO, RP2040 TIMER, ESP32-C3 GPIO, or ESP32-C3
 TIMG models. The platforms compensate without changing the register addresses
@@ -1904,13 +1908,18 @@ read-modify-writing them.
 
 #### Running Renode
 
-The monitor templates live in `renode/` and use three substitutions:
+The monitor templates live in `renode/` and use these substitutions:
 
 | placeholder | replacement |
 |-------------|-------------|
+| `@MODELS@` | `include @<path>` lines for the board's repository peripheral models (RP2040 and ESP32-C3 only; see section 9.18) |
 | `@PLATFORM@` | `@<absolute forward-slash path to the .repl>` |
 | `@ELF@` | `@<absolute path to the .elf>` |
 | `@UART_LOG@` | plain absolute path to the UART log file (quoted by the template) |
+
+`TargetSpec::write_renode_models(dir)` copies the C# models next to the
+script and returns the `@MODELS@` text; Renode compiles them when the script
+runs, before the platform description refers to their types.
 
 The leading `@` on the platform and ELF substitutions is Renode's file
 reference marker; dropping it produces `Could not tokenize here`. The rendered
@@ -1944,6 +1953,7 @@ a script that captures a fixed window and then quits.
 cargo test --test module24_renode -- --test-threads=1 --nocapture
 cargo test --test module25_modern_mcus -- --test-threads=1 --nocapture
 cargo test --test module26_interrupts -- --test-threads=1 --nocapture
+cargo test --test module27_drivers -- --test-threads=1 --nocapture
 ```
 
 The static tests (platform/UART definitions, freestanding C, hosted/no-entry
@@ -1956,13 +1966,16 @@ $env:LUSA_RISCV_CC = "C:\tools\riscv-none-elf-gcc\bin\riscv-none-elf-gcc.exe"
 $env:LUSA_ESP32_CC = $env:LUSA_RISCV_CC
 $env:LUSA_ARM_CC = "C:\tools\arm-none-eabi-gcc\bin\arm-none-eabi-gcc.exe"
 $env:LUSA_RENODE = "C:\tools\renode\renode.exe"
-cargo test --test module24_renode --test module25_modern_mcus --test module26_interrupts -- --test-threads=1 --nocapture
+cargo test --test module24_renode --test module25_modern_mcus --test module26_interrupts --test module27_drivers -- --test-threads=1 --nocapture
 ```
 
 Set `LUSA_KEEP_RENODE_ARTIFACTS=1` to keep the generated platform, script,
 ELF, and UART log. `.github/workflows/renode.yml` downloads Renode, xPack
 RISC-V GCC, and xPack Arm GCC on Ubuntu, sets `LUSA_RISCV_CC`,
-`LUSA_ESP32_CC`, `LUSA_ARM_CC`, and `LUSA_RENODE`, and runs the three suites.
+`LUSA_ESP32_CC`, `LUSA_ARM_CC`, and `LUSA_RENODE`, and runs the four suites.
+The RISC-V platforms declare `rv32imc_zicsr`/`rv32imac_zicsr`/
+`rv64imac_zicsr` CPUs, matching the `-march` flags, because the startup code
+and critical sections use CSR instructions.
 
 ### 9.17 Hardware interrupts and critical sections (Module 26)
 
@@ -2041,7 +2054,149 @@ platform models a CLINT at `0x20008000` rather than the full interrupt matrix.
 Renode 1.17 models the Cortex-M NVIC/SysTick and the STM32 timer, which is what
 the boot tests exercise.
 
-### 9.18 Native subset limits
+### 9.18 Peripheral drivers and resource tokens (Module 27)
+
+#### `#[peripheral]` structs
+
+`#[peripheral]` marks a struct as a hardware resource token:
+
+```lusa
+#[peripheral]
+struct Uart { index: u32 }
+```
+
+- A peripheral struct is **move-only** in the interpreter, the bytecode VM, and
+  the C11 checker, even though its fields are scalars (section 5 makes
+  scalar-only structs Copy). Assignment, a by-value argument, and `return`
+  move it; a later use is `E1001`. Lend it with `borrow token`.
+- `clone` of a peripheral struct, or of any struct that contains one through
+  its fields, is `E1006`.
+- The attribute is accepted on structs only; elsewhere it is `E0101`, as is a
+  duplicate `#[peripheral]`. It combines with `#[packed]` and
+  `#[repr(align(N))]`.
+
+#### The `lusa` crate
+
+A program that mentions a `lusa::` path receives a bundled crate before the
+module resolver runs. `lusa::` is a path root, like `crate::`, in every module.
+The crate holds `lusa::hal::uart`, `lusa::hal::spi`, and `lusa::hal::i2c`,
+rendered for the build target: `lusalang build --target stm32f4`, `rp2040`, or
+`esp32c3` selects that board's register-level drivers, and the interpreter,
+the VM, and host builds use software models. A target without drivers
+(`riscv32-virt`, `riscv64-virt`) reports `lusa::hal has no drivers for target
+...`. The crate is spliced onto the first line, after a leading `#[no_std]`,
+so the program's line numbers do not change; diagnostics print the expanded
+line, where module paths appear under their internal `__lusa_m_...` names.
+Native programs that use the HAL must be `#[no_std]`, because the drivers keep
+their state in promoted module globals (section 9.12).
+
+Each driver exposes one instance per block, claimed with `take()`:
+
+```lusa
+#[no_std]
+use lusa::hal::uart;
+use lusa::hal::spi;
+use lusa::hal::i2c;
+
+#[interrupt("USART2")]
+function serial_irq(): void
+    uart::on_interrupt()
+end
+
+#[entry]
+function main(): void
+    local port: uart::Uart = uart::take():unwrap()   -- Some once, then None
+    uart::configure(borrow port, 115200)
+    interrupts_enable()
+    uart::write(borrow port, 65)                     -- false if the ring is full
+    match uart::read(borrow port) with
+    | Some(byte) => uart::write(borrow port, byte)
+    | None => uart::idle(borrow port)
+    end
+    uart::flush(borrow port)
+end
+```
+
+- `uart`: `configure(port, baud)`, `write(port, byte): bool`,
+  `read(port): Option<u32>`, `available`, `pending`, `overruns`, `is_busy`,
+  `flush`, `idle`, `baud`, `on_interrupt()`.
+- `spi`: `configure(bus, frequency_hz, mode)` (8-bit frames, MSB first, mode
+  0-3 with CPOL = `mode // 2` and CPHA = `mode % 2`), `transfer(bus, byte):
+  bool` (one full-duplex frame), `read`, `available`, `pending`, `overruns`,
+  `is_busy`, `flush`, `idle`, `mode`, `frequency`, `on_interrupt()`.
+- `i2c`: `configure(bus, frequency_hz)` (7-bit addresses), `queue(bus, byte)`,
+  `start_write(bus, address)`, `start_read(bus, address, count)`,
+  `wait(bus): u32` and `status(bus)` (0 completed, 1 NACK, 2 bus error or
+  arbitration loss), `is_busy`, `read`, `available`, `max_read`, `max_write`,
+  `idle`, `frequency`, `on_interrupt()`.
+
+Every driver owns a 64-byte receive ring and a 64-byte transmit ring. Ring
+operations run inside `interrupts_disable`/`interrupts_restore`, which are
+compiler barriers in C, so the indices need no volatile access. Writes queue
+and return immediately; the interrupt handler moves bytes between the rings
+and the controller, and the program waits only on ring state (`flush`,
+`wait`), never on a status register. Install the handler with the board's
+vector and call `on_interrupt()`:
+
+| board | UART | SPI | I2C |
+|-------|------|-----|-----|
+| `stm32f4` | `usart2` (USART2, PA2/PA3) | `spi1` (SPI1, PA5-PA7) | `i2c1_ev` and `i2c1_er` (I2C1, PB8/PB9) |
+| `rp2040` | `uart0` (PL011, GP0/GP1) | `spi0` (PL022, GP16-GP19) | `i2c0` (DW_apb_i2c, GP4/GP5) |
+| `esp32c3` | `machine_external` (UART0) | `machine_external` (GP-SPI2) | `machine_external` (I2C, GPIO4/GPIO5) |
+
+On ESP32-C3 the drivers program the interrupt matrix to deliver sources 21
+(UART0), 19 (SPI2), and 29 (I2C) to CPU interrupt 11, so one
+`machine_external` handler calls all three `on_interrupt()` functions; each
+returns at once when its block has nothing pending. `configure` also enables
+the block's clock, releases its reset, and routes its pins. The drivers assume
+the reset clock tree: 16 MHz HSI on STM32F4, a 125 MHz `clk_sys` feeding
+`clk_peri` on RP2040, and an 80 MHz APB on ESP32-C3. One I2C transaction
+carries up to 16 read bytes on RP2040 (the controller FIFO) and 31 written or
+32 read bytes on ESP32-C3 (the command-list FIFO).
+
+On the host the drivers model their controllers in software: `uart::sim_receive(byte)`,
+`uart::sim_sent()`, `uart::sim_loopback(on)`, `spi::sim_reply_offset(n)`, and
+`i2c::sim_attach(address)` act as the other end of the wire, `sim_irq_pending()`
+reports the modelled interrupt line, and `idle`, `flush`, and `wait` deliver
+it. These `sim_*` functions exist only in host builds.
+
+#### Renode
+
+Each Renode platform adds an SPI loopback (MISO wired to MOSI) and an
+`EchoI2CDevice` at I2C address `0x55`, which returns the bytes last written to
+it. STM32F4 uses Renode's `STM32_UART`, `STM32SPI`, and `STM32F1_I2C` (the F4
+I2C block is register-compatible). RP2040 uses `PL011`,
+`DesignWare_APB_I2C`, and the repository model `renode/models/LusaRp2040Spi.cs`
+(Renode 1.17 has no PL022). ESP32-C3 uses repository models for all three
+blocks (`LusaEsp32C3Uart.cs`, `LusaEsp32C3Spi.cs`, `LusaEsp32C3I2c.cs`):
+Renode's `ESP32_UART` raises no receive interrupt and Renode ships no ESP32-C3
+SPI or I2C controller. The three ESP32-C3 interrupt lines are OR-ed onto
+`cpu@11` by a `CombinedInput`. The DesignWare model does not report address
+NACKs, so the RP2040 NACK path runs only on hardware.
+
+`examples/interrupt_uart_echo.lusa` is the STM32F4 echo server.
+`tests/module27_drivers.rs` types `hello lusa`, `ping`, and `!` into the UART
+of all three boards and expects:
+
+```text
+LUSA ECHO READY
+hello lusa
+[ 10 bytes]
+ping
+[ 4 bytes]
+bye l=2
+```
+
+It also runs a driver check on each board that claims all three blocks,
+exchanges a burst through the SPI loopback, writes to and reads back from the
+I2C echo device, and expects a NACK from address `0x22`.
+
+```sh
+lusalang build examples/interrupt_uart_echo.lusa --target stm32f4
+cargo test --test module27_drivers -- --test-threads=1 --nocapture
+```
+
+### 9.19 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 table literals, fixed-size `[T; N]` arrays and local array literals, nested keyed
@@ -2051,6 +2206,8 @@ tables, and arrays, `if`, `while`, `repeat`, `do`, `return`, `break`,
 assignments, globals, `print`, `clone`, `borrow`, `move`, the compile-time
 borrow checker, `unsafe` blocks, static `struct` declarations in brace and bare
 form, `#[packed]`/`#[repr(align(N))]` representation attributes,
+`#[peripheral]` resource tokens and the bundled `lusa::hal` drivers
+(section 9.18),
 `#[no_std]`/`#[entry]`/`#[global_allocator]`/`#[link_section = "..."]`/
 `#[interrupt]`/`#[interrupt("VECTOR")]`
 (sections 9.12, 9.13, and 9.17), struct

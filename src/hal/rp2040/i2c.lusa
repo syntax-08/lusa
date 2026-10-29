@@ -1,0 +1,137 @@
+-- RP2040 I2C0 (DesignWare DW_apb_i2c at 0x40044000): GP4 = SDA, GP5 = SCL
+-- (external pull-ups).  NVIC IRQ 23; install the handler with
+-- `#[interrupt("I2C0")]`.
+--
+-- Registers (word offsets): IC_CON +0, IC_TAR +1, IC_DATA_CMD +4, SCL counts
+-- +5..+8, IC_INTR_STAT +11, IC_INTR_MASK +12, IC_RX_TL +14, IC_TX_TL +15,
+-- IC_CLR_INTR +16, IC_CLR_TX_ABRT +21, IC_CLR_STOP_DET +24, IC_ENABLE +27,
+-- IC_RXFLR +30, IC_TX_ABRT_SOURCE +32.
+--
+-- Writes feed IC_DATA_CMD from the TX_EMPTY interrupt, with STOP on the last
+-- byte.  Reads queue every read command up front (the 16-entry FIFOs bound a
+-- read to 16 bytes) and collect the data at STOP_DET.  TX_ABRT reports a
+-- NACK or arbitration loss.
+
+-- Interrupt mask bits: TX_EMPTY 0x10, TX_ABRT 0x40, STOP_DET 0x200.
+local mask_write: u32 = 592
+local mask_done: u32 = 576
+
+function i2c0(word: u32): u32
+    return 1074020352 + word * 4
+end
+
+function ll_configure(frequency_hz: u32): void
+    super::unreset(8)             -- I2C0 (bit 3)
+    super::unreset(32)            -- IO_BANK0
+    super::gpio_function(4, 3)
+    super::gpio_function(5, 3)
+    super::mmio_write(i2c0(27), 0)
+    super::mmio_write(i2c0(12), 0)
+    -- SCL period in clk_sys cycles, 60 % low / 40 % high.
+    local period: u32 = 125000000 // frequency_hz
+    local low: u32 = period * 3 // 5
+    if frequency_hz > 100000 then
+        -- MASTER_MODE | SPEED = fast | RESTART_EN | SLAVE_DISABLE | TX_EMPTY_CTRL
+        super::mmio_write(i2c0(0), 357)
+        super::mmio_write(i2c0(7), period - low)
+        super::mmio_write(i2c0(8), low)
+    else
+        super::mmio_write(i2c0(0), 355)   -- SPEED = standard
+        super::mmio_write(i2c0(5), period - low)
+        super::mmio_write(i2c0(6), low)
+    end
+    super::mmio_write(i2c0(14), 0)
+    super::mmio_write(i2c0(15), 0)
+    super::mmio_read(i2c0(16))            -- clear stale interrupts
+    super::nvic_enable(23)
+end
+
+function ll_max_read(): u32
+    return 16
+end
+
+-- TX_EMPTY feeds the FIFO byte by byte, so only the ring bounds a write.
+function ll_max_write(): u32
+    return 64
+end
+
+function ll_start(): void
+    super::mmio_write(i2c0(27), 0)
+    super::mmio_write(i2c0(1), target)
+    super::mmio_write(i2c0(27), 1)
+    if op_read then
+        local issued: u32 = 0
+        while issued < remaining do
+            issued = issued + 1
+            if issued == remaining then
+                super::mmio_write(i2c0(4), 768)   -- CMD = read | STOP
+            else
+                super::mmio_write(i2c0(4), 256)   -- CMD = read
+            end
+        end
+        super::mmio_write(i2c0(12), mask_done)
+    else
+        super::mmio_write(i2c0(12), mask_write)
+    end
+end
+
+function drain_rx(): void
+    while super::mmio_read(i2c0(30)) > 0 do
+        rx_push(super::mmio_read(i2c0(4)) % 256)
+        if remaining > 0 then
+            remaining = remaining - 1
+        end
+    end
+end
+
+function ll_service(): void
+    local status: u32 = super::mmio_read(i2c0(11))
+    if super::has_bit(status, 64) then                    -- TX_ABRT
+        local source: u32 = super::mmio_read(i2c0(32))
+        super::mmio_read(i2c0(21))
+        super::mmio_write(i2c0(12), 0)
+        -- ABRT_7B_ADDR_NOACK (bit 0) or ABRT_TXDATA_NOACK (bit 3).
+        if super::has_bit(source, 1) or super::has_bit(source, 8) then
+            finish(1)
+        else
+            finish(2)
+        end
+        return
+    end
+    if super::has_bit(status, 512) then                   -- STOP_DET
+        super::mmio_read(i2c0(24))
+        super::mmio_write(i2c0(12), 0)
+        if op_read then
+            drain_rx()
+            if remaining == 0 then
+                finish(0)
+            else
+                finish(2)
+            end
+        else
+            finish(0)
+        end
+        return
+    end
+    if super::has_bit(status, 16) then                    -- TX_EMPTY
+        if tx_len() > 0 then
+            local byte: u32 = tx_pop()
+            if tx_len() == 0 then
+                super::mmio_write(i2c0(4), byte + 512)    -- last byte | STOP
+                super::mmio_write(i2c0(12), mask_done)
+            else
+                super::mmio_write(i2c0(4), byte)
+            end
+        else
+            super::mmio_write(i2c0(12), mask_done)
+        end
+    end
+end
+
+function ll_quiesce(): void
+    super::mmio_write(i2c0(12), 0)
+    super::mmio_read(i2c0(16))
+end
+
+function ll_idle(): void
+end

@@ -1136,6 +1136,96 @@ track the same global mask.
   state must use `volatile_read`/`volatile_write` or explicit critical
   sections.
 
+## Module 27 - Safe, interrupt-driven peripheral drivers (shipped in v2.3.0)
+
+Module 27 turns the Module 26 interrupt path into reusable drivers. A bundled
+`lusa` crate provides `lusa::hal::uart`, `lusa::hal::spi`, and
+`lusa::hal::i2c` with one API on STM32F4, RP2040, ESP32-C3, and the host, and
+the ownership checker guarantees that each register block has one owner.
+
+### 27.1 `#[peripheral]` resource tokens
+
+- `#[peripheral]` structs are move-only in the interpreter, the VM, and the C11
+  checker even with scalar fields; reuse after a move is `E1001` and `clone`
+  (directly or through a containing struct) is `E1006`.
+- Both parsers accept the attribute on structs only and reject duplicates.
+- The VM now registers struct declarations with the runtime, so heap-bearing
+  and peripheral structs move in the VM exactly as in the interpreter.
+- Each driver's `take()` hands out its token once (`Some`) and returns `None`
+  afterwards; drivers borrow the token for every call.
+
+### 27.2 The bundled crate
+
+- `src/hal.rs` assembles the crate per `TargetSpec::hal` family from
+  `src/hal/*.lusa`: a ring-buffer template instantiated per buffer, the common
+  driver API, and the board backend with its MMIO, clock, reset, pin, and
+  interrupt-controller helpers.
+- The module resolver splices the crate onto the first line (after
+  `#[no_std]`) when a program mentions `lusa::`, keeping the program's line
+  numbers, treats `lusa::` as a path root in every module, keeps hoisted
+  structs after a leading `#[no_std]`, and reports boards without drivers.
+- `cbackend::emit_c_for_target` and `lusalang build --target` resolve the HAL
+  for the selected board; the CLI renders diagnostics against the expanded
+  program, so module paths no longer shift reported positions.
+
+### 27.3 Interrupt-driven drivers
+
+- Every driver owns 64-byte receive and transmit rings guarded by
+  `interrupts_disable`/`interrupts_restore` critical sections; writes never
+  block and the handler feeds the controller.
+- UART: STM32F4 USART2 (TXEIE/RXNEIE), RP2040 PL011 (FIFOs off, primed
+  transmit interrupt), ESP32-C3 UART0 (RXFIFO_FULL/TXFIFO_EMPTY).
+- SPI: STM32F4 SPI1 (RXNE), RP2040 PL022 (receive timeout), ESP32-C3 GP-SPI2
+  user transactions (TRANS_DONE); modes 0-3 and the nearest divider.
+- I2C: STM32F4 I2C1 event/error state machine, RP2040 DesignWare command FIFO
+  (TX_EMPTY, STOP_DET, TX_ABRT), ESP32-C3 command list (TRANS_COMPLETE, NACK);
+  results 0 ok, 1 NACK, 2 bus error.
+- New vectors: STM32F4 `i2c1_ev` 47, `i2c1_er` 48, `spi1` 51; RP2040 `spi0`
+  34, `i2c0` 39. ESP32-C3 sources 19/21/29 go through the interrupt matrix to
+  CPU interrupt 11 (`machine_external`).
+- Host models (`sim_*`) make the drivers testable with `lusalang run`/`--vm`.
+
+### 27.4 Renode, example, tests, and CI
+
+- Each platform adds an SPI loopback and an `EchoI2CDevice` at `0x55`.
+  `renode/models/` provides C# models for the RP2040 PL022 and the ESP32-C3
+  UART, GP-SPI2, and I2C controller; the `@MODELS@` script line and
+  `TargetSpec::write_renode_models` load them. RISC-V platform CPUs declare
+  Zicsr.
+- `examples/interrupt_uart_echo.lusa` is a STM32F4 echo server.
+- `tests/module27_drivers.rs` covers the attribute, move/clone rules, crate
+  resolution and line numbers, the host models, vectors and platforms, cross
+  builds, and Renode runs of the echo server and an SPI/I2C/ownership check
+  on all three boards.
+- `.github/workflows/renode.yml` runs modules 24 through 27.
+- Fixed along the way: native `and`/`or` and literal constant folding failed
+  with `E1001` inside the self-hosted compiler, and character indexing of long
+  ASCII strings (`#s`, `string.byte`, `string.sub`) was linear per call, which
+  made large native builds quadratic.
+
+**Acceptance criteria**
+
+- Claiming a block twice yields `None`; moving or cloning a token is rejected
+  by all three engines with `E1001`/`E1006`.
+- The UART echo session prints the same transcript on STM32F4, RP2040, and
+  ESP32-C3 under Renode, driven only by receive/transmit interrupts.
+- SPI bursts round-trip through the loopback and I2C writes read back from the
+  echo device on all three boards; a missing address NACKs where the emulator
+  models it.
+- The full `cargo test --all-targets -- --test-threads=1` suite stays green
+  with and without the optional tools.
+
+**Risks**
+
+- The ESP32-C3 controllers and the RP2040 PL022 run against repository models
+  written from the reference manuals; they cover the registers the drivers
+  use, not the whole block.
+- Renode's DesignWare I2C model never reports a NACK, so that RP2040 path is
+  verified on hardware only.
+- The drivers assume reset clock trees and expose one instance per block;
+  DMA, chip selects, interrupt priorities, and 10-bit I2C addresses are left
+  to applications.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -1172,6 +1262,7 @@ track the same global mask.
 | v2.0.0 | Cross-compilation and Renode hardware tests (shipped) | `--target riscv32-virt`/`riscv64-virt`, `#[no_std]` + `#[entry]` validation, embedded startup/linker assets, xPack/GNU RISC-V discovery, custom Renode platforms, UART file backend, exact-banner execution tests for RV32 and RV64, dedicated Renode CI workflow |
 | v2.1.0 | Modern MCU targets and peripheral emulation (shipped) | `--target rp2040`/`stm32f4`/`esp32c3`, per-board startup and linker maps, target-aware toolchain discovery and diagnostics, Renode platforms with GPIO/timer/SysTick/UART, three volatile-MMIO examples, exact-banner Renode boots for all three boards, ARM and RISC-V toolchains in the Renode CI workflow |
 | v2.2.0 | Hardware interrupts and exception vectors (shipped) | bare and explicit `#[interrupt]` in both front ends, target vector registries and default timer resolution, generated Arm vector tables and RISC-V trap tables, linker `PROVIDE` fallbacks, `interrupts_disable`/`interrupts_enable`/`interrupts_restore` in all engines, Renode TIM2/SysTick/CLINT interrupt boots, module 26 tests |
+| v2.3.0 | Safe, interrupt-driven peripheral drivers (shipped) | `#[peripheral]` move-only tokens in both front ends and all engines (`E1006`), bundled target-aware `lusa::hal` crate with stable line numbers, ring-buffered UART/SPI/I2C drivers for STM32F4, RP2040, ESP32-C3, and host models, new SPI/I2C vectors, Renode loopback/echo devices and repository peripheral models, UART echo and SPI/I2C Renode runs on all three boards, module 27 tests |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

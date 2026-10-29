@@ -1,0 +1,119 @@
+-- lusa::hal::uart -- interrupt-driven, buffered serial port.
+--
+-- `take()` hands out the board's serial port once as a `#[peripheral]`
+-- token.  Writes queue bytes in the `tx` ring and the interrupt handler feeds
+-- the transmitter; received bytes land in the `rx` ring from the handler, so
+-- neither direction polls a hardware status register.  Install the handler
+-- with `#[interrupt("<vector>")]` and call `on_interrupt()` from it.
+
+#[peripheral]
+pub struct Uart { index: u32 }
+
+local claimed: bool = false
+-- True while the interrupt handler owns the transmitter (a byte is in flight
+-- or queued).  Shared with the handler, so it is only touched in critical
+-- sections.
+local tx_busy: bool = false
+local configured_baud: u32 = 0
+
+-- Claims the serial port.  The first call returns `Some(port)`; every later
+-- call returns `None`, so the registers can never be owned twice.
+pub function take(): Option<Uart>
+    local state: u32 = interrupts_disable()
+    local first: bool = not claimed
+    claimed = true
+    interrupts_restore(state)
+    if first then
+        return Some(Uart{index: 0})
+    end
+    return None
+end
+
+-- Sets the baud rate, enables the receiver and transmitter, and unmasks the
+-- receive interrupt.  Both rings start empty.
+pub function configure(port: Uart, baud: u32): void
+    local state: u32 = interrupts_disable()
+    rx_clear()
+    tx_clear()
+    tx_busy = false
+    configured_baud = baud
+    ll_configure(baud)
+    interrupts_restore(state)
+end
+
+pub function baud(port: Uart): u32
+    return configured_baud
+end
+
+-- Queues one byte without blocking.  Returns false when the transmit ring is
+-- full.  The first byte of a burst starts the interrupt-driven transmitter.
+pub function write(port: Uart, byte: u32): bool
+    local state: u32 = interrupts_disable()
+    local queued: bool = tx_push(byte % 256)
+    if queued then
+        if not tx_busy then
+            tx_busy = true
+            ll_start_tx()
+        end
+    end
+    interrupts_restore(state)
+    return queued
+end
+
+-- Next received byte, or `None` when the receive ring is empty.
+pub function read(port: Uart): Option<u32>
+    local state: u32 = interrupts_disable()
+    local ready: bool = rx_len() > 0
+    local value: u32 = 0
+    if ready then
+        value = rx_pop()
+    end
+    interrupts_restore(state)
+    if ready then
+        return Some(value)
+    end
+    return None
+end
+
+-- Bytes waiting in the receive ring.
+pub function available(port: Uart): u32
+    return rx_len()
+end
+
+-- Bytes queued for transmission that the handler has not sent yet.
+pub function pending(port: Uart): u32
+    return tx_len()
+end
+
+-- Received bytes dropped because the receive ring was full.
+pub function overruns(port: Uart): u32
+    return rx_overruns()
+end
+
+pub function is_busy(port: Uart): bool
+    local state: u32 = interrupts_disable()
+    local busy: bool = tx_busy
+    interrupts_restore(state)
+    return busy
+end
+
+-- Lets the driver make progress while the caller waits.  On hardware the
+-- interrupt does the work and this returns at once; the host model delivers
+-- its simulated interrupt here.
+pub function idle(port: Uart): void
+    ll_idle()
+end
+
+-- Waits until the handler has sent every queued byte.  The loop observes
+-- interrupt progress through the shared flag; it never polls the hardware.
+pub function flush(port: Uart): void
+    while is_busy(borrow port) do
+        ll_idle()
+    end
+end
+
+-- Interrupt handler body: moves received bytes into `rx` and feeds the
+-- transmitter from `tx`.
+pub function on_interrupt(): void
+    ll_service()
+end

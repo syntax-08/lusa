@@ -1,0 +1,127 @@
+-- ESP32-C3 I2C controller (I2C_EXT0 at 0x60013000): GPIO4 = SCL, GPIO5 = SDA
+-- through the GPIO matrix (signals 53 and 54; external pull-ups).  Interrupt
+-- source 29, routed to CPU interrupt 11; install the handler with
+-- `#[interrupt("machine_external")]`.
+--
+-- Registers (word offsets): SCL_LOW +0, CTR +1, SR +2, FIFO_CONF +6,
+-- DATA +7, INT_CLR +9, INT_ENA +10, INT_ST +11, timing +12..+19,
+-- CLK_CONF +21, COMD0..7 +22..+29.  The controller runs a command list
+-- (RSTART, WRITE, READ, STOP); the address and every data byte of a write go
+-- through the 32-byte TX FIFO, so one transaction carries up to 31 data
+-- bytes, and a read up to 32.  TRANS_COMPLETE ends a transaction; NACK,
+-- ARBITRATION_LOST, and TIME_OUT abort it.
+
+-- CTR: SDA_FORCE_OUT | SCL_FORCE_OUT | MS_MODE | CLK_EN
+local ctr_master: u32 = 275
+
+function i2c0(word: u32): u32
+    return 1610690560 + word * 4
+end
+
+-- Command word: opcode << 11 | ACK_VALUE << 10 | ACK_CHECK_EN << 8 | count.
+function command(index: u32, opcode: u32, ack_value: u32, check: u32, count: u32): void
+    super::mmio_write(i2c0(22 + index), opcode * 2048 + ack_value * 1024 + check * 256 + count)
+end
+
+function reset_fifos(): void
+    local conf: u32 = super::mmio_read(i2c0(6))
+    super::mmio_write(i2c0(6), super::with_bit(super::with_bit(conf, 4096), 8192))
+    super::mmio_write(i2c0(6), super::without_bit(super::without_bit(conf, 4096), 8192))
+end
+
+function ll_configure(frequency_hz: u32): void
+    super::peripheral_on(128)     -- I2C_EXT0 (bit 7)
+    super::matrix_pin(4, 53)
+    super::matrix_pin(5, 54)
+    super::mmio_write(i2c0(21), 2097152)          -- SCLK_ACTIVE, 40 MHz XTAL
+    local period: u32 = 40000000 // frequency_hz
+    super::mmio_write(i2c0(0), period // 2)       -- SCL low
+    super::mmio_write(i2c0(14), period // 2)      -- SCL high
+    super::mmio_write(i2c0(12), period // 4)      -- SDA hold
+    super::mmio_write(i2c0(13), period // 4)      -- SDA sample
+    super::mmio_write(i2c0(16), period // 2)      -- START hold
+    super::mmio_write(i2c0(17), period // 2)      -- RSTART setup
+    super::mmio_write(i2c0(18), period // 2)      -- STOP hold
+    super::mmio_write(i2c0(19), period // 2)      -- STOP setup
+    super::mmio_write(i2c0(1), ctr_master)
+    reset_fifos()
+    super::mmio_write(i2c0(1), ctr_master + 2048) -- CONF_UPGATE
+    super::mmio_write(i2c0(9), 262143)            -- clear every interrupt
+    -- ARBITRATION_LOST | TRANS_COMPLETE | TIME_OUT | NACK
+    super::mmio_write(i2c0(10), 32 + 128 + 256 + 1024)
+    super::route_interrupt(29)
+end
+
+function ll_max_read(): u32
+    return 32
+end
+
+function ll_max_write(): u32
+    return 31
+end
+
+function ll_start(): void
+    reset_fifos()
+    command(0, 6, 0, 0, 0)                        -- RSTART
+    if op_read then
+        super::mmio_write(i2c0(7), target * 2 + 1)
+        command(1, 1, 0, 1, 1)                    -- WRITE address, check ACK
+        if remaining > 1 then
+            command(2, 3, 0, 0, remaining - 1)    -- READ, ACK each byte
+            command(3, 3, 1, 0, 1)                -- READ the last, NACK it
+            command(4, 2, 0, 0, 0)                -- STOP
+        else
+            command(2, 3, 1, 0, 1)
+            command(3, 2, 0, 0, 0)
+        end
+    else
+        super::mmio_write(i2c0(7), target * 2)
+        local count: u32 = tx_len()
+        while tx_len() > 0 do
+            super::mmio_write(i2c0(7), tx_pop())
+        end
+        command(1, 1, 0, 1, count + 1)            -- WRITE address + data
+        command(2, 2, 0, 0, 0)                    -- STOP
+    end
+    super::mmio_write(i2c0(1), ctr_master + 2048) -- CONF_UPGATE
+    super::mmio_write(i2c0(1), ctr_master + 32)   -- TRANS_START
+end
+
+function ll_service(): void
+    local status: u32 = super::mmio_read(i2c0(11))
+    super::mmio_write(i2c0(9), status)
+    if super::has_bit(status, 1024) then          -- NACK
+        finish(1)
+        return
+    end
+    if super::has_bit(status, 32) or super::has_bit(status, 256) then
+        finish(2)                                 -- ARBITRATION_LOST, TIME_OUT
+        return
+    end
+    if super::has_bit(status, 128) then           -- TRANS_COMPLETE
+        if op_read then
+            local count: u32 = (super::mmio_read(i2c0(2)) // 256) % 64   -- RXFIFO_CNT
+            while count > 0 do
+                rx_push(super::mmio_read(i2c0(7)) % 256)
+                count = count - 1
+                if remaining > 0 then
+                    remaining = remaining - 1
+                end
+            end
+            if remaining == 0 then
+                finish(0)
+            else
+                finish(2)
+            end
+        else
+            finish(0)
+        end
+    end
+end
+
+function ll_quiesce(): void
+    super::mmio_write(i2c0(9), super::mmio_read(i2c0(11)))
+end
+
+function ll_idle(): void
+end

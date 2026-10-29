@@ -1,0 +1,82 @@
+-- ESP32-C3 GP-SPI2 (0x60024000): GPIO6 = SCK, GPIO7 = MOSI, GPIO2 = MISO,
+-- GPIO10 = CS0 (IO MUX function 2).  Interrupt source 19, routed to CPU
+-- interrupt 11; install the handler with `#[interrupt("machine_external")]`.
+--
+-- Registers (word offsets): CMD +0, CLOCK +3, USER +4, MS_DLEN +7, MISC +8,
+-- DMA_INT_ENA +13, DMA_INT_CLR +14, DMA_INT_RAW +15, W0 +38, SLAVE +56,
+-- CLK_GATE +58.  Each frame is one full-duplex user transaction through W0;
+-- TRANS_DONE (DMA_INT bit 12) reports it.
+
+function spi2(word: u32): u32
+    return 1610760192 + word * 4
+end
+
+-- CMD.UPDATE latches configuration into the SPI clock domain.
+function latch(): void
+    super::mmio_write(spi2(0), 8388608)
+    local tries: u32 = 0
+    while tries < 1000 and super::has_bit(super::mmio_read(spi2(0)), 8388608) do
+        tries = tries + 1
+    end
+end
+
+function ll_configure(frequency_hz: u32, mode: u32): void
+    super::peripheral_on(64)      -- SPI2 (bit 6)
+    super::iomux_function(6, 2)
+    super::iomux_function(7, 2)
+    super::iomux_function(2, 2)
+    super::iomux_function(10, 2)
+    super::mmio_write(spi2(58), 7)                -- CLK_EN | MST_CLK_ACTIVE | MST_CLK_SEL
+    super::mmio_write(spi2(56), 0)                -- master
+    -- SCK = APB / ((PRE + 1) * (N + 1)): the smallest pre-divider whose
+    -- counter (N + 1 <= 64) reaches the request.
+    local pre: u32 = 0
+    local count: u32 = (super::apb() + frequency_hz - 1) // frequency_hz
+    while pre < 15 and count > 64 do
+        pre = pre + 1
+        count = (super::apb() + (pre + 1) * frequency_hz - 1) // ((pre + 1) * frequency_hz)
+    end
+    if count < 2 then
+        super::mmio_write(spi2(3), 2147483648)    -- CLK_EQU_SYSCLK
+    else
+        if count > 64 then
+            count = 64
+        end
+        local n: u32 = count - 1
+        super::mmio_write(spi2(3), pre * 262144 + n * 4096 + (count // 2 - 1) * 64 + n)
+    end
+    -- CPOL is the idle level; the output edge flips for modes 1 and 2.
+    super::mmio_write(spi2(8), (mode // 2) * 536870912)
+    local edge: u32 = 0
+    if mode == 1 or mode == 2 then
+        edge = 512
+    end
+    -- DOUTDIN | CS_HOLD | CS_SETUP | CK_OUT_EDGE | USR_MOSI | USR_MISO
+    super::mmio_write(spi2(4), 1 + 64 + 128 + edge + 134217728 + 268435456)
+    super::mmio_write(spi2(7), 7)                 -- 8-bit frames
+    latch()
+    super::mmio_write(spi2(14), 4096)
+    super::mmio_write(spi2(13), 4096)             -- TRANS_DONE
+    super::route_interrupt(19)
+end
+
+function ll_send(byte: u32): void
+    super::mmio_write(spi2(38), byte)
+    super::mmio_write(spi2(0), 16777216)          -- CMD.USR
+end
+
+function ll_rx_ready(): bool
+    return super::has_bit(super::mmio_read(spi2(15)), 4096)
+end
+
+function ll_receive(): u32
+    local value: u32 = super::mmio_read(spi2(38)) % 256
+    super::mmio_write(spi2(14), 4096)
+    return value
+end
+
+function ll_stop(): void
+end
+
+function ll_idle(): void
+end

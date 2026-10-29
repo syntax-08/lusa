@@ -405,8 +405,12 @@ fn render_script(target: &TargetSpec, dir: &Path, elf: &Path) -> (PathBuf, PathB
     let platform = dir.join("platform.repl");
     std::fs::write(&platform, target.renode_platform).expect("write Renode platform");
     let uart = dir.join("uart.log");
+    let models = target
+        .write_renode_models(dir)
+        .expect("write Renode peripheral models");
     let script = target
         .renode_script
+        .replace("@MODELS@", &models)
         .replace("@PLATFORM@", &format!("@{}", slash_path(&platform)))
         .replace("@ELF@", &format!("@{}", slash_path(elf)))
         .replace("@UART_LOG@", &slash_path(&uart));
@@ -690,7 +694,8 @@ fn target_vector_tables_match_hardware() {
         .lines()
         .filter(|line| line.trim_start().starts_with(".word"))
         .collect();
-    assert_eq!(words.len(), 37, "RP2040 vector table size");
+    // Module 27 added I2C0 at exception 39, the highest RP2040 vector.
+    assert_eq!(words.len(), 40, "RP2040 vector table size");
     assert!(words[15].contains("lusa_isr_systick"), "{}", words[15]);
     assert!(words[36].contains("lusa_isr_uart0"), "{}", words[36]);
 

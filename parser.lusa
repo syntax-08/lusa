@@ -745,7 +745,7 @@ parse_unsafe = function()
     }
 end
 
--- Parses `#[packed]`, `#[repr(align(N))]`, `#[no_std]`, `#[entry]`,
+-- Parses `#[packed]`, `#[repr(align(N))]`, `#[peripheral]`, `#[no_std]`, `#[entry]`,
 -- `#[global_allocator]`, and `#[link_section = "..."]` prefixes.  Returns a
 -- table of attribute values; `align` and `link_section` are nil when absent.
 local function section_name_char(code)
@@ -814,6 +814,7 @@ local function parse_attributes()
     local attrs = {
         packed = false,
         align = nil,
+        peripheral = false,
         no_std = false,
         entry = false,
         global_allocator = false,
@@ -833,6 +834,11 @@ local function parse_attributes()
                 fail_at(attr_line, attr_column, "duplicate `#[packed]` attribute")
             end
             attrs.packed = true
+        elseif attr == "peripheral" then
+            if attrs.peripheral then
+                fail_at(attr_line, attr_column, "duplicate `#[peripheral]` attribute")
+            end
+            attrs.peripheral = true
         elseif attr == "no_std" then
             if attrs.no_std then
                 fail_at(attr_line, attr_column, "duplicate `#[no_std]` attribute")
@@ -944,7 +950,7 @@ local function parse_attributes()
         else
             fail_at(attr_line, attr_column,
                 "unsupported attribute `#" .. attr
-                .. "`; supported attributes are `#[packed]`, `#[repr(align(N))]`, "
+                .. "`; supported attributes are `#[packed]`, `#[repr(align(N))]`, `#[peripheral]`, "
                 .. '`#[no_std]`, `#[entry]`, `#[global_allocator]`, '
                 .. '`#[interrupt]`, `#[interrupt("VECTOR")]`, and '
                 .. '`#[link_section = "..."]`')
@@ -957,7 +963,7 @@ local function parse_attributes()
     return attrs
 end
 
-parse_struct = function(packed, align)
+parse_struct = function(packed, align, peripheral)
     local line = peek_line()
     local column = peek_column()
     advance() -- struct
@@ -1012,6 +1018,7 @@ parse_struct = function(packed, align)
         fields = fields,
         packed = packed,
         align = align,
+        peripheral = peripheral == true,
         line = line,
         column = column
     }
@@ -1372,7 +1379,7 @@ parse_attributed_stmt = function()
     local attrs = parse_attributes()
 
     if attrs.no_std then
-        if attrs.packed or attrs.align ~= nil or attrs.entry
+        if attrs.packed or attrs.align ~= nil or attrs.peripheral or attrs.entry
             or attrs.global_allocator or attrs.link_section ~= nil
             or attrs.interrupt then
             fail_at(attr_line, attr_column,
@@ -1391,7 +1398,12 @@ parse_attributed_stmt = function()
             fail_at(attr_line, attr_column,
                 "`#[entry]` and `#[link_section]` are only supported on functions or globals; `#[global_allocator]` and `#[interrupt]` are only supported on functions")
         end
-        return parse_struct(attrs.packed, attrs.align)
+        return parse_struct(attrs.packed, attrs.align, attrs.peripheral)
+    end
+
+    if attrs.peripheral then
+        fail_at(attr_line, attr_column,
+            "`#[peripheral]` is only supported on structs")
     end
 
     if at_keyword("function") or at_keyword("async") then

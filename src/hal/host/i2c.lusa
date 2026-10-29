@@ -1,0 +1,117 @@
+-- Host I2C controller (simulation).
+--
+-- One modelled device answers at the address set with `sim_attach` (0x55 by
+-- default).  It stores written bytes and returns them, in order, to the next
+-- read, like Renode's `EchoI2CDevice`; any other address NACKs.  Each call
+-- of the handler performs one bus event (address phase, one data byte, or the
+-- STOP), so a transaction needs several interrupts, as on hardware.
+
+local sim_address: u32 = 85
+-- 0 address phase, 1 data phase, 2 STOP pending.
+local sim_phase: u32 = 0
+local sim_irq: bool = false
+local sim_event_count: u32 = 0
+-- Echo device memory: a write transaction replaces it, reads replay it.
+local store_bytes: [u32; 32]
+local store_size: u32 = 0
+local store_cursor: u32 = 0
+
+function ll_configure(frequency_hz: u32): void
+    sim_phase = 0
+    sim_irq = false
+    sim_event_count = 0
+end
+
+-- The modelled device stores 32 bytes.
+function ll_max_read(): u32
+    return 32
+end
+
+function ll_max_write(): u32
+    return 32
+end
+
+-- START condition: the controller raises its first event.
+function ll_start(): void
+    sim_phase = 0
+    sim_irq = true
+end
+
+function ll_service(): void
+    if not sim_irq then
+        return
+    end
+    sim_event_count = sim_event_count + 1
+    if sim_phase == 0 then
+        if target ~= sim_address then
+            sim_irq = false
+            finish(1)
+            return
+        end
+        if op_read then
+            store_cursor = 0
+        else
+            store_size = 0
+        end
+        sim_phase = 1
+        return
+    end
+    if sim_phase == 1 then
+        if op_read then
+            rx_push(store_next())
+            remaining = remaining - 1
+            if remaining == 0 then
+                sim_phase = 2
+            end
+        else
+            store_put(tx_pop())
+            if tx_len() == 0 then
+                sim_phase = 2
+            end
+        end
+        return
+    end
+    sim_irq = false
+    finish(0)
+end
+
+function ll_quiesce(): void
+    sim_irq = false
+end
+
+function ll_idle(): void
+    if sim_irq then
+        on_interrupt()
+    end
+end
+
+function store_put(byte: u32): void
+    if store_size < 32 then
+        store_bytes[store_size] = byte
+        store_size = store_size + 1
+    end
+end
+
+function store_next(): u32
+    local value: u32 = 0
+    if store_cursor < store_size then
+        value = store_bytes[store_cursor]
+        store_cursor = store_cursor + 1
+    end
+    return value
+end
+
+-- Simulation: move the modelled device to another 7-bit address.
+pub function sim_attach(address: u32): void
+    sim_address = address % 128
+end
+
+-- Simulation: true while the modelled controller asserts its interrupt.
+pub function sim_irq_pending(): bool
+    return sim_irq
+end
+
+-- Simulation: bus events handled since `configure`.
+pub function sim_events(): u32
+    return sim_event_count
+end

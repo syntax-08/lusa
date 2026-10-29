@@ -106,11 +106,16 @@ pub enum StKind {
     /// `packed` and `align` carry `#[packed]` / `#[repr(align(N))]`
     /// representation attributes.  The dynamic engines ignore the physical
     /// layout; only the C11 backend needs it.
+    ///
+    /// `peripheral` marks a `#[peripheral]` resource token: every engine
+    /// treats it as move-only (never Copy) and rejects `clone`, so a claimed
+    /// hardware block cannot be aliased.
     Struct {
         name: String,
         fields: Vec<StructField>,
         packed: bool,
         align: Option<u32>,
+        peripheral: bool,
     },
     /// `unsafe do ... end` block (raw pointers and intrinsics only).
     Unsafe { body: Block },

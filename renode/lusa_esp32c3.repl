@@ -1,9 +1,18 @@
-// Minimal ESP32-C3 platform.  Renode 1.17 has an ESP32 UART but no TIMG;
-// Arm_CMSDK_Timer at the TIMG T0 base provides the same offsets used by the
-// example for CTRL, VALUE (T0LO), and RELOAD (T0HI).  GPIO output is backed by
-// MappedMemory because Renode exposes no ESP32 GPIO port model.  The CoreLevel
-// Interruptor at the ESP32-C3 CLINT base supplies machine timer interrupts for
-// `#[interrupt]` handlers, wired to mcause 3 (software) and 7 (timer).
+// Minimal ESP32-C3 platform.  Renode 1.17 has no TIMG; Arm_CMSDK_Timer at the
+// TIMG T0 base provides the same offsets used by the example for CTRL, VALUE
+// (T0LO), and RELOAD (T0HI).  GPIO output is backed by MappedMemory because
+// Renode exposes no ESP32 GPIO port model.  The CoreLevelInterruptor at the
+// ESP32-C3 CLINT base supplies machine timer interrupts for `#[interrupt]`
+// handlers, wired to mcause 3 (software) and 7 (timer).
+//
+// UART0, GP-SPI2, and I2C are repository models (renode/models/*.cs, loaded
+// by `@MODELS@` in the monitor script): Renode's ESP32_UART raises no receive
+// interrupt and Renode ships no ESP32-C3 SPI or I2C controller.  On silicon
+// the interrupt matrix maps each source to a CPU interrupt; `lusa::hal`
+// programs it to CPU interrupt 11, and here the three lines are OR-ed onto
+// the CPU's external interrupt (mcause 11, `machine_external`).  The matrix,
+// SYSTEM clock gates, and IO MUX are plain memory.  SPI2 drives a MISO/MOSI
+// loopback and I2C an echo device at 0x55 for the `lusa::hal` tests.
 flash: Memory.MappedMemory @ sysbus 0x42000000
     size: 0x400000
 
@@ -13,7 +22,31 @@ sram: Memory.MappedMemory @ sysbus 0x3FC80000
 gpio: Memory.MappedMemory @ sysbus 0x60004000
     size: 0x1000
 
-uart0: UART.ESP32_UART @ sysbus 0x60000000
+ioMux: Memory.MappedMemory @ sysbus 0x60009000
+    size: 0x1000
+
+system: Memory.MappedMemory @ sysbus 0x600C0000
+    size: 0x1000
+
+interruptMatrix: Memory.MappedMemory @ sysbus 0x600C2000
+    size: 0x1000
+
+externalIRQ: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 3
+    -> cpu@11
+
+uart0: UART.LusaEsp32C3Uart @ sysbus 0x60000000
+    -> externalIRQ@0
+
+spi2: SPI.LusaEsp32C3Spi @ sysbus 0x60024000
+    -> externalIRQ@1
+
+spiLoopback: SPI.SPILoopback @ spi2
+
+i2c0: I2C.LusaEsp32C3I2c @ sysbus 0x60013000
+    -> externalIRQ@2
+
+i2cEcho: Mocks.EchoI2CDevice @ i2c0 0x55
 
 timer0: Timers.Arm_CMSDK_Timer @ sysbus 0x6001F000
     frequency: 16000000
@@ -23,7 +56,7 @@ clint: IRQControllers.CoreLevelInterruptor @ sysbus 0x20008000
     frequency: 16000000
 
 cpu: CPU.RiscV32 @ sysbus
-    cpuType: "rv32imc"
+    cpuType: "rv32imc_zicsr"
     privilegedArchitecture: PrivilegedArchitecture.Priv1_10
     timeProvider: clint
     hartId: 0
