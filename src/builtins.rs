@@ -366,6 +366,41 @@ fn b_unsafe_alloc(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<V
     one(Value::Number(base as f64))
 }
 
+/// `interrupts_disable()` - clears the global interrupt mask and returns 1
+/// when interrupts were previously enabled.  The C backend lowers this to
+/// `cpsid i`/PRIMASK on Arm and `csrci mstatus, 8` on RISC-V; the sandbox
+/// tracks the mask so interpreted programs observe the same restore protocol.
+fn b_interrupts_disable(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    if !args.is_empty() {
+        return Err(LusaError::new(
+            E_CALL,
+            Some(span),
+            "`interrupts_disable` takes no arguments",
+        ));
+    }
+    let previous = i.interrupts_enabled;
+    i.interrupts_enabled = false;
+    one(Value::Number(if previous { 1.0 } else { 0.0 }))
+}
+
+fn b_interrupts_enable(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    if !args.is_empty() {
+        return Err(LusaError::new(
+            E_CALL,
+            Some(span),
+            "`interrupts_enable` takes no arguments",
+        ));
+    }
+    i.interrupts_enabled = true;
+    Ok(Vec::new())
+}
+
+fn b_interrupts_restore(i: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
+    let state = need_num(get(&args, 0, "state", span)?, "state", span)?;
+    i.interrupts_enabled = state != 0.0;
+    Ok(Vec::new())
+}
+
 /// `unsafe_nop()` - a portable no-op intrinsic.  The native backend lowers it
 /// to a compiler barrier/nop; the sandbox treats it as a plain no-op.
 fn b_unsafe_nop(i: &mut Interp, _args: Vec<Value>, span: Span) -> LResult<Vec<Value>> {
@@ -829,6 +864,9 @@ pub fn all() -> Vec<(&'static str, BF)> {
         ("volatile_read", Box::new(b_volatile_read)),
         ("volatile_write", Box::new(b_volatile_write)),
         ("unsafe_nop", Box::new(b_unsafe_nop)),
+        ("interrupts_disable", Box::new(b_interrupts_disable)),
+        ("interrupts_enable", Box::new(b_interrupts_enable)),
+        ("interrupts_restore", Box::new(b_interrupts_restore)),
         ("unsafe_asm", Box::new(b_unsafe_asm)),
         ("asm", Box::new(b_asm)),
         ("io_read_file", Box::new(b_io_read_file)),

@@ -1184,8 +1184,8 @@ freestanding ELF images for Renode's `virt` board:
 | target | triple | ISA / ABI | default output |
 |--------|--------|-----------|----------------|
 | `host` | host | host C compiler | `.exe` on Windows, no extension elsewhere |
-| `riscv32-virt` | `riscv32-unknown-elf` | `rv32imac` / `ilp32` | `.elf` |
-| `riscv64-virt` | `riscv64-unknown-elf` | `rv64imac` / `lp64` | `.elf` |
+| `riscv32-virt` | `riscv32-unknown-elf` | `rv32imac_zicsr` / `ilp32` | `.elf` |
+| `riscv64-virt` | `riscv64-unknown-elf` | `rv64imac_zicsr` / `lp64` | `.elf` |
 
 A cross build requires a `#[no_std]` program with an `#[entry]` function; a
 hosted program fails with "requires a `#[no_std]` program" and a no_std program
@@ -1193,9 +1193,10 @@ without an entry fails with "requires an `#[entry]` function" before any
 toolchain is discovered. The backend renames the entry wrapper to `lusa_entry`,
 compiles the generated C with `-ffreestanding -fno-builtin
 -fno-stack-protector -mcmodel=medany`, assembles the embedded
-`renode/startup_riscv.S` (stack pointer, BSS zeroing, call, park), and links the
-embedded `renode/linker_riscv.ld` with `-nostdlib -nostartfiles -Wl,-T,linker.ld
--lgcc`. RAM is placed at `0x80000000` and the NS16550 UART at `0x10000000`.
+`renode/startup_riscv.S` (stack pointer, trap entry, BSS zeroing, call, park),
+and links the embedded `renode/linker_riscv.ld` with `-nostdlib -nostartfiles
+-Wl,-T,linker.ld -lgcc`. RAM is placed at `0x80000000` and the NS16550 UART at
+`0x10000000`.
 
 Cross-compiler discovery is `--cc` → `LUSA_RISCV_CC`/`LUSA_CROSS_CC` → a
 conventional GNU RISC-V compiler on `PATH` (`riscv32-unknown-elf-gcc`,
@@ -1233,16 +1234,19 @@ Renode platform:
 |--------|--------|-----------|-------|------|------|
 | `rp2040` | `thumbv6m-none-eabi` | Cortex-M0+ (`-mcpu=cortex-m0plus -mthumb -mfloat-abi=soft`) | 2 MiB @ `0x10000000` | 264 KiB @ `0x20000000` | PL011 UART0 @ `0x40034000` |
 | `stm32f4` | `thumbv7em-none-eabi` | Cortex-M4 (`-mcpu=cortex-m4 -mthumb -mfloat-abi=soft`) | 1 MiB @ `0x08000000` | 128 KiB @ `0x20000000` | USART2 @ `0x40004400` |
-| `esp32c3` | `riscv32-esp-elf` | RV32IMC (`-march=rv32imc -mabi=ilp32 -mcmodel=medany`) | 4 MiB @ `0x42000000` | 400 KiB @ `0x3FC80000` | UART0 @ `0x60000000` |
+| `esp32c3` | `riscv32-esp-elf` | RV32IMC + Zicsr (`-march=rv32imc_zicsr -mabi=ilp32 -mcmodel=medany`) | 4 MiB @ `0x42000000` | 400 KiB @ `0x3FC80000` | UART0 @ `0x60000000` |
 
-The ARM targets share `renode/startup_arm.S`, which installs the 16 architectural
-Cortex-M exception vectors, sets VTOR, copies `.data` from flash to SRAM, zeroes
-`.bss`, and calls `lusa_entry`. `renode/linker_arm_rp2040.ld` and
+The ARM targets share `renode/startup_arm.S`, which installs a generated
+Cortex-M vector table (one word per exception through the board's highest
+device vector), sets VTOR, copies `.data` from flash to SRAM, zeroes `.bss`, and
+calls `lusa_entry`. `renode/linker_arm_rp2040.ld` and
 `renode/linker_arm_stm32f4.ld` encode the flash/SRAM origins above.
-ESP32-C3 reuses the RISC-V startup stub, with `renode/linker_riscv_flash.ld`
-placing code in flash and data in SRAM. GCC can lower aggregate copies to
-`memcpy`/`memset` even under `-ffreestanding`, so both startup stubs provide
-byte-wise implementations for libc-free images.
+ESP32-C3 reuses the RISC-V startup stub, which installs a direct-mode trap
+entry (`mtvec`), enables the machine software/timer/external interrupt classes
+in `mie`, and dispatches on `mcause`; `renode/linker_riscv_flash.ld` places code
+in flash and data in SRAM. GCC can lower aggregate copies to `memcpy`/`memset`
+even under `-ffreestanding`, so both startup stubs provide byte-wise
+implementations for libc-free images.
 
 Cross-compiler discovery is target-aware. ARM targets try `--cc`, then
 `LUSA_ARM_CC`/`LUSA_CROSS_CC`, then `arm-none-eabi-gcc` on `PATH`. ESP32-C3
@@ -1257,7 +1261,7 @@ The pre-configured Renode environments are:
 |----------|----------------------|-------|
 | `renode/lusa_rp2040.repl` | dual `CPU.CortexM`, two NVICs, PL011 UART0, SIO window, SysTick | Renode 1.17 has no RP2040 SIO/TIMER models; SIO is backed by `MappedMemory`, timing uses SysTick, and `cortex-m0` stands in for M0+ (`cpu1` is halted by the script) |
 | `renode/lusa_stm32f4.repl` | `UART.STM32_UART`, `GPIOPort.STM32_GPIOPort`, `Timers.STM32_Timer`, NVIC/SysTick | USART2, GPIOA, and TIM2 use their real STM32 models |
-| `renode/lusa_esp32c3.repl` | `CPU.RiscV32` (`rv32imc`), `UART.ESP32_UART`, `Timers.Arm_CMSDK_Timer`, `MappedMemory` GPIO | no ESP32-C3 TIMG/GPIO model in 1.17, so CMSDK sits at the TIMG T0 base and the GPIO block is plain memory |
+| `renode/lusa_esp32c3.repl` | `CPU.RiscV32` (`rv32imc`), `UART.ESP32_UART`, `Timers.Arm_CMSDK_Timer`, `MappedMemory` GPIO, CLINT machine timer | no ESP32-C3 TIMG/GPIO model in 1.17, so CMSDK sits at the TIMG T0 base and the GPIO block is plain memory; `IRQControllers.CoreLevelInterruptor` at the CLINT base supplies timer interrupts |
 
 `examples/modern_mcu_peripherals.lusa` is the STM32F4 reference image. It
 writes `LUSA MODERN MCU OK\nstm32f4 gpio=ok timer=ok\n\n` through USART2,
@@ -1278,7 +1282,104 @@ embedded assets, freestanding C emission, cross-built ELF headers, the CLI
 target names, and—when the toolchains and Renode are present—boots each image
 and asserts its exact UART banner. `.github/workflows/renode.yml` installs
 xPack Arm GCC and xPack RISC-V GCC, exports `LUSA_ARM_CC`/`LUSA_ESP32_CC`, and
-runs modules 24 and 25 together.
+runs modules 24, 25, and 26 together.
+
+### Hardware interrupts and critical sections (Module 26)
+
+`#[interrupt]` marks a function as a hardware ISR. The cross build emits a
+callable wrapper named `lusa_isr_<vector>`, validates the vector against the
+selected board, and places the wrapper in the generated vector table. A bare
+`#[interrupt]` selects the board's default timer; `#[interrupt("VECTOR")]`
+selects an explicit vector, matched case-insensitively:
+
+| target | default vector | other vectors |
+|--------|----------------|---------------|
+| `stm32f4` | `tim2` (exception 44) | `systick` (15), `usart2` (54) |
+| `rp2040` | `systick` (exception 15) | `uart0` (exception 36) |
+| `esp32c3` | `machine_timer` (`mcause` 7) | `machine_software` (3), `machine_external` (11) |
+| `riscv32-virt` / `riscv64-virt` | `machine_timer` (`mcause` 7) | `machine_software` (3), `machine_external` (11) |
+
+ISR functions must take no parameters, return `void`, and cannot be `async`,
+`#[entry]`, or `#[global_allocator]`. Two handlers may not resolve to the same
+vector; the check runs after bare defaults are resolved, so a bare
+`#[interrupt]` plus `#[interrupt("TIM2")]` on STM32F4 is rejected.
+
+The runtime provides three critical-section intrinsics. `interrupts_disable()`
+clears the global mask and returns `1` when interrupts were enabled;
+`interrupts_enable()` sets it; `interrupts_restore(state)` restores the exact
+previous state. On Arm they use `mrs primask`/`cpsid i` and `cpsie i`; on
+RISC-V they test and clear/set `mstatus.MIE` with `csrr`/`csrci`/`csrsi`. The
+interpreter and bytecode VM simulate the same mask, so the protocol is testable
+on the host.
+
+```lusa
+#[no_std]
+
+local ticks: u32 = 0
+
+#[interrupt("TIM2")]
+function tim2_isr(): void
+    unsafe do
+        local tim: *mut u32 = 0x40000000
+        local status: *mut u32 = tim + 4
+        status.write_volatile(0) -- acknowledge the update event
+        volatile_write(&ticks, volatile_read(&ticks) + 1)
+    end
+end
+
+#[entry]
+function _start(): void
+    -- Configure TIM2 and the NVIC, then:
+    interrupts_enable()
+    unsafe do
+        while volatile_read(&ticks) < 3 do
+        end
+    end
+    local before: u32 = interrupts_disable()
+    interrupts_restore(before)
+    while true do
+    end
+end
+```
+
+`examples/interrupt_driven_timer.lusa` is the complete STM32F4 image. It
+programs PSC/ARR for a 100 Hz update interrupt, enables TIM2 in the NVIC, waits
+for three ISR activations, exercises the disable/nested-disable/restore
+protocol, and prints:
+
+```text
+LUSA INTERRUPT OK
+stm32f4 irq=ok count=ok flag=ok state=ok restored=ok
+```
+
+The RP2040 and ESP32-C3 interrupt images are built inline by
+`tests/module26_interrupts.rs`: the RP2040 programs SysTick for a 1 kHz tick,
+and the ESP32-C3 programs the CLINT `mtimecmp` register at `0x2000C000` from a
+16 MHz `mtime` at `0x20013FF8`. Their Renode platforms wire SysTick to
+`nvic@15` and the machine timer to `cpu@7`; STM32F4 TIM2 is wired to
+`nvic@28`.
+
+```sh
+lusalang build examples/interrupt_driven_timer.lusa --target stm32f4
+lusalang build examples/interrupt_driven_timer.lusa --target stm32f4 --emit-c
+
+cargo test --test module26_interrupts -- --test-threads=1
+```
+
+The cross build defines `LUSA_DEFAULT_VECTOR=<board default>` so a bare
+`#[interrupt]` names `lusa_isr_tim2`, `lusa_isr_systick`, or
+`lusa_isr_machine_timer`. The generated C carries
+`/* lusa:interrupt vector=... */` metadata for each wrapper. Startup tables are
+rendered from the same target registry, and the linker provides
+`_default_handler` fallbacks for vectors the program does not implement.
+
+Limits: cross targets compile with `-march=..._zicsr` on RISC-V so the CSR
+instructions are accepted. Renode 1.17 supplies the NVIC/SysTick and STM32
+timer models, but the ESP32-C3 platform uses a Renode CLINT at the documented
+`0x20008000` base rather than a full ESP32-C3 interrupt matrix. `#[interrupt]`
+does not configure clocks, GPIO alternate functions, or interrupt priorities;
+the example and tests write the raw registers directly. Host builds accept the
+attribute and emit the wrapper, but only cross targets install a vector table.
 
 ### Host compiler discovery
 
@@ -1322,7 +1423,11 @@ freestanding arena emission, owned-element drops, allocator diagnostics, and
 three-engine parity. `tests/module21.rs` adds `Result`/`Option` constructors and
 combinators, `?` in branches and loops, rich payloads, sum parameters and
 fields, `match` binding, freestanding scalar sums, typed diagnostics, runtime
-wrong-variant errors, and native + dynamic parity. See
+wrong-variant errors, and native + dynamic parity. `tests/module26_interrupts.rs`
+adds bare and explicit `#[interrupt]` parsing, placement/signature/duplicate
+diagnostics, target vector tables, critical-section parity, wrapper emission,
+cross builds, and exact-banner Renode boots for STM32F4 TIM2, RP2040 SysTick,
+and ESP32-C3 machine timer interrupts. See
 [`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md) and
 [`docs/LANGUAGE.md`](docs/LANGUAGE.md) section 9 for details.
 
@@ -1411,6 +1516,11 @@ Near-term milestones:
   linker maps and startup code, pre-configured Renode platforms for GPIO,
   timers/SysTick, and UART, three hardware examples, and module 25
   cross-build/emulation tests.
+- **v2.2.0 (shipped):** `#[interrupt]`/`#[interrupt("VECTOR")]` ISR
+  registration, generated Arm and RISC-V vector/trap tables, target-validated
+  default timer vectors, `interrupts_disable`/`interrupts_enable`/
+  `interrupts_restore` critical sections, Renode-driven TIM2/SysTick/CLINT
+  interrupt tests, and a shared volatile counter example.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

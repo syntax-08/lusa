@@ -48,6 +48,7 @@ struct Attributes {
     entry: bool,
     global_allocator: bool,
     link_section: Option<String>,
+    interrupt: Option<InterruptAttr>,
 }
 
 /// Linker section names are emitted inside a C string literal and passed to a
@@ -79,6 +80,47 @@ fn validate_section_name(name: &str, span: Span) -> LResult<()> {
             "invalid character in `link_section` name",
         )
         .help("section names may contain ASCII letters, digits, `_`, `.`, `-`, and `$`"));
+    }
+    Ok(())
+}
+
+/// Interrupt vector names become linker/assembly symbols, so they are limited
+/// to a portable identifier spelling.  Target membership is validated later,
+/// when the cross-build knows which board is being produced.
+fn validate_interrupt_name(name: &str, span: Span) -> LResult<()> {
+    if name.is_empty() {
+        return Err(LusaError::new(
+            E_PARSE,
+            Some(span),
+            "interrupt vector name cannot be empty",
+        )
+        .help("write `#[interrupt(\"TIM2\")]` or use a bare `#[interrupt]`"));
+    }
+    if name.len() > 64 {
+        return Err(LusaError::new(
+            E_PARSE,
+            Some(span),
+            "interrupt vector name is too long (maximum 64 bytes)",
+        ));
+    }
+    let mut bytes = name.bytes();
+    let first = bytes.next().unwrap_or(b'_');
+    if !(first.is_ascii_alphabetic() || first == b'_')
+        || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(LusaError::new(
+            E_PARSE,
+            Some(span),
+            "invalid character in interrupt vector name",
+        )
+        .help("vector names may contain ASCII letters, digits, and `_`, and must start with a letter or `_`"));
+    }
+    if name.eq_ignore_ascii_case("default") || name.starts_with('@') {
+        return Err(LusaError::new(
+            E_PARSE,
+            Some(span),
+            "`default` is reserved for the bare `#[interrupt]` timer vector",
+        ));
     }
     Ok(())
 }
@@ -509,10 +551,10 @@ impl Parser {
     /// Parses zero or more `#[...]` attributes.
     ///
     /// Supported attributes are `#[packed]`, `#[repr(align(N))]`,
-    /// `#[no_std]`, `#[entry]`, `#[global_allocator]`, and
-    /// `#[link_section = "..."]`.  The values are validated here, before the
-    /// AST reaches either backend, so the dynamic engines and the C emitter
-    /// agree on what is legal.
+    /// `#[no_std]`, `#[entry]`, `#[global_allocator]`, `#[interrupt]`,
+    /// `#[interrupt("VECTOR")]`, and `#[link_section = "..."]`.  The values are
+    /// validated here, before the AST reaches either backend, so the dynamic
+    /// engines and the C emitter agree on what is legal.
     fn parse_attributes(&mut self) -> LResult<Attributes> {
         const MAX_ALIGN: u32 = 4096;
         let mut attrs = Attributes::default();
@@ -608,6 +650,53 @@ impl Parser {
                     validate_section_name(&name, tk.span)?;
                     attrs.link_section = Some(name);
                 }
+                "interrupt" => {
+                    if attrs.interrupt.is_some() {
+                        return Err(LusaError::new(
+                            E_PARSE,
+                            Some(attr_span),
+                            "duplicate `#[interrupt]` attribute",
+                        ));
+                    }
+                    let mut vector = None;
+                    if self.eat(TK::LParen) {
+                        let tk = self.peek().clone();
+                        let name = match &tk.kind {
+                            TK::Str(segs) => {
+                                let mut text = String::new();
+                                for seg in segs {
+                                    match seg {
+                                        StrSeg::Lit(lit) => text.push_str(lit),
+                                        StrSeg::Expr(_) => {
+                                            return Err(LusaError::new(
+                                                E_PARSE,
+                                                Some(tk.span),
+                                                "`interrupt` requires a plain vector-name string",
+                                            ));
+                                        }
+                                    }
+                                }
+                                self.bump();
+                                text
+                            }
+                            _ => {
+                                return Err(LusaError::new(
+                                    E_PARSE,
+                                    Some(tk.span),
+                                    format!(
+                                        "expected an interrupt vector name, found {}",
+                                        tk.desc()
+                                    ),
+                                )
+                                .help("write `#[interrupt(\"TIM2\")]` or use a bare `#[interrupt]`"));
+                            }
+                        };
+                        validate_interrupt_name(&name, tk.span)?;
+                        self.expect(TK::RParen, "`)` after the interrupt vector name")?;
+                        vector = Some(name);
+                    }
+                    attrs.interrupt = Some(InterruptAttr { vector });
+                }
                 "repr" => {
                     self.expect(TK::LParen, "`(` after `repr`")?;
                     let (inner, inner_span) = self.expect_name()?;
@@ -679,7 +768,8 @@ impl Parser {
                     )
                     .help(
                         "supported attributes are `#[packed]`, `#[repr(align(N))]`, \
-                         `#[no_std]`, `#[entry]`, `#[global_allocator]`, and \
+                         `#[no_std]`, `#[entry]`, `#[global_allocator]`, \
+                         `#[interrupt]`, `#[interrupt(\"VECTOR\")]`, and \
                          `#[link_section = \"...\"]`",
                     ));
                 }
@@ -705,6 +795,7 @@ impl Parser {
                 || attrs.align.is_some()
                 || attrs.entry
                 || attrs.global_allocator
+                || attrs.interrupt.is_some()
                 || attrs.link_section.is_some()
             {
                 return Err(LusaError::new(
@@ -718,11 +809,15 @@ impl Parser {
         }
 
         if self.at(TK::Struct) {
-            if attrs.entry || attrs.link_section.is_some() || attrs.global_allocator {
+            if attrs.entry
+                || attrs.link_section.is_some()
+                || attrs.global_allocator
+                || attrs.interrupt.is_some()
+            {
                 return Err(LusaError::new(
                     E_PARSE,
                     Some(start),
-                    "`#[entry]` and `#[link_section]` are only supported on functions or globals; `#[global_allocator]` is only supported on functions",
+                    "`#[entry]` and `#[link_section]` are only supported on functions or globals; `#[global_allocator]` and `#[interrupt]` are only supported on functions",
                 ));
             }
             return self.parse_struct_st(attrs.packed, attrs.align);
@@ -745,35 +840,45 @@ impl Parser {
                 entry,
                 global_allocator,
                 link_section,
+                interrupt,
                 ..
             } = &mut st.kind
             {
                 *entry = attrs.entry;
                 *global_allocator = attrs.global_allocator;
                 *link_section = attrs.link_section;
+                *interrupt = attrs.interrupt;
             }
             return Ok(st);
         }
 
         if self.at(TK::Local) {
-            if attrs.packed || attrs.align.is_some() || attrs.entry || attrs.global_allocator
+            if attrs.packed
+                || attrs.align.is_some()
+                || attrs.entry
+                || attrs.global_allocator
+                || attrs.interrupt.is_some()
             {
                 return Err(LusaError::new(
                     E_PARSE,
                     Some(start),
-                    "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate a local; `#[global_allocator]` is only supported on functions",
+                    "`#[packed]`, `#[repr(align(N))]`, `#[entry]`, and `#[interrupt]` cannot annotate a local; `#[global_allocator]` is only supported on functions",
                 ));
             }
             return self.parse_local_st(attrs.link_section);
         }
 
         if matches!(self.peek().kind, TK::Name(_) | TK::Star | TK::StarLine) {
-            if attrs.packed || attrs.align.is_some() || attrs.entry || attrs.global_allocator
+            if attrs.packed
+                || attrs.align.is_some()
+                || attrs.entry
+                || attrs.global_allocator
+                || attrs.interrupt.is_some()
             {
                 return Err(LusaError::new(
                     E_PARSE,
                     Some(start),
-                    "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate an assignment; `#[global_allocator]` is only supported on functions",
+                    "`#[packed]`, `#[repr(align(N))]`, `#[entry]`, and `#[interrupt]` cannot annotate an assignment; `#[global_allocator]` is only supported on functions",
                 ));
             }
             let mut st = self.parse_assign_or_expr()?;
@@ -1240,7 +1345,14 @@ impl Parser {
         }
         func.span_body = merge(kw.span, func.span_body);
         Ok(St {
-            kind: StKind::FuncSt { target, func, entry: false, global_allocator: false, link_section: None },
+            kind: StKind::FuncSt {
+                target,
+                func,
+                entry: false,
+                global_allocator: false,
+                link_section: None,
+                interrupt: None,
+            },
             span: kw.span,
         })
     }

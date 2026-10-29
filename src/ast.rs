@@ -68,6 +68,17 @@ pub struct St {
     pub span: Span,
 }
 
+/// `#[interrupt]` / `#[interrupt("TIM2")]` metadata attached to a function.
+///
+/// The dynamic engines accept and ignore the attribute; the self-hosted C
+/// backend emits a callable vector wrapper for the marked function.
+#[derive(Clone, Debug)]
+pub struct InterruptAttr {
+    /// Explicit target vector name.  `None` selects the board's default timer
+    /// vector (`#[interrupt]`).
+    pub vector: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub enum StKind {
     /// `local` declarations
@@ -137,6 +148,8 @@ pub enum StKind {
         global_allocator: bool,
         /// `#[link_section = "..."]` on the function.
         link_section: Option<String>,
+        /// `#[interrupt]` / `#[interrupt("VECTOR")]` hardware ISR marker.
+        interrupt: Option<InterruptAttr>,
     },
     /// `#[no_std]`: file-level bare-metal mode marker.  The dynamic engines
     /// accept and ignore it; the C backend disables the hosted runtime.

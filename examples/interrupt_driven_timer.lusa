@@ -1,0 +1,173 @@
+-- Module 26 example: periodic TIM2 interrupts on STM32F4.
+--
+--   lusalang build examples/interrupt_driven_timer.lusa --target stm32f4
+--
+-- `#[interrupt("TIM2")]` places `tim2_isr` in the generated `.vectors` table
+-- at exception 44 (IRQ 28). The main program configures TIM2 for a 100 Hz
+-- update interrupt, enables the NVIC line, and waits for the ISR to advance a
+-- shared volatile counter. It then exercises the critical-section intrinsics:
+-- `interrupts_disable()` reports the previous state, a nested disable returns
+-- 0, and `interrupts_restore()` puts the mask back exactly as it was.
+--
+-- The UART banner is asserted byte-for-byte by tests/module26_interrupts.rs
+-- under Renode. All shared state is accessed through the volatile intrinsics,
+-- so polling in `main` cannot be optimized into an infinite loop.
+
+#[no_std]
+
+local ticks: u32 = 0
+local fired: u32 = 0
+
+function uart_init(): void
+    unsafe do
+        local usart: *mut u32 = 0x40004400
+        local baud: *mut u32 = usart + 2
+        local control: *mut u32 = usart + 3
+        baud.write_volatile(0x8B)      -- 115200 baud (APB1 clock not modelled)
+        control.write_volatile(0x2008) -- UE | TE
+    end
+end
+
+function uart_putc(byte: u32): void
+    unsafe do
+        local usart: *mut u32 = 0x40004400
+        local status: *mut u32 = usart
+        local data: *mut u32 = usart + 1
+        while (status.read_volatile() // 128) % 2 == 0 do
+        end
+        data.write_volatile(byte)
+    end
+end
+
+function uart_puts(message: *mut u32, length: u32): void
+    local i: u32 = 0
+    unsafe do
+        local cursor: *mut u32 = message
+        while i < length do
+            uart_putc(cursor.read_volatile())
+            cursor = cursor + 1
+            i = i + 1
+        end
+    end
+end
+
+#[interrupt("TIM2")]
+function tim2_isr(): void
+    unsafe do
+        local tim: *mut u32 = 0x40000000
+        local status: *mut u32 = tim + 4
+        -- Acknowledge the update event, then publish the shared state.
+        status.write_volatile(0)
+        local next: u32 = volatile_read(&ticks) + 1
+        volatile_write(&ticks, next)
+        volatile_write(&fired, 1)
+    end
+end
+
+function timer_start(): void
+    unsafe do
+        local tim: *mut u32 = 0x40000000
+        local cr1: *mut u32 = tim
+        local dier: *mut u32 = tim + 3
+        local status: *mut u32 = tim + 4
+        local egr: *mut u32 = tim + 5
+        local psc: *mut u32 = tim + 10
+        local arr: *mut u32 = tim + 11
+        -- 10 MHz / (9999 + 1) = 1 kHz; update every 10 ticks = 100 Hz.
+        psc.write_volatile(9999)
+        arr.write_volatile(99)
+        status.write_volatile(0)
+        dier.write_volatile(1) -- UIE
+        egr.write_volatile(1)  -- UG: latch PSC and ARR
+        cr1.write_volatile(1)  -- CEN
+        -- NVIC ISER0 bit 28 enables TIM2. This image uses no other IRQ.
+        local nvic: *mut u32 = 3758153984 -- 0xE000E100
+        nvic.write_volatile(268435456) -- 1 << 28
+    end
+end
+
+#[entry]
+function _start(): void
+    uart_init()
+    timer_start()
+    interrupts_enable()
+
+    -- Wait until the ISR has run at least three times. The volatile read is
+    -- what makes this loop wait on hardware rather than spin on a register.
+    unsafe do
+        while volatile_read(&ticks) < 3 do
+        end
+    end
+
+    local before: u32 = interrupts_disable()
+    local nested: u32 = interrupts_disable()
+    interrupts_restore(nested) -- nested state 0 keeps the mask disabled
+    local count: u32 = 0
+    local flag: u32 = 0
+    unsafe do
+        count = volatile_read(&ticks)
+        flag = volatile_read(&fired)
+    end
+    interrupts_restore(before)
+    local restored: u32 = interrupts_disable()
+    interrupts_enable()
+
+    local prefix: [u32; 18] = [
+        76, 85, 83, 65, 32, 73, 78, 84, 69, 82, 82, 85, 80, 84, 32, 79,
+        75, 10
+    ]
+    local board: [u32; 12] = [
+        115, 116, 109, 51, 50, 102, 52, 32, 105, 114, 113, 61
+    ]
+    local count_label: [u32; 7] = [32, 99, 111, 117, 110, 116, 61]
+    local flag_label: [u32; 6] = [32, 102, 108, 97, 103, 61]
+    local state_label: [u32; 7] = [32, 115, 116, 97, 116, 101, 61]
+    local restored_label: [u32; 10] = [
+        32, 114, 101, 115, 116, 111, 114, 101, 100, 61
+    ]
+    local ok: [u32; 2] = [111, 107]
+    local fail: [u32; 4] = [102, 97, 105, 108]
+    local newline: [u32; 2] = [10, 10]
+
+    uart_puts(&prefix[0], 18)
+    uart_puts(&board[0], 12)
+    if count > 0 then
+        uart_puts(&ok[0], 2)
+    else
+        uart_puts(&fail[0], 4)
+    end
+    uart_puts(&count_label[0], 7)
+    if count >= 3 then
+        uart_puts(&ok[0], 2)
+    else
+        uart_puts(&fail[0], 4)
+    end
+    uart_puts(&flag_label[0], 6)
+    if flag == 1 then
+        uart_puts(&ok[0], 2)
+    else
+        uart_puts(&fail[0], 4)
+    end
+    local state_ok: bool = false
+    if before == 1 then
+        if nested == 0 then
+            state_ok = true
+        end
+    end
+    uart_puts(&state_label[0], 7)
+    if state_ok then
+        uart_puts(&ok[0], 2)
+    else
+        uart_puts(&fail[0], 4)
+    end
+    uart_puts(&restored_label[0], 10)
+    if restored == 1 then
+        uart_puts(&ok[0], 2)
+    else
+        uart_puts(&fail[0], 4)
+    end
+    uart_puts(&newline[0], 2)
+
+    while true do
+    end
+end

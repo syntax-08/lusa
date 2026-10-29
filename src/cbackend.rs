@@ -582,6 +582,59 @@ fn entry_wrapper_name(c_source: &str) -> Option<String> {
     None
 }
 
+/// Validates the `/* lusa:interrupt vector=... */` metadata emitted for every
+/// `#[interrupt]` wrapper against the selected target's vector registry.
+///
+/// The self-hosted emitter is target-independent, so this is the point where a
+/// bare attribute is resolved to the board's default timer and explicit names
+/// are checked for membership.  It also rejects two handlers that resolve to
+/// the same hardware vector (for example a bare `#[interrupt]` and an explicit
+/// `#[interrupt("TIM2")]` on STM32F4).
+pub fn validate_interrupt_vectors(c_source: &str, target: &TargetSpec) -> Result<(), String> {
+    const MARKER: &str = "/* lusa:interrupt vector=";
+    let mut seen: Vec<String> = Vec::new();
+    for line in c_source.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(MARKER) else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix(" */") else {
+            continue;
+        };
+        let name = name.trim();
+        let resolved = if name.eq_ignore_ascii_case("default") {
+            if target.default_vector.is_empty() {
+                return Err(format!(
+                    "target `{}` does not define a default interrupt vector; write `#[interrupt(\"VECTOR\")]`",
+                    target.name
+                ));
+            }
+            target.default_vector
+        } else {
+            name
+        };
+        let Some(vector) = target.vector(resolved) else {
+            return Err(format!(
+                "unknown interrupt vector `{}` for target `{}`; available vectors: {}",
+                resolved,
+                target.name,
+                target.vector_names()
+            ));
+        };
+        if seen
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(vector.name))
+        {
+            return Err(format!(
+                "duplicate `#[interrupt]` for vector `{}` on target `{}`",
+                vector.name, target.name
+            ));
+        }
+        seen.push(vector.name.to_string());
+    }
+    Ok(())
+}
+
 fn entry_signature(line: &str) -> Option<String> {
     let rest = line
         .strip_prefix("void ")
@@ -616,6 +669,9 @@ fn cross_build_source(
             target.name
         )
     })?;
+    validate_interrupt_vectors(c_source, target)?;
+    let startup_source = target.startup_source();
+    let linker_source = target.linker_source();
     let compiler = find_target_compiler(target, cc)?;
     let output = if output.is_absolute() {
         output.to_path_buf()
@@ -639,9 +695,9 @@ fn cross_build_source(
     let write = || -> Result<(), String> {
         std::fs::write(workdir.join("program.c"), c_source)
             .map_err(|e| format!("cannot write generated C: {e}"))?;
-        std::fs::write(workdir.join("startup.S"), target.startup)
+        std::fs::write(workdir.join("startup.S"), &startup_source)
             .map_err(|e| format!("cannot write startup assembly: {e}"))?;
-        std::fs::write(workdir.join("linker.ld"), target.linker_script)
+        std::fs::write(workdir.join("linker.ld"), &linker_source)
             .map_err(|e| format!("cannot write linker script: {e}"))?;
         Ok(())
     };
@@ -662,6 +718,12 @@ fn cross_build_source(
             .args(target.arch_flags);
         if entry != "lusa_entry" {
             compile.arg(format!("-D{entry}=lusa_entry"));
+        }
+        if !target.default_vector.is_empty() {
+            compile.arg(format!(
+                "-DLUSA_DEFAULT_VECTOR={}",
+                target.default_vector
+            ));
         }
         compile
             .arg("-c")

@@ -6,8 +6,10 @@
  * which sets VTOR, copies `.data` from flash to SRAM, zeroes `.bss`, calls the
  * generated `lusa_entry`, and parks the core.
  *
- * The table contains the 16 architectural Cortex-M exceptions.  Boards with
- * external interrupts should extend it with their device vectors.
+ * The build replaces the vector-entry marker below with one word per
+ * architectural and device vector.  Entries without a `#[interrupt]` handler
+ * point at `_default_handler`; the linker also provides a fallback for each
+ * `lusa_isr_<vector>` symbol, so sparse handler tables stay valid.
  */
 .syntax unified
 .thumb
@@ -18,9 +20,7 @@
 _vectors:
     .word _stack_top
     .word _reset
-    .rept 14
-    .word _default_handler
-    .endr
+@LUSA_VECTOR_ENTRIES@
 .size _vectors, . - _vectors
 
 .section .text.init, "ax", %progbits

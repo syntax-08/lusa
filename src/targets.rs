@@ -29,6 +29,17 @@ pub enum TargetKind {
     Esp32C3,
 }
 
+/// One hardware interrupt vector exposed by a cross target.
+///
+/// `number` is the Cortex-M exception number (`16 + IRQn`) on Arm and the
+/// RISC-V `mcause` code on RISC-V.  Names are lowercase and become the
+/// `lusa_isr_<name>` wrapper symbols referenced by the startup table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterruptVector {
+    pub name: &'static str,
+    pub number: u16,
+}
+
 /// A complete cross-compilation recipe.
 #[derive(Clone, Copy, Debug)]
 pub struct TargetSpec {
@@ -57,13 +68,128 @@ pub struct TargetSpec {
     pub renode_platform: &'static str,
     /// Renode monitor script template (empty for host targets).
     pub renode_script: &'static str,
+    /// Interrupt vectors in ascending hardware order.
+    pub vectors: &'static [InterruptVector],
+    /// Vector selected by a bare `#[interrupt]` (empty for host targets).
+    pub default_vector: &'static str,
 }
 
 impl TargetSpec {
     pub fn is_host(&self) -> bool {
         self.kind == TargetKind::Host
     }
+
+    pub fn is_riscv(&self) -> bool {
+        matches!(
+            self.kind,
+            TargetKind::RiscV32Virt | TargetKind::RiscV64Virt | TargetKind::Esp32C3
+        )
+    }
+
+    pub fn vector(&self, name: &str) -> Option<&'static InterruptVector> {
+        self.vectors
+            .iter()
+            .find(|vector| vector.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Comma-separated vector names for diagnostics.
+    pub fn vector_names(&self) -> String {
+        self.vectors
+            .iter()
+            .map(|vector| vector.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Renders the embedded startup stub, expanding its vector-table marker and
+    /// filling unclaimed entries with `_default_handler`.
+    pub fn startup_source(&self) -> String {
+        let mut source = self.startup.to_string();
+        if source.contains("@LUSA_VECTOR_ENTRIES@") {
+            let mut entries = String::new();
+            let max = self.vectors.iter().map(|v| v.number).max().unwrap_or(15);
+            for number in 2..=max.max(15) {
+                entries.push_str("    .word ");
+                match self
+                    .vectors
+                    .iter()
+                    .find(|vector| vector.number == number)
+                {
+                    Some(vector) => {
+                        entries.push_str("lusa_isr_");
+                        entries.push_str(vector.name);
+                    }
+                    None => entries.push_str("_default_handler"),
+                }
+                entries.push('\n');
+            }
+            source = source.replace("@LUSA_VECTOR_ENTRIES@", entries.trim_end());
+        }
+        if source.contains("@LUSA_TRAP_ENTRIES@") {
+            let mut entries = String::new();
+            let max = self.vectors.iter().map(|v| v.number).max().unwrap_or(11);
+            let directive = if self.kind == TargetKind::RiscV64Virt {
+                ".dword"
+            } else {
+                ".word"
+            };
+            for cause in 0..=max {
+                entries.push_str("    ");
+                entries.push_str(directive);
+                entries.push(' ');
+                match self
+                    .vectors
+                    .iter()
+                    .find(|vector| vector.number == cause)
+                {
+                    Some(vector) => {
+                        entries.push_str("lusa_isr_");
+                        entries.push_str(vector.name);
+                    }
+                    None => entries.push_str("_default_handler"),
+                }
+                entries.push('\n');
+            }
+            source = source.replace("@LUSA_TRAP_ENTRIES@", entries.trim_end());
+        }
+        source
+    }
+
+    /// Renders the embedded linker script, adding a fallback definition for
+    /// every generated vector wrapper so unused vectors still link.
+    pub fn linker_source(&self) -> String {
+        let mut provides = String::new();
+        for vector in self.vectors {
+            provides.push_str("PROVIDE(lusa_isr_");
+            provides.push_str(vector.name);
+            provides.push_str(" = _default_handler);\n");
+        }
+        self.linker_script
+            .replace("@LUSA_INTERRUPT_PROVIDES@", provides.trim_end())
+    }
 }
+
+/// Cortex-M architectural SysTick plus the RISC-V supervisor-level defaults.
+/// RISC-V `mcause` values: software = 3, machine timer = 7, external = 11.
+static RISCV_VECTORS: &[InterruptVector] = &[
+    InterruptVector { name: "machine_software", number: 3 },
+    InterruptVector { name: "machine_timer", number: 7 },
+    InterruptVector { name: "machine_external", number: 11 },
+];
+
+/// RP2040 exception numbers: SysTick = 15, UART0 IRQ 20 = exception 36.
+static RP2040_VECTORS: &[InterruptVector] = &[
+    InterruptVector { name: "systick", number: 15 },
+    InterruptVector { name: "uart0", number: 36 },
+];
+
+/// STM32F4 exception numbers: SysTick = 15, TIM2 IRQ 28 = 44,
+/// USART2 IRQ 38 = 54.
+static STM32F4_VECTORS: &[InterruptVector] = &[
+    InterruptVector { name: "systick", number: 15 },
+    InterruptVector { name: "tim2", number: 44 },
+    InterruptVector { name: "usart2", number: 54 },
+];
 
 /// The host target.  Its toolchain details are resolved by the existing host
 /// compiler discovery code, so the cross-specific fields stay empty.
@@ -81,6 +207,8 @@ pub static HOST: TargetSpec = TargetSpec {
     startup: "",
     renode_platform: "",
     renode_script: "",
+    vectors: &[],
+    default_vector: "",
 };
 
 /// Renode's 32-bit RISC-V `virt` machine with an NS16550 UART.
@@ -98,7 +226,7 @@ pub static RISCV32_VIRT: TargetSpec = TargetSpec {
     ],
     compiler_env: &["LUSA_RISCV_CC", "LUSA_CROSS_CC"],
     arch_flags: &[
-        "-march=rv32imac",
+        "-march=rv32imac_zicsr",
         "-mabi=ilp32",
         "-mcmodel=medany",
     ],
@@ -107,6 +235,8 @@ pub static RISCV32_VIRT: TargetSpec = TargetSpec {
     startup: include_str!("../renode/startup_riscv.S"),
     renode_platform: include_str!("../renode/lusa_riscv32_virt.repl"),
     renode_script: include_str!("../renode/lusa_riscv32_virt.resc"),
+    vectors: RISCV_VECTORS,
+    default_vector: "machine_timer",
 };
 
 /// Renode's 64-bit RISC-V `virt` machine with an NS16550 UART.
@@ -124,7 +254,7 @@ pub static RISCV64_VIRT: TargetSpec = TargetSpec {
     ],
     compiler_env: &["LUSA_RISCV_CC", "LUSA_CROSS_CC"],
     arch_flags: &[
-        "-march=rv64imac",
+        "-march=rv64imac_zicsr",
         "-mabi=lp64",
         "-mcmodel=medany",
     ],
@@ -133,6 +263,8 @@ pub static RISCV64_VIRT: TargetSpec = TargetSpec {
     startup: include_str!("../renode/startup_riscv.S"),
     renode_platform: include_str!("../renode/lusa_riscv64_virt.repl"),
     renode_script: include_str!("../renode/lusa_riscv64_virt.resc"),
+    vectors: RISCV_VECTORS,
+    default_vector: "machine_timer",
 };
 
 /// Raspberry Pi RP2040: dual Cortex-M0+, 2 MiB flash, 264 KiB SRAM.
@@ -154,6 +286,8 @@ pub static RP2040: TargetSpec = TargetSpec {
     startup: include_str!("../renode/startup_arm.S"),
     renode_platform: include_str!("../renode/lusa_rp2040.repl"),
     renode_script: include_str!("../renode/lusa_rp2040.resc"),
+    vectors: RP2040_VECTORS,
+    default_vector: "systick",
 };
 
 /// STM32F4: Cortex-M4, 1 MiB flash, 128 KiB SRAM.
@@ -175,6 +309,8 @@ pub static STM32F4: TargetSpec = TargetSpec {
     startup: include_str!("../renode/startup_arm.S"),
     renode_platform: include_str!("../renode/lusa_stm32f4.repl"),
     renode_script: include_str!("../renode/lusa_stm32f4.resc"),
+    vectors: STM32F4_VECTORS,
+    default_vector: "tim2",
 };
 
 /// Espressif ESP32-C3: RV32IMC, 4 MiB flash, 400 KiB SRAM.
@@ -192,7 +328,7 @@ pub static ESP32C3: TargetSpec = TargetSpec {
     ],
     compiler_env: &["LUSA_ESP32_CC", "LUSA_RISCV_CC", "LUSA_CROSS_CC"],
     arch_flags: &[
-        "-march=rv32imc",
+        "-march=rv32imc_zicsr",
         "-mabi=ilp32",
         "-mcmodel=medany",
     ],
@@ -201,6 +337,8 @@ pub static ESP32C3: TargetSpec = TargetSpec {
     startup: include_str!("../renode/startup_riscv.S"),
     renode_platform: include_str!("../renode/lusa_esp32c3.repl"),
     renode_script: include_str!("../renode/lusa_esp32c3.resc"),
+    vectors: RISCV_VECTORS,
+    default_vector: "machine_timer",
 };
 
 /// Every non-host target offered by `lusalang build --target`.

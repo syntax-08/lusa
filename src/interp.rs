@@ -77,6 +77,10 @@ pub struct Interp {
     pub coroutine_captures: Vec<value::CaptureMap>,
     /// pending `task.spawn` queue drained by `task.run`
     pub task_queue: Vec<Rc<RefCell<crate::value::TaskObj>>>,
+    /// simulated global interrupt mask used by `interrupts_disable` and
+    /// friends.  Native builds lower the same calls to CPUI/PRIMASK or
+    /// `mstatus.MIE`; the sandbox only needs to return the previous state.
+    pub interrupts_enabled: bool,
 }
 
 pub struct Frame {
@@ -126,6 +130,7 @@ impl Interp {
             active_coroutines: Vec::new(),
             coroutine_captures: Vec::new(),
             task_queue: Vec::new(),
+            interrupts_enabled: true,
         }
     }
 

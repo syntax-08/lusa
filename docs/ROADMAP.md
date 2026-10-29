@@ -999,9 +999,9 @@ registry.
   embedded assets, freestanding C emission, cross-built ELF headers, the CLI
   target names, and exact-banner Renode boots for all three boards. Renode and
   toolchain checks skip cleanly when the optional tools are absent.
-- `.github/workflows/renode.yml` now installs xPack Arm GCC as well as xPack
+- `.github/workflows/renode.yml` installs xPack Arm GCC as well as xPack
   RISC-V GCC and Renode, exports `LUSA_ARM_CC`/`LUSA_ESP32_CC`, and runs
-  modules 24 and 25.
+  modules 24, 25, and 26.
 
 **Acceptance criteria**
 
@@ -1029,6 +1029,112 @@ registry.
 - The cross toolchains and Renode remain optional local dependencies. CI covers
   Linux x86_64; Windows and macOS developers must install the tools to execute
   the boot tests.
+
+## Module 26 - Hardware interrupts and exception vectors (shipped in v2.2.0)
+
+Module 26 connects Lusa functions to the hardware interrupt controllers already
+modelled by the Module 24/25 platforms. The goal is a single registration
+surface (`#[interrupt]`), generated Arm vector tables and RISC-V trap tables,
+and a critical-section protocol that behaves identically in the interpreter,
+the bytecode VM, and freestanding C images.
+
+### 26.1 `#[interrupt]` and the target vector registry
+
+- `#[interrupt]` marks a top-level function as an ISR. A bare attribute selects
+  the board's default timer vector; `#[interrupt("VECTOR")]` selects an
+  explicit vector.
+- Each `TargetSpec` owns a `vectors` registry and `default_vector`:
+  STM32F4 defaults to `tim2` (exception 44) with `systick` (15) and `usart2`
+  (54) available; RP2040 defaults to `systick` (15) with `uart0` (36); the
+  ESP32-C3 and both `virt` boards default to `machine_timer` (`mcause` 7) with
+  `machine_software` (3) and `machine_external` (11).
+- Both front ends validate the attribute. Vector names are ASCII identifiers,
+  matched case-insensitively; `default` is reserved. ISRs take no parameters,
+  return `void`, and cannot be `async`, `#[entry]`, `#[global_allocator]`, or
+  methods.
+- The self-hosted emitter writes `void lusa_isr_<vector>(void)` wrappers with
+  `__attribute__((used))` and `/* lusa:interrupt vector=<name|default> */`
+  metadata. Bare attributes emit `LUSA_ISR_NAME(LUSA_DEFAULT_VECTOR)`, and the
+  cross build supplies `-DLUSA_DEFAULT_VECTOR=<board default>`.
+- `cbackend::validate_interrupt_vectors` resolves `default`, checks target
+  membership, and rejects two handlers that resolve to the same slot before
+  the C compiler or linker runs.
+- The dynamic engines accept and preserve the attribute without executing the
+  handler; the intrinsics remain testable on the host.
+
+### 26.2 Critical sections
+
+`interrupts_disable() -> u32` disables interrupts and returns `1` when they
+were enabled, `interrupts_enable()` enables them, and
+`interrupts_restore(state)` restores the exact prior state, so nested
+disable/restore sequences are safe. On Arm the lowering uses
+`mrs primask` plus `cpsid i`/`cpsie i`; on RISC-V it tests and clears or
+sets `mstatus.MIE` with `csrr`/`csrci`/`csrsi`. The interpreter and bytecode VM
+track the same global mask.
+
+### 26.3 Startup tables, linker fallbacks, and RISC-V traps
+
+- `renode/startup_arm.S` expands `@LUSA_VECTOR_ENTRIES@` with one word per
+  exception from 2 through the target's highest vector. The build renders the
+  same table from the `TargetSpec` registry, and
+  `@LUSA_INTERRUPT_PROVIDES@` in every linker script supplies a
+  `PROVIDE(lusa_isr_<vector> = _default_handler)` fallback.
+- `renode/startup_riscv.S` installs `_trap_entry` in `mtvec`, enables
+  `MSIE | MTIE | MEIE` in `mie`, saves the caller-saved state, dispatches on
+  `mcause`, and returns with `mret`. Its `@LUSA_TRAP_ENTRIES@` table covers
+  `mcause` 0–11. Timer handlers reprogram the CLINT compare register
+  themselves.
+- RISC-V targets compile with `-march=..._zicsr` (`rv32imc_zicsr`,
+  `rv32imac_zicsr`, `rv64imac_zicsr`) because startup and the critical-section
+  runtime use CSR instructions.
+- The ESP32-C3 Renode platform gains a
+  `IRQControllers.CoreLevelInterruptor` at `0x20008000` wired to the CPU
+  timer interrupt and a 16 MHz `timeProvider`; the STM32F4 TIM2 model is wired
+  to `nvic@28`.
+
+### 26.4 Example, tests, and CI
+
+- `examples/interrupt_driven_timer.lusa` programs STM32F4 TIM2 (PSC `+10`,
+  ARR `+11`) for a 100 Hz update interrupt, enables it in the NVIC, waits for
+  three ISR activations, exercises nested critical sections, and prints
+  `LUSA INTERRUPT OK\nstm32f4 irq=ok count=ok flag=ok state=ok restored=ok\n\n`.
+- `tests/module26_interrupts.rs` covers parsing, misuse and signature
+  diagnostics, duplicate-vector rejection, target tables, intrinsic parity,
+  wrapper/metadata emission, all three cross builds, and exact-banner Renode
+  boots of the STM32F4 TIM2 example plus inline RP2040 SysTick and ESP32-C3
+  CLINT firmware.
+- `.github/workflows/renode.yml` runs modules 24, 25, and 26 with the same
+  optional toolchain setup.
+
+**Acceptance criteria**
+
+- Bare and explicit `#[interrupt]` registrations build for the target that
+  owns the resolved vector and fail with a target-specific diagnostic on the
+  other boards.
+- Renode executes at least three periodic interrupts on STM32F4, RP2040, and
+  ESP32-C3, and the ISR mutates a shared counter and flag read back by the main
+  program.
+- The `interrupts_disable`/`interrupts_enable`/`interrupts_restore` protocol
+  matches across the interpreter, VM, and generated Arm/RISC-V C.
+- Generated vector/trap tables, linker fallbacks, and target registries are
+  asserted by module 26, and the full `cargo test --all-targets --
+  --test-threads=1` suite stays green with and without the optional tools.
+- `README.md`, `docs/LANGUAGE.md` sections 9.16–9.17, and this roadmap document
+  the attribute, intrinsics, platforms, and local test commands.
+
+**Risks**
+
+- Renode 1.17 models the Arm NVIC/SysTick, STM32 TIM2, and a generic CLINT, but
+  not the full ESP32-C3 interrupt matrix or RP2040 TIMER. The tests validate
+  the architectural interrupt path, not every vendor IRQ routing option.
+- `#[interrupt]` does not configure clocks, GPIO alternate functions, or
+  priorities; examples write raw registers and are bring-up references.
+- Vector tables are generated for the device vectors Lusa declares. Adding a
+  board requires extending its `TargetSpec` registry; unknown names fail
+  before compilation.
+- Interrupt handlers run outside the ownership checker's dynamic view; shared
+  state must use `volatile_read`/`volatile_write` or explicit critical
+  sections.
 
 ## Cross-cutting work
 
@@ -1065,6 +1171,7 @@ registry.
 | v1.9.0 | Namespaced modules, `use`, and visibility (shipped) | inline and file modules, `pub` privacy with `E0350`, `use` aliases/globs/re-exports, path resolution precedence, struct hoisting, module-level method sugar, legacy import compatibility, multi-file example, three-engine parity, native builds |
 | v2.0.0 | Cross-compilation and Renode hardware tests (shipped) | `--target riscv32-virt`/`riscv64-virt`, `#[no_std]` + `#[entry]` validation, embedded startup/linker assets, xPack/GNU RISC-V discovery, custom Renode platforms, UART file backend, exact-banner execution tests for RV32 and RV64, dedicated Renode CI workflow |
 | v2.1.0 | Modern MCU targets and peripheral emulation (shipped) | `--target rp2040`/`stm32f4`/`esp32c3`, per-board startup and linker maps, target-aware toolchain discovery and diagnostics, Renode platforms with GPIO/timer/SysTick/UART, three volatile-MMIO examples, exact-banner Renode boots for all three boards, ARM and RISC-V toolchains in the Renode CI workflow |
+| v2.2.0 | Hardware interrupts and exception vectors (shipped) | bare and explicit `#[interrupt]` in both front ends, target vector registries and default timer resolution, generated Arm vector tables and RISC-V trap tables, linker `PROVIDE` fallbacks, `interrupts_disable`/`interrupts_enable`/`interrupts_restore` in all engines, Renode TIM2/SysTick/CLINT interrupt boots, module 26 tests |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

@@ -296,11 +296,11 @@ fn link_section_misplacement_is_rejected() {
         ),
         (
             "#[link_section = \".data.boot\"]\nstruct Bad { a: u32 }\n",
-            "`#[entry]` and `#[link_section]` are only supported on functions or globals",
+            "`#[entry]` and `#[link_section]` are only supported on functions or globals; `#[global_allocator]` and `#[interrupt]` are only supported on functions",
         ),
         (
             "#[entry]\nlocal x: u32 = 1\n",
-            "`#[entry]` cannot annotate a local",
+            "cannot annotate a local",
         ),
     ];
     for (source, needle) in cases {

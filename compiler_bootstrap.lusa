@@ -347,6 +347,8 @@ opt_stmt = function(stmt)
             global_allocator = stmt.global_allocator,
             is_async = stmt.is_async,
             link_section = stmt.link_section,
+            interrupt = stmt.interrupt,
+            interrupt_vector = stmt.interrupt_vector,
             line = line, column = column
         }
     end
@@ -1216,6 +1218,8 @@ local check_alloc_key = nil
 local check_alloc_name = nil
 local check_dealloc_key = nil
 local check_dealloc_name = nil
+local check_interrupts = {}
+local check_interrupt_order = {}
 
 -- Section names are validated by both parsers before they reach the emitter;
 -- repeat the check here so `Compiler.emit_c` also rejects hand-built ASTs.
@@ -1240,6 +1244,41 @@ local function validate_link_section(name, line, column)
                 "invalid character in `link_section` name")
         end
         i = i + 1
+    end
+end
+
+-- Vector names become assembly/linker symbols.  The parser already narrows the
+-- spelling; validate again for hand-built ASTs and reject the reserved bare
+-- `#[interrupt]` marker.
+local function validate_interrupt_vector(name, line, column)
+    if type(name) ~= "string" or #name == 0 then
+        type_fail("E0325", line, column,
+            "interrupt vector name cannot be empty")
+    end
+    if #name > 64 then
+        type_fail("E0325", line, column,
+            "interrupt vector name is too long (maximum 64 bytes)")
+    end
+    local first = string.byte(name, 1)
+    if not ((first >= 65 and first <= 90)
+        or (first >= 97 and first <= 122) or first == 95) then
+        type_fail("E0325", line, column,
+            "interrupt vector name must start with a letter or `_`")
+    end
+    local i = 2
+    while i <= #name do
+        local code = string.byte(name, i)
+        if not ((code >= 48 and code <= 57)
+            or (code >= 65 and code <= 90)
+            or (code >= 97 and code <= 122) or code == 95) then
+            type_fail("E0325", line, column,
+                "invalid character in interrupt vector name")
+        end
+        i = i + 1
+    end
+    if string.lower(name) == "default" then
+        type_fail("E0325", line, column,
+            "`default` is reserved for the bare `#[interrupt]` timer vector")
     end
 end
 
@@ -2576,6 +2615,36 @@ local function check_call(expr)
         end
         expr.ctype = "i128"
         return expr, "i128"
+    end
+
+    if name == "interrupts_disable" or name == "interrupts_enable"
+        or name == "interrupts_restore" then
+        local wanted = 0
+        if name == "interrupts_restore" then
+            wanted = 1
+        end
+        if #args ~= wanted then
+            type_fail("E0311", expr.line, expr.column,
+                "`" .. name .. "` takes " .. tostring(wanted)
+                .. " argument(s), found " .. tostring(#args))
+        end
+        if name == "interrupts_restore" then
+            local checked_state, state_type = check_expr(args[1])
+            if not is_integer_type(state_type) then
+                check_mismatch(checked_state.line, checked_state.column,
+                    "`interrupts_restore` state", "integer", state_type)
+            end
+            args[1] = checked_state
+            expr.ctype = "void"
+        elseif name == "interrupts_disable" then
+            expr.ctype = "u32"
+        else
+            expr.ctype = "void"
+        end
+        local result_type = expr.ctype
+        expr.builtin = name
+        expr.args = args
+        return expr, result_type
     end
 
     if name == "error" then
@@ -4515,6 +4584,57 @@ local function scan_functions(body)
             if link_section ~= nil then
                 validate_link_section(link_section, fline, fcolumn)
             end
+            local interrupt = stmt.interrupt == true
+            local interrupt_vector = nil
+            if interrupt then
+                if receiver ~= nil then
+                    type_fail("E0325", fline, fcolumn,
+                        "`#[interrupt]` cannot annotate a method")
+                end
+                if stmt.is_async == true then
+                    type_fail("E0325", fline, fcolumn,
+                        "`#[interrupt]` functions cannot be `async`")
+                end
+                if #stmt.params ~= 0 then
+                    type_fail("E0325", fline, fcolumn,
+                        "`#[interrupt]` functions cannot take parameters")
+                end
+                if ret ~= "void" then
+                    type_fail("E0325", fline, fcolumn,
+                        "`#[interrupt]` functions must return `void`")
+                end
+                if stmt.entry == true then
+                    type_fail("E0325", fline, fcolumn,
+                        "`#[entry]` and `#[interrupt]` cannot annotate the same function")
+                end
+                if stmt.global_allocator == true then
+                    type_fail("E0325", fline, fcolumn,
+                        "`#[global_allocator]` and `#[interrupt]` cannot annotate the same function")
+                end
+                if stmt.interrupt_vector ~= nil then
+                    validate_interrupt_vector(stmt.interrupt_vector,
+                        fline, fcolumn)
+                    interrupt_vector = stmt.interrupt_vector
+                end
+                local vector_key = "@default"
+                if interrupt_vector ~= nil then
+                    vector_key = string.lower(interrupt_vector)
+                end
+                if check_interrupts[vector_key] ~= nil then
+                    type_fail("E0325", fline, fcolumn,
+                        "duplicate `#[interrupt]` for vector `"
+                        .. tostring(vector_key) .. "` (already defined by `"
+                        .. tostring(check_interrupts[vector_key]) .. "`)")
+                end
+                check_interrupts[vector_key] = fname
+                check_interrupt_order[#check_interrupt_order + 1] = {
+                    key = key,
+                    name = fname,
+                    vector = vector_key,
+                    line = fline,
+                    column = fcolumn
+                }
+            end
             if stmt.entry == true then
                 if receiver ~= nil then
                     type_fail("E0325", fline, fcolumn,
@@ -4583,6 +4703,8 @@ local function scan_functions(body)
                 async_ret = async_result,
                 entry = stmt.entry == true,
                 link_section = link_section,
+                interrupt = interrupt,
+                interrupt_vector = interrupt_vector,
                 node = stmt
             }
             check_functions[key] = signature
@@ -4993,6 +5115,8 @@ local function check_program(ast)
     check_alloc_name = nil
     check_dealloc_key = nil
     check_dealloc_name = nil
+    check_interrupts = {}
+    check_interrupt_order = {}
     check_vec_order = {}
     check_vec_seen = {}
     check_box_order = {}
@@ -5056,6 +5180,7 @@ local function check_program(ast)
     ast.global_dealloc_name = check_dealloc_name
     ast.has_global_allocator = check_alloc_key ~= nil
     ast.has_global_deallocator = check_dealloc_key ~= nil
+    ast.interrupts = clone check_interrupt_order
     ast.vec_elements = check_vec_order
     ast.box_elements = check_box_order
     ast.sum_types = check_sum_order
@@ -6542,6 +6667,62 @@ local NO_STD_RUNTIME = {
     "        exponent >>= 1;",
     "    }",
     "    return result;",
+    "}",
+    ""
+}
+
+-- ---- hardware interrupts --------------------------------------------------
+
+-- The critical-section helpers use the architecture's global interrupt mask.
+-- `interrupts_disable()` returns 1 when interrupts were enabled so a caller can
+-- restore the exact previous state.  The no-op fallback keeps hosted builds
+-- and `lusalang run` working without privileged instructions.
+local INTERRUPT_RUNTIME = {
+    "/* Hardware interrupt support.  Vector wrappers are emitted per #[interrupt].",
+    "   `LUSA_DEFAULT_VECTOR` is supplied by the cross build so a bare attribute",
+    "   resolves to the board's default timer vector. */",
+    "#if defined(_MSC_VER)",
+    "#define LUSA_ISR_FN",
+    "#else",
+    "#define LUSA_ISR_FN __attribute__((used))",
+    "#endif",
+    "#ifndef LUSA_DEFAULT_VECTOR",
+    "#define LUSA_DEFAULT_VECTOR default",
+    "#endif",
+    "#define LUSA_ISR_JOIN2(prefix, name) prefix##name",
+    "#define LUSA_ISR_JOIN(prefix, name) LUSA_ISR_JOIN2(prefix, name)",
+    "#define LUSA_ISR_NAME(name) LUSA_ISR_JOIN(lusa_isr_, name)",
+    "",
+    "static uint32_t lusa_interrupts_disable(void) {",
+    "#if defined(__arm__)",
+    "    uint32_t primask;",
+    '    __asm__ __volatile__("mrs %0, primask" : "=r"(primask));',
+    '    __asm__ __volatile__("cpsid i" : : : "memory");',
+    "    return primask == 0u ? 1u : 0u;",
+    "#elif defined(__riscv)",
+    "    uint32_t mstatus;",
+    '    __asm__ __volatile__("csrr %0, mstatus" : "=r"(mstatus));',
+    '    __asm__ __volatile__("csrci mstatus, 8" : : : "memory");',
+    "    return (mstatus & 8u) != 0u ? 1u : 0u;",
+    "#else",
+    "    return 1u;",
+    "#endif",
+    "}",
+    "",
+    "static void lusa_interrupts_enable(void) {",
+    "#if defined(__arm__)",
+    '    __asm__ __volatile__("cpsie i" : : : "memory");',
+    "#elif defined(__riscv)",
+    '    __asm__ __volatile__("csrsi mstatus, 8" : : : "memory");',
+    "#endif",
+    "}",
+    "",
+    "static void lusa_interrupts_restore(uint32_t state) {",
+    "    if (state != 0u) {",
+    "        lusa_interrupts_enable();",
+    "    } else {",
+    "        (void)lusa_interrupts_disable();",
+    "    }",
     "}",
     ""
 }
@@ -8937,6 +9118,16 @@ emit_expr = function(expr)
         if expr.builtin == "unsafe_ptr_cast" then
             return "((uintptr_t)(" .. emit_expr(expr.args[1]) .. "))"
         end
+        if expr.builtin == "interrupts_disable" then
+            return "lusa_interrupts_disable()"
+        end
+        if expr.builtin == "interrupts_enable" then
+            return "lusa_interrupts_enable()"
+        end
+        if expr.builtin == "interrupts_restore" then
+            return "lusa_interrupts_restore((uint32_t)("
+                .. emit_expr(expr.args[1]) .. "))"
+        end
         if expr.builtin == "unsafe_alloc" then
             return "((uintptr_t)(lusa_unsafe_alloc((uint64_t)("
                 .. emit_expr(expr.args[1]) .. "))))"
@@ -10864,6 +11055,46 @@ local function emit_async_function_definition(signature)
     emit_async_mode = previous_async
 end
 
+local function emit_interrupt_wrappers(ast)
+    local entries = ast.interrupts or {}
+    if #entries == 0 then
+        return
+    end
+    local i = 1
+    while i <= #entries do
+        local entry = clone entries[i]
+        local signature = nil
+        local j = 1
+        while j <= #emit_functions do
+            if emit_functions[j].key == entry.key then
+                signature = clone emit_functions[j]
+            end
+            j = j + 1
+        end
+        if signature == nil then
+            fail(entry.line, entry.column,
+                "internal: interrupt function signature is missing")
+        end
+        local bare = entry.vector == "@default"
+        local vector = entry.vector
+        if bare then
+            vector = "default"
+        end
+        line("/* lusa:interrupt vector=" .. vector .. " */")
+        if bare then
+            line("LUSA_ISR_FN void LUSA_ISR_NAME(LUSA_DEFAULT_VECTOR)(void) {")
+        else
+            line("LUSA_ISR_FN void lusa_isr_" .. vector .. "(void) {")
+        end
+        emit_indent = emit_indent + 1
+        line(signature.cname .. "(NULL);")
+        emit_indent = emit_indent - 1
+        line("}")
+        line("")
+        i = i + 1
+    end
+end
+
 local function emit_main(ast)
     emit_is_main = true
     emit_return_type = "i32"
@@ -10973,6 +11204,11 @@ local function emit_c_impl(ast)
         put(runtime[i])
         i = i + 1
     end
+    i = 1
+    while i <= #INTERRUPT_RUNTIME do
+        put(INTERRUPT_RUNTIME[i])
+        i = i + 1
+    end
     if not ast.no_std then
         i = 1
         while i <= #COROUTINE_RUNTIME do
@@ -11017,6 +11253,7 @@ local function emit_c_impl(ast)
         end
         i = i + 1
     end
+    emit_interrupt_wrappers(borrow ast)
     if ast.has_entry then
         emit_program_body(clone ast)
         emit_entry_wrapper(ast)
@@ -11063,7 +11300,7 @@ function Compiler.memory_layout()
         ["match"] = "`match value with | literal => ... | name => ... | _ => ... end` lowers to a hidden local plus an ordinary if/elseif chain; ownership is checked per arm at compile time with no runtime dispatch",
         imports = "`import 'file.lusa'` and `mod name` are expanded at compile time relative to the importing file; the merged source shares one symbol table and each module is included once",
         pointers = "*mut u32/*const u32 and *mut i32/*const i32 lower to volatile C pointers; pointer arithmetic scales by the element size and dereferences are volatile reads/writes",
-        intrinsics = "asm!/unsafe_asm/unsafe_nop lower to LUSA_ASM(text)/LUSA_NOP() - `__asm__ __volatile__ (text : : );` on GCC/Clang, no-ops elsewhere",
+        intrinsics = "asm!/unsafe_asm/unsafe_nop lower to LUSA_ASM(text)/LUSA_NOP() - `__asm__ __volatile__ (text : : );` on GCC/Clang, no-ops elsewhere; interrupts_disable/interrupts_enable/interrupts_restore lower to CPUI/PRIMASK on Arm and mstatus.MIE on RISC-V",
         table_kinds = {
             unknown = 0, i32 = 1, u32 = 2, i128 = 3,
             f32 = 4, bool = 5, string = 6, table = 7

@@ -63,11 +63,19 @@ Download `lusa-setup.zip` or the platform tarball.
 
 ## Current release
 
-The v2.1.0 body is [`.github/release-notes/v2.1.0.md`](../.github/release-notes/v2.1.0.md).
-It follows this structure and documents `--target rp2040`/`stm32f4`/`esp32c3`,
-per-board startup and linker maps, Renode platforms with GPIO, timers/SysTick,
-and UART, the three volatile-MMIO examples, and the module 25
-cross-build/emulation suite.
+The v2.2.0 body is [`.github/release-notes/v2.2.0.md`](../.github/release-notes/v2.2.0.md).
+It follows this structure and documents bare and explicit `#[interrupt]`
+registration, target default timer vectors, generated Arm vector tables and
+RISC-V trap tables, linker `PROVIDE` fallbacks, the
+`interrupts_disable`/`interrupts_enable`/`interrupts_restore` critical-section
+protocol, live Renode TIM2/SysTick/CLINT interrupt boots, the
+`examples/interrupt_driven_timer.lusa` image, and the module 26 suite.
+
+The v2.1.0 body remains at
+[`.github/release-notes/v2.1.0.md`](../.github/release-notes/v2.1.0.md) and
+documents `--target rp2040`/`stm32f4`/`esp32c3`, per-board startup and linker
+maps, Renode platforms with GPIO, timers/SysTick, and UART, the three
+volatile-MMIO examples, and the module 25 cross-build/emulation suite.
 
 The v2.0.0 body remains at
 [`.github/release-notes/v2.0.0.md`](../.github/release-notes/v2.0.0.md) and

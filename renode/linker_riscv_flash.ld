@@ -41,3 +41,5 @@ SECTIONS {
   . = ALIGN(16);
   _stack_top = ORIGIN(RAM) + LENGTH(RAM);
 }
+
+@LUSA_INTERRUPT_PROVIDES@

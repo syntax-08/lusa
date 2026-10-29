@@ -575,6 +575,8 @@ parse_function = function(entry, link_section, global_allocator, is_async)
         global_allocator = global_allocator == true,
         is_async = is_async == true,
         link_section = link_section,
+        interrupt = false,
+        interrupt_vector = nil,
         line = line,
         column = column
     }
@@ -774,6 +776,40 @@ local function validate_section_name(name, line, column)
     end
 end
 
+-- Vector names become linker and assembly symbols.  Keep the spelling to a
+-- portable identifier; board membership is checked by the cross-build once the
+-- target is known.
+local function validate_interrupt_name(name, line, column)
+    if #name == 0 then
+        fail_at(line, column, "interrupt vector name cannot be empty")
+    end
+    if #name > 64 then
+        fail_at(line, column,
+            "interrupt vector name is too long (maximum 64 bytes)")
+    end
+    local first = string.byte(name, 1)
+    if not ((first >= 65 and first <= 90) or (first >= 97 and first <= 122)
+        or first == 95) then
+        fail_at(line, column,
+            "interrupt vector name must start with a letter or `_`")
+    end
+    local i = 2
+    while i <= #name do
+        local code = string.byte(name, i)
+        if not ((code >= 48 and code <= 57)
+            or (code >= 65 and code <= 90)
+            or (code >= 97 and code <= 122) or code == 95) then
+            fail_at(line, column,
+                "invalid character in interrupt vector name")
+        end
+        i = i + 1
+    end
+    if string.lower(name) == "default" then
+        fail_at(line, column,
+            "`default` is reserved for the bare `#[interrupt]` timer vector")
+    end
+end
+
 local function parse_attributes()
     local attrs = {
         packed = false,
@@ -781,7 +817,9 @@ local function parse_attributes()
         no_std = false,
         entry = false,
         global_allocator = false,
-        link_section = nil
+        link_section = nil,
+        interrupt = false,
+        interrupt_vector = nil
     }
     local stop_after = false
     while at_value("#") and peek_value_at(1) == "[" do
@@ -834,6 +872,31 @@ local function parse_attributes()
             advance()
             validate_section_name(text, text_line, text_column)
             attrs.link_section = text
+        elseif attr == "interrupt" then
+            if attrs.interrupt then
+                fail_at(attr_line, attr_column,
+                    "duplicate `#[interrupt]` attribute")
+            end
+            attrs.interrupt = true
+            if at_value("(") then
+                advance()
+                local vector_line = peek_line()
+                local vector_column = peek_column()
+                if peek_kind() ~= "string" then
+                    fail_at(vector_line, vector_column,
+                        "expected an interrupt vector name, found "
+                        .. describe_token())
+                end
+                if tokens[pos].interpolated then
+                    fail_at(vector_line, vector_column,
+                        "`interrupt` requires a plain vector-name string")
+                end
+                local vector = tokens[pos].text
+                advance()
+                validate_interrupt_name(vector, vector_line, vector_column)
+                expect_value(")", "`)` after the interrupt vector name")
+                attrs.interrupt_vector = vector
+            end
         elseif attr == "repr" then
             expect_value("(", "`(` after `repr`")
             local inner_line = peek_line()
@@ -882,7 +945,8 @@ local function parse_attributes()
             fail_at(attr_line, attr_column,
                 "unsupported attribute `#" .. attr
                 .. "`; supported attributes are `#[packed]`, `#[repr(align(N))]`, "
-                .. '`#[no_std]`, `#[entry]`, `#[global_allocator]`, and '
+                .. '`#[no_std]`, `#[entry]`, `#[global_allocator]`, '
+                .. '`#[interrupt]`, `#[interrupt("VECTOR")]`, and '
                 .. '`#[link_section = "..."]`')
         end
         expect_value("]", "`]` to close the attribute")
@@ -1309,7 +1373,8 @@ parse_attributed_stmt = function()
 
     if attrs.no_std then
         if attrs.packed or attrs.align ~= nil or attrs.entry
-            or attrs.global_allocator or attrs.link_section ~= nil then
+            or attrs.global_allocator or attrs.link_section ~= nil
+            or attrs.interrupt then
             fail_at(attr_line, attr_column,
                 "`#[no_std]` must be written on its own")
         end
@@ -1321,9 +1386,10 @@ parse_attributed_stmt = function()
     end
 
     if at_keyword("struct") then
-        if attrs.entry or attrs.link_section ~= nil or attrs.global_allocator then
+        if attrs.entry or attrs.link_section ~= nil or attrs.global_allocator
+            or attrs.interrupt then
             fail_at(attr_line, attr_column,
-                "`#[entry]` and `#[link_section]` are only supported on functions or globals; `#[global_allocator]` is only supported on functions")
+                "`#[entry]` and `#[link_section]` are only supported on functions or globals; `#[global_allocator]` and `#[interrupt]` are only supported on functions")
         end
         return parse_struct(attrs.packed, attrs.align)
     end
@@ -1333,19 +1399,24 @@ parse_attributed_stmt = function()
             fail_at(attr_line, attr_column,
                 "`#[packed]` and `#[repr(align(N))]` are only supported on structs")
         end
+        local stmt
         if at_keyword("async") then
-            return parse_async_function(attrs.entry, attrs.link_section,
+            stmt = parse_async_function(attrs.entry, attrs.link_section,
+                attrs.global_allocator)
+        else
+            stmt = parse_function(attrs.entry, attrs.link_section,
                 attrs.global_allocator)
         end
-        return parse_function(attrs.entry, attrs.link_section,
-            attrs.global_allocator)
+        stmt.interrupt = attrs.interrupt
+        stmt.interrupt_vector = attrs.interrupt_vector
+        return stmt
     end
 
     if at_keyword("local") then
         if attrs.packed or attrs.align ~= nil or attrs.entry
-            or attrs.global_allocator then
+            or attrs.global_allocator or attrs.interrupt then
             fail_at(attr_line, attr_column,
-                "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate a local; `#[global_allocator]` is only supported on functions")
+                "`#[packed]`, `#[repr(align(N))]`, `#[entry]`, and `#[interrupt]` cannot annotate a local; `#[global_allocator]` is only supported on functions")
         end
         return parse_local(attrs.link_section)
     end
@@ -1355,9 +1426,9 @@ parse_attributed_stmt = function()
     if kind == "name"
         or (kind == "operator" and (value == "*" or value == "&")) then
         if attrs.packed or attrs.align ~= nil or attrs.entry
-            or attrs.global_allocator then
+            or attrs.global_allocator or attrs.interrupt then
             fail_at(attr_line, attr_column,
-                "`#[packed]`, `#[repr(align(N))]`, and `#[entry]` cannot annotate an assignment; `#[global_allocator]` is only supported on functions")
+                "`#[packed]`, `#[repr(align(N))]`, `#[entry]`, and `#[interrupt]` cannot annotate an assignment; `#[global_allocator]` is only supported on functions")
         end
         return parse_assign_or_call(attrs.link_section)
     end

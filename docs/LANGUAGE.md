@@ -1694,11 +1694,11 @@ lusalang build --help
 | target | accepted spellings | triple | ISA/ABI | default output |
 |--------|--------------------|--------|---------|----------------|
 | host | `host`, `native`, omitted | host | host compiler | `.exe` on Windows, no extension elsewhere |
-| 32-bit Renode `virt` | `riscv32-virt`, `riscv32-unknown-elf` | `riscv32-unknown-elf` | `rv32imac` / `ilp32` | `.elf` |
-| 64-bit Renode `virt` | `riscv64-virt`, `riscv64-unknown-elf` | `riscv64-unknown-elf` | `rv64imac` / `lp64` | `.elf` |
+| 32-bit Renode `virt` | `riscv32-virt`, `riscv32-unknown-elf` | `riscv32-unknown-elf` | `rv32imac_zicsr` / `ilp32` | `.elf` |
+| 64-bit Renode `virt` | `riscv64-virt`, `riscv64-unknown-elf` | `riscv64-unknown-elf` | `rv64imac_zicsr` / `lp64` | `.elf` |
 | Raspberry Pi RP2040 | `rp2040`, `thumbv6m-none-eabi` | `thumbv6m-none-eabi` | Cortex-M0+ / soft-float | `.elf` |
 | STM32F4 | `stm32f4`, `thumbv7em-none-eabi` | `thumbv7em-none-eabi` | Cortex-M4 / soft-float | `.elf` |
-| Espressif ESP32-C3 | `esp32c3`, `riscv32-esp-elf` | `riscv32-esp-elf` | `rv32imc` / `ilp32` | `.elf` |
+| Espressif ESP32-C3 | `esp32c3`, `riscv32-esp-elf` | `riscv32-esp-elf` | `rv32imc_zicsr` / `ilp32` | `.elf` |
 
 Names and triples are matched case-insensitively. An unknown target exits with
 status 2 and prints the available names.
@@ -1730,6 +1730,10 @@ places `.text.init` in flash at `0x42000000` and `.data`/`.bss` in SRAM at
 ```asm
 _reset:
     la sp, _stack_top          # stack placed after .bss
+    la t0, _trap_entry
+    csrw mtvec, t0             # direct-mode traps and interrupts
+    li t0, 0x888               # MSIE | MTIE | MEIE
+    csrw mie, t0
     la t0, _data_load_start
     la t1, _data_start
     la t2, _data_end
@@ -1749,17 +1753,19 @@ _reset:
 5:  j 5b
 ```
 
-The ARM targets reuse `renode/startup_arm.S`. It places a 16-entry Cortex-M
-vector table at the start of flash, sets VTOR, copies `.data` from flash to
-SRAM, zeroes `.bss`, and calls `lusa_entry`:
+The ARM targets reuse `renode/startup_arm.S`. The build substitutes its
+`@LUSA_VECTOR_ENTRIES@` marker with one word per architectural and device
+vector, from exception 2 through the board's highest entry (54 for STM32F4,
+36 for RP2040). The stub then sets VTOR, copies `.data` from flash to SRAM,
+zeroes `.bss`, and calls `lusa_entry`:
 
 ```asm
 _vectors:
-    .word _stack_top
-    .word _reset
-    .rept 14
-    .word _default_handler
-    .endr
+    .word _stack_top             @ initial stack pointer
+    .word _reset                 @ exception 1: reset
+    .word _default_handler       @ exception 2: NMI, and every unclaimed slot
+    @ ... exception 15 is lusa_isr_systick on RP2040 and STM32F4
+    @ ... one word per exception through the highest device vector
 
 _reset:
     cpsid i
@@ -1770,6 +1776,13 @@ _reset:
     str r1, [r0]
     @ copy .data and zero .bss, then bl lusa_entry
 ```
+
+Every `lusa_isr_<vector>` symbol has a weak `PROVIDE(... = _default_handler)`
+fallback in the linker script, so a table entry is valid whether or not the
+program implements that vector. The RISC-V stub installs a direct-mode trap
+handler with `mtvec`, enables the machine software/timer/external classes in
+`mie`, and dispatches on `mcause` through a generated `_trap_vectors` table;
+section 9.17 describes the interrupt contract.
 
 `renode/linker_arm_rp2040.ld` maps 2 MiB flash at `0x10000000` and 264 KiB
 SRAM at `0x20000000`; `renode/linker_arm_stm32f4.ld` maps 1 MiB flash at
@@ -1930,26 +1943,105 @@ a script that captures a fixed window and then quits.
 ```sh
 cargo test --test module24_renode -- --test-threads=1 --nocapture
 cargo test --test module25_modern_mcus -- --test-threads=1 --nocapture
+cargo test --test module26_interrupts -- --test-threads=1 --nocapture
 ```
 
 The static tests (platform/UART definitions, freestanding C, hosted/no-entry
-rejections) always run. The compile-and-boot tests skip with a printed reason
-when no cross compiler or Renode executable is found. To execute them locally:
+rejections, interrupt parsing/vector tables) always run. The compile-and-boot
+tests skip with a printed reason when no cross compiler or Renode executable is
+found. To execute them locally:
 
 ```powershell
 $env:LUSA_RISCV_CC = "C:\tools\riscv-none-elf-gcc\bin\riscv-none-elf-gcc.exe"
 $env:LUSA_ESP32_CC = $env:LUSA_RISCV_CC
 $env:LUSA_ARM_CC = "C:\tools\arm-none-eabi-gcc\bin\arm-none-eabi-gcc.exe"
 $env:LUSA_RENODE = "C:\tools\renode\renode.exe"
-cargo test --test module24_renode --test module25_modern_mcus -- --test-threads=1 --nocapture
+cargo test --test module24_renode --test module25_modern_mcus --test module26_interrupts -- --test-threads=1 --nocapture
 ```
 
 Set `LUSA_KEEP_RENODE_ARTIFACTS=1` to keep the generated platform, script,
 ELF, and UART log. `.github/workflows/renode.yml` downloads Renode, xPack
 RISC-V GCC, and xPack Arm GCC on Ubuntu, sets `LUSA_RISCV_CC`,
-`LUSA_ESP32_CC`, `LUSA_ARM_CC`, and `LUSA_RENODE`, and runs both suites.
+`LUSA_ESP32_CC`, `LUSA_ARM_CC`, and `LUSA_RENODE`, and runs the three suites.
 
-### 9.17 Native subset limits
+### 9.17 Hardware interrupts and critical sections (Module 26)
+
+`#[interrupt]` marks a top-level function as a hardware interrupt service
+routine. The typed checker enforces the ISR contract and the cross build emits
+a wrapper named `lusa_isr_<vector>` that the generated vector table references:
+
+```lusa
+#[interrupt("TIM2")]
+function tim2_isr(): void
+    unsafe do
+        local tim: *mut u32 = 0x40000000
+        local status: *mut u32 = tim + 4
+        status.write_volatile(0)
+        volatile_write(&ticks, volatile_read(&ticks) + 1)
+    end
+end
+```
+
+A bare `#[interrupt]` selects the board's default timer vector; the build
+passes `-DLUSA_DEFAULT_VECTOR=<default>` to the C compiler. An explicit
+`#[interrupt("VECTOR")]` selects another vector. Names are case-insensitive
+and validated against the target's registry after defaults are resolved, so
+two handlers can never claim the same slot:
+
+| target | default (`#[interrupt]`) | other vectors |
+|--------|--------------------------|---------------|
+| `stm32f4` | `tim2` (exception 44) | `systick` (15), `usart2` (54) |
+| `rp2040` | `systick` (exception 15) | `uart0` (36) |
+| `esp32c3`, `riscv32-virt`, `riscv64-virt` | `machine_timer` (`mcause` 7) | `machine_software` (3), `machine_external` (11) |
+
+Vector names are ASCII identifiers (letters, digits, and underscores), matched
+case-insensitively; `default` is reserved for the bare form. An ISR cannot
+take parameters, must return `void`, and cannot be `async`, `#[entry]`,
+`#[global_allocator]`, or a method. Host builds accept the attribute and emit
+the wrapper, but only cross targets install a vector or trap table.
+
+Each wrapper carries `/* lusa:interrupt vector=<name|default> */` metadata.
+The Rust driver validates the metadata against the selected `TargetSpec`,
+resolves `default`, rejects duplicates and unknown vectors before invoking the
+C compiler, and renders the startup table from the same registry. The ARM
+startup expands `@LUSA_VECTOR_ENTRIES@`; the RISC-V startup expands
+`@LUSA_TRAP_ENTRIES@` with `mcause` 0–11. Linkers substitute
+`@LUSA_INTERRUPT_PROVIDES@` with a `_default_handler` fallback for every
+vector, so sparse tables link cleanly.
+
+Three intrinsics form the critical-section protocol:
+
+| intrinsic | behavior |
+|-----------|----------|
+| `interrupts_disable() -> u32` | disables interrupts; returns `1` if they were enabled, `0` otherwise |
+| `interrupts_enable()` | enables interrupts |
+| `interrupts_restore(state)` | restores the exact state returned by `interrupts_disable()` |
+
+On Arm they use `mrs primask` plus `cpsid i`/`cpsie i`; on RISC-V
+they test and clear or set `mstatus.MIE` with `csrr`/`csrci`/`csrsi`. The
+startup stub enables the machine software, timer, and external classes in
+`mie` once, while `mstatus.MIE` stays clear until `interrupts_enable()` runs.
+The interpreter and bytecode VM simulate the same global mask, so nested
+disable/restore logic is testable on the host.
+
+`examples/interrupt_driven_timer.lusa` programs STM32F4 TIM2 for a 100 Hz
+update interrupt, enables it in the NVIC, waits for three activations,
+exercises nested `interrupts_disable`/`interrupts_restore`, and prints:
+
+```text
+LUSA INTERRUPT OK
+stm32f4 irq=ok count=ok flag=ok state=ok restored=ok
+```
+
+`tests/module26_interrupts.rs` builds and boots the STM32F4 example plus
+inline RP2040 SysTick and ESP32-C3 CLINT firmware under Renode. Limitations:
+`#[interrupt]` does not configure clocks, GPIO alternate functions, or
+priorities; RISC-V cross targets require `-march=..._zicsr`; and the ESP32-C3
+platform models a CLINT at `0x20008000` rather than the full interrupt matrix.
+Renode 1.17 models the Cortex-M NVIC/SysTick and the STM32 timer, which is what
+the boot tests exercise.
+
+### 9.18 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 table literals, fixed-size `[T; N]` arrays and local array literals, nested keyed
@@ -1959,8 +2051,9 @@ tables, and arrays, `if`, `while`, `repeat`, `do`, `return`, `break`,
 assignments, globals, `print`, `clone`, `borrow`, `move`, the compile-time
 borrow checker, `unsafe` blocks, static `struct` declarations in brace and bare
 form, `#[packed]`/`#[repr(align(N))]` representation attributes,
-`#[no_std]`/`#[entry]`/`#[global_allocator]`/`#[link_section = "..."]`
-(sections 9.12 and 9.13), struct
+`#[no_std]`/`#[entry]`/`#[global_allocator]`/`#[link_section = "..."]`/
+`#[interrupt]`/`#[interrupt("VECTOR")]`
+(sections 9.12, 9.13, and 9.17), struct
 literals with defaults (scalar, `string`, `table`, pointer, and previously
 declared struct fields), `match`, compile-time `import`/`mod`, namespaced
 modules with `mod name;`/`mod name { ... }`, `use` aliases and globs, and
@@ -1968,7 +2061,9 @@ modules with `mod name;`/`mod name { ... }`, `use` aliases and globs, and
 (`&place`), raw pointer types (`*mut T`, `*const T`), pointer arithmetic and
 dereferences inside `unsafe`, the raw intrinsics above (`unsafe_ptr_cast`,
 `unsafe_read_mem`, `unsafe_write_mem`, `unsafe_alloc`, `volatile_read`,
-`volatile_write`, `unsafe_nop`, `unsafe_asm`, `asm!("...")`), native `pcall`,
+`volatile_write`, `unsafe_nop`, `unsafe_asm`, `asm!("...")`), the
+critical-section intrinsics `interrupts_disable`, `interrupts_enable`, and
+`interrupts_restore`, native `pcall`,
 `Vec<T>` (push/pop/len/capacity/is_empty/reserve/clear, indexing, and
 element assignment) and `Box<T>` (implicit and `Box(value)` construction,
 safe `*b` reads/writes, `nil` clearing) with their RAII drop helpers,
