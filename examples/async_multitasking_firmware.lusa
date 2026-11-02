@@ -1,0 +1,173 @@
+-- Module 28 example: three cooperative tasks on one microcontroller.
+--
+--   lusalang build examples/async_multitasking_firmware.lusa --target stm32f4
+--
+-- `task.run()` is the executor.  It polls whichever task is ready and, when
+-- every task is parked, sleeps the CPU in `wfi` until an interrupt arrives.
+-- There is no RTOS kernel and no per-task stack: each async function is a
+-- small state machine, and tasks switch only at `await`.
+--
+-- * `blinker` toggles the user LED every 50 ms.  `timer::delay_ms` parks it
+--   on the executor clock, which the TIM2 interrupt advances.
+-- * `console` echoes every byte typed into the UART.  `uart::read_async`
+--   parks it until the USART2 interrupt wakes the driver's event.  A newline
+--   publishes the line length and wakes application event 1; `!` ends the
+--   session.
+-- * `reporter` waits on event 1 and writes `[ <n> bytes]` after each line.
+--
+-- When all three tasks have finished, `main` prints a summary: the line
+-- count, whether the LED blinked while the console was waiting for input,
+-- whether the LED pin reads back the state the toggles predict, and how many
+-- tasks the executor ran.
+--
+-- tests/module28_async_rtos.rs types `hello lusa`, `ping`, and `!` into the
+-- Renode UART of STM32F4, RP2040, and ESP32-C3 (with each board's vectors)
+-- and asserts the transcript byte-for-byte.
+
+#[no_std]
+use lusa::hal::uart;
+use lusa::hal::timer;
+use lusa::hal::led;
+
+-- Interrupt handlers: STM32F4 vectors.  On RP2040 use "SYSTICK" and
+-- "UART0"; on ESP32-C3 one "machine_external" handler calls both drivers.
+#[interrupt("TIM2")]
+function tick_irq(): void
+    timer::on_interrupt()
+end
+
+#[interrupt("USART2")]
+function serial_irq(): void
+    uart::on_interrupt()
+end
+
+-- Shared by the tasks.  Interrupt handlers never touch them, and a task only
+-- gives up the CPU at `await`, so no critical section is needed.
+local running: bool = true
+local line_length: u32 = 0
+local lines: u32 = 0
+
+-- Queues `count` bytes from `text`, waiting for room in the transmit ring.
+function send(port: uart::Uart, text: *mut u32, count: u32): void
+    local i: u32 = 0
+    unsafe do
+        local cursor: *mut u32 = text
+        while i < count do
+            if uart::write(borrow port, *cursor) then
+                cursor = cursor + 1
+                i = i + 1
+            end
+        end
+    end
+end
+
+function send_verdict(port: uart::Uart, label: *mut u32, count: u32, ok: bool): void
+    local pass: [u32; 2] = [111, 107]
+    local fail: [u32; 4] = [102, 97, 105, 108]
+    send(borrow port, label, count)
+    if ok then
+        send(borrow port, &pass[0], 2)
+    else
+        send(borrow port, &fail[0], 4)
+    end
+end
+
+-- Writes `value` in decimal from a task.
+async function write_number(port: uart::Uart, value: u32): void
+    local scale: u32 = 1
+    while value // scale >= 10 do
+        scale = scale * 10
+    end
+    while scale > 0 do
+        await uart::write_async(borrow port, 48 + value // scale % 10)
+        scale = scale // 10
+    end
+end
+
+-- Task 1: blinks the LED every 50 ms while the session is open.
+async function blinker(clock: timer::Timer, light: led::Led): u32
+    while running do
+        await timer::delay_ms(borrow clock, 50)
+        led::toggle(borrow light)
+    end
+    return led::toggles(borrow light)
+end
+
+-- Task 2: echoes every byte.  A newline publishes the line length and wakes
+-- the reporter (event 1); `!` ends the session.
+async function console(port: uart::Uart): u32
+    local length: u32 = 0
+    while running do
+        local byte: u32 = await uart::read_async(borrow port)
+        if byte == 33 then
+            running = false
+        else
+            await uart::write_async(borrow port, byte)
+            if byte == 10 then
+                line_length = length
+                lines = lines + 1
+                length = 0
+                task.wake(1)
+            else
+                length = length + 1
+            end
+        end
+    end
+    task.wake(1)
+    return lines
+end
+
+-- Task 3: reports the length of each finished line.
+async function reporter(port: uart::Uart, open: *mut u32, close: *mut u32): u32
+    local reported: u32 = 0
+    while running do
+        task.wait(1)
+        if running then
+            await uart::write_all_async(borrow port, open, 2)
+            await write_number(borrow port, line_length)
+            await uart::write_all_async(borrow port, close, 8)
+            reported = reported + 1
+        end
+    end
+    return reported
+end
+
+#[entry]
+function main(): void
+    local port: uart::Uart = uart::take():unwrap()
+    local clock: timer::Timer = timer::take():unwrap()
+    local light: led::Led = led::take():unwrap()
+    uart::configure(borrow port, 115200)
+    timer::configure(borrow clock, 1000)
+    led::configure(borrow light)
+    interrupts_enable()
+
+    local banner: [u32; 17] = [
+        76, 85, 83, 65, 32, 65, 83, 89, 78, 67, 32, 82, 69, 65, 68, 89, 10
+    ]
+    send(borrow port, &banner[0], 17)            -- "LUSA ASYNC READY\n"
+
+    local open: [u32; 2] = [91, 32]                                -- "[ "
+    local close: [u32; 8] = [32, 98, 121, 116, 101, 115, 93, 10]   -- " bytes]\n"
+    task.spawn(blinker(borrow clock, borrow light))
+    task.spawn(console(borrow port))
+    task.spawn(reporter(borrow port, &open[0], &close[0]))
+    local started: i32 = task.run()
+
+    -- "bye lines=<n> blinks=ok led=ok tasks=ok\n"
+    local toggles: u32 = led::toggles(borrow light)
+    local bye: [u32; 10] = [98, 121, 101, 32, 108, 105, 110, 101, 115, 61]
+    local blinks_label: [u32; 8] = [32, 98, 108, 105, 110, 107, 115, 61]
+    local led_label: [u32; 5] = [32, 108, 101, 100, 61]
+    local tasks_label: [u32; 7] = [32, 116, 97, 115, 107, 115, 61]
+    local digit: [u32; 1] = [48 + lines % 10]
+    send(borrow port, &bye[0], 10)
+    send(borrow port, &digit[0], 1)
+    send_verdict(borrow port, &blinks_label[0], 8, toggles >= 3)
+    send_verdict(borrow port, &led_label[0], 5, led::is_on(borrow light) == (toggles % 2 == 1))
+    send_verdict(borrow port, &tasks_label[0], 7, started == 3)
+    send(borrow port, &banner[16], 1)            -- "\n"
+    uart::flush(borrow port)
+    while true do
+    end
+end

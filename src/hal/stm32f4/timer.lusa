@@ -1,0 +1,30 @@
+-- STM32F4 TIM2 (0x40000000): the executor tick.  NVIC IRQ 28; install the
+-- handler with `#[interrupt("TIM2")]`.
+--
+-- Registers (word offsets): CR1 +0, DIER +3, SR +4, EGR +5, PSC +10,
+-- ARR +11.  The prescaler brings the 16 MHz timer clock down to 1 MHz and
+-- the update event fires every 1000000 / hz counts.
+
+function tim2(word: u32): u32
+    return 1073741824 + word * 4
+end
+
+function ll_configure(hz: u32): void
+    super::clock_apb1(1)                        -- TIM2EN
+    super::mmio_write(tim2(0), 0)               -- stop
+    super::mmio_write(tim2(10), super::pclk() // 1000000 - 1)
+    super::mmio_write(tim2(11), 1000000 // hz - 1)
+    super::mmio_write(tim2(3), 1)               -- UIE
+    super::mmio_write(tim2(5), 1)               -- UG: latch PSC and ARR
+    super::mmio_write(tim2(4), 0)               -- drop the UG update flag
+    super::mmio_write(tim2(0), 1)               -- CEN
+    super::nvic_enable(28)
+end
+
+function ll_acknowledge(): bool
+    if super::has_bit(super::mmio_read(tim2(4)), 1) then   -- UIF
+        super::mmio_write(tim2(4), 0)
+        return true
+    end
+    return false
+end

@@ -1226,6 +1226,105 @@ the ownership checker guarantees that each register block has one owner.
   DMA, chip selects, interrupt priorities, and 10-bit I2C addresses are left
   to applications.
 
+## Module 28 - Embedded async executor and cooperative scheduler (shipped in v2.4.0)
+
+Module 28 turns the Module 22 task queue into an event-driven executor for
+firmware. Tasks park on wake events or on the tick clock, interrupt handlers
+wake them, and the CPU sleeps in `wfi` while every task is parked. There is
+no kernel, no per-task stack, and no locking: each async function stays a
+stackless state machine, and tasks switch only at `await`.
+
+### 28.1 Parking, wakes, and the tick clock
+
+- `task.wait(event)` (events 0-31) and `task.sleep(ticks)` are suspension
+  points inside async functions, lowered like `task.yield_now()`: the VM's
+  `Park` instruction and the C helpers `lusa_task_wait_event` /
+  `lusa_task_sleep_for`, which record the wait and return `LUSA_TASK_PARK`.
+- `task.wake(event)` and `task.tick()` are interrupt-safe stores to volatile
+  wake stamps and the tick clock; `task.now()` reads the clock. A parked task
+  is runnable once its event's stamp is newer than the stamp taken when its
+  poll began, so a wake between the readiness check and the park is never
+  lost and every waiter of an event wakes. Waiters left parked refresh their
+  stamp on each collect, so stamps never wrap.
+- `task.status` reports `parked`. The native checker types the new calls
+  (`E0311`, `E0312`); the dynamic engines report misuse as `E9999` and
+  out-of-range events as `E2005`.
+
+### 28.2 Executor and awaits
+
+- `task.run()` collects ready parked tasks, polls the run queue round-robin,
+  and idles when nothing is ready: `wfi` on freestanding Arm/RISC-V builds
+  (`LUSA_TASK_WFI`, with interrupts masked across the check), and a jump of
+  the virtual clock to the earliest deadline on the host, which returns once
+  only event waiters remain.
+- Awaiting inside an async function polls the child inline (`AwaitPoll` in
+  the VM, `lusa_task_poll` in C); a child that yields or parks suspends its
+  parent with the same wait, so only top-level tasks sit in the queues.
+- A blocking `await` outside async code drives its task inline and runs
+  executor turns while it is parked; a task nothing can wake is `E2012` in
+  the dynamic engines and failed natively.
+- Native task blocks of awaited `f(...)` temporaries are recycled through a
+  same-size free list, so unbounded await loops fit the `#[no_std]` arena.
+  The runtime is also emitted for programs that only call `task.*` (an ISR
+  that wakes or ticks), and `await` of a `task<void>` is accepted as a
+  statement.
+- Fixed along the way: in the tree-walking interpreter, a nested task resume
+  now flushes the enclosing task's captured variables before it runs and
+  reloads them afterwards, so writes shared between nested tasks survive.
+
+### 28.3 Drivers
+
+- `lusa::hal::timer`: `take`, `configure(timer, hz)`, `on_interrupt`
+  (acknowledge + `task.tick()`), `ticks`, `millis`, `ticks_for`, async
+  `delay_ms`/`delay_ticks`. STM32F4 TIM2 (vector `tim2`), RP2040 SysTick
+  (`systick`), ESP32-C3 SYSTIMER alarm 0 (source 37 to CPU interrupt 11,
+  `machine_external`); the host model is virtual, with `sim_advance(n)`.
+- `lusa::hal::led`: the user LED (STM32F4 PA5, RP2040 GP25, ESP32-C3 GPIO8)
+  with `set`, `toggle`, `is_on` read back from the output register, and
+  `toggles`.
+- Async wrappers: `uart::read_async`, `read_exact_async`, `write_async`,
+  `write_all_async`, `flush_async`; `spi::transfer_async`, `flush_async`;
+  `i2c::wait_async`. Each driver's `on_interrupt()` wakes its event (UART 24,
+  SPI 25, I2C 26, also `uart::event()` and friends); host models wake the
+  same events when they deliver a simulated interrupt.
+
+### 28.4 Renode, example, tests, and CI
+
+- `renode/models/LusaEsp32C3Systimer.cs` models SYSTIMER counter unit 0 and
+  alarm 0 for the ESP32-C3 platform, whose `CombinedInput` now ORs four lines
+  onto `cpu@11`.
+- `examples/async_multitasking_firmware.lusa` runs three tasks on one MCU: an
+  LED blinker on `timer::delay_ms`, a UART echo console on
+  `uart::read_async`, and a reporter woken by application event 1.
+- `tests/module28_async_rtos.rs` covers scheduling order, events, sleeps,
+  blocking awaits, deadlock, diagnostics, runtime emission, and arena
+  recycling in all three engines; the async drivers on the host models;
+  board vectors and firmware emission; cross builds; and Renode runs of the
+  example and a scheduler check (round-robin `xyxyxy`, timer order `aabaa`)
+  on STM32F4, RP2040, and ESP32-C3.
+- `.github/workflows/renode.yml` runs modules 24 through 28.
+
+**Acceptance criteria**
+
+- The interpreter, the VM, and native host builds print identical traces for
+  round-robin scheduling, event wakes, and timed sleeps.
+- Under Renode, each board blinks the LED from the timer while the console
+  echoes UART input, and the scheduler check prints its expected order.
+- 3000 consecutive awaits run inside the default 16 KiB `#[no_std]` arena.
+- The full `cargo test --all-targets -- --test-threads=1` suite stays green
+  with and without the optional tools.
+
+**Risks**
+
+- Wake events are signals, not counters; tasks must recheck their condition
+  after waking, as the drivers do.
+- The timers assume the reset clock trees, and Renode models STM32F4 TIM2 at
+  10 MHz instead of 16 MHz, so emulated ticks there are slower than on
+  silicon.
+- The SYSTIMER model covers only the registers the driver uses.
+- Native async bodies still cannot hold fixed arrays or drop owned locals, so
+  buffers come in as pointers.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -1263,6 +1362,7 @@ the ownership checker guarantees that each register block has one owner.
 | v2.1.0 | Modern MCU targets and peripheral emulation (shipped) | `--target rp2040`/`stm32f4`/`esp32c3`, per-board startup and linker maps, target-aware toolchain discovery and diagnostics, Renode platforms with GPIO/timer/SysTick/UART, three volatile-MMIO examples, exact-banner Renode boots for all three boards, ARM and RISC-V toolchains in the Renode CI workflow |
 | v2.2.0 | Hardware interrupts and exception vectors (shipped) | bare and explicit `#[interrupt]` in both front ends, target vector registries and default timer resolution, generated Arm vector tables and RISC-V trap tables, linker `PROVIDE` fallbacks, `interrupts_disable`/`interrupts_enable`/`interrupts_restore` in all engines, Renode TIM2/SysTick/CLINT interrupt boots, module 26 tests |
 | v2.3.0 | Safe, interrupt-driven peripheral drivers (shipped) | `#[peripheral]` move-only tokens in both front ends and all engines (`E1006`), bundled target-aware `lusa::hal` crate with stable line numbers, ring-buffered UART/SPI/I2C drivers for STM32F4, RP2040, ESP32-C3, and host models, new SPI/I2C vectors, Renode loopback/echo devices and repository peripheral models, UART echo and SPI/I2C Renode runs on all three boards, module 27 tests |
+| v2.4.0 | Embedded async executor and cooperative scheduler (shipped) | `task.wait`/`task.wake` events with interrupt-safe wake stamps, `task.sleep`/`task.tick`/`task.now` tick clock, event-driven `task.run()` with `wfi` idling and a host virtual clock, yields and parks propagated through awaited children, blocking `await` with `E2012`, recycled task blocks in the `#[no_std]` arena, `lusa::hal::timer` and `lusa::hal::led`, async UART/SPI/I2C wrappers woken by their interrupts, ESP32-C3 SYSTIMER Renode model, three-task firmware example and scheduler check under Renode on all three boards, module 28 tests |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

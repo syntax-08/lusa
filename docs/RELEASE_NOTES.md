@@ -63,8 +63,21 @@ Download `lusa-setup.zip` or the platform tarball.
 
 ## Current release
 
-The v2.3.0 body is [`.github/release-notes/v2.3.0.md`](../.github/release-notes/v2.3.0.md).
-It follows this structure and documents the bundled `lusa::hal` crate with
+The v2.4.0 body is [`.github/release-notes/v2.4.0.md`](../.github/release-notes/v2.4.0.md).
+It follows this structure and documents the event-driven executor behind
+`task.run()` (`task.wait`/`task.wake` events, `task.sleep`/`task.tick`/
+`task.now` on the tick clock, `wfi` idling on firmware and a virtual clock on
+the host, yields and parks propagated through awaited children, blocking
+`await` with the `E2012` deadlock error, and recycled task blocks in the
+`#[no_std]` arena); the new `lusa::hal::timer` and `lusa::hal::led` drivers;
+the async UART, SPI, and I2C wrappers woken by each driver's interrupt; the
+ESP32-C3 SYSTIMER Renode model; the
+`examples/async_multitasking_firmware.lusa` three-task firmware; the module 28
+suite; and the interpreter fix for writes shared between nested tasks.
+
+The v2.3.0 body remains at
+[`.github/release-notes/v2.3.0.md`](../.github/release-notes/v2.3.0.md) and
+documents the bundled `lusa::hal` crate with
 interrupt-driven, ring-buffered UART, SPI, and I2C drivers for STM32F4,
 RP2040, ESP32-C3, and host simulation; `#[peripheral]` move-only resource
 tokens and the `E1006` clone diagnostic; the new SPI/I2C vectors; the Renode

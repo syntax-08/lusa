@@ -1,0 +1,22 @@
+-- Host tick source (simulation).
+--
+-- The host has no timer interrupt.  When every task is parked, the executor
+-- advances its clock straight to the next `task.sleep` deadline, so delays
+-- cost no real time and runs are deterministic.  `sim_advance(n)` plays `n`
+-- timer interrupts explicitly.
+
+function ll_configure(hz: u32): void
+end
+
+function ll_acknowledge(): bool
+    return true
+end
+
+-- Simulation: `count` timer interrupts fire.
+pub function sim_advance(count: u32): void
+    local i: u32 = 0
+    while i < count do
+        on_interrupt()
+        i = i + 1
+    end
+end

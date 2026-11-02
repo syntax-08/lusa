@@ -1,0 +1,22 @@
+-- RP2040 SysTick (0xE000E010): the executor tick.  Exception 15; install
+-- the handler with `#[interrupt("SYSTICK")]` (or a bare `#[interrupt]`).
+--
+-- Registers (word offsets): CSR +0, RVR +1, CVR +2.  SysTick counts the
+-- 125 MHz clk_sys (CLKSOURCE); RVR holds 24 bits, so the slowest tick is
+-- about 8 Hz.
+
+function ll_configure(hz: u32): void
+    local reload: u32 = 125000000 // hz - 1
+    if reload > 16777215 then
+        reload = 16777215
+    end
+    super::mmio_write(3758153744, 0)            -- stop
+    super::mmio_write(3758153748, reload)       -- RVR
+    super::mmio_write(3758153752, 0)            -- CVR: restart the count
+    super::mmio_write(3758153744, 7)            -- CLKSOURCE | TICKINT | ENABLE
+end
+
+-- SysTick has its own exception, so every entry is a tick.
+function ll_acknowledge(): bool
+    return true
+end

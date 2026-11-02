@@ -1,0 +1,23 @@
+-- RP2040 user LED on GP25 (Pico).  IO_BANK0 routes the pin to SIO
+-- (function 5); SIO GPIO_OUT (0xD0000010) and GPIO_OE (0xD0000020) are
+-- updated read-modify-write, bit 25 (33554432).
+
+function ll_configure(): void
+    super::unreset(32)                  -- IO_BANK0 (bit 5)
+    super::unreset(256)                 -- PADS_BANK0 (bit 8)
+    super::gpio_function(25, 5)
+    super::mmio_write(3489660960, super::with_bit(super::mmio_read(3489660960), 33554432))
+end
+
+function ll_write(on: bool): void
+    local out: u32 = super::mmio_read(3489660944)
+    if on then
+        super::mmio_write(3489660944, super::with_bit(out, 33554432))
+    else
+        super::mmio_write(3489660944, super::without_bit(out, 33554432))
+    end
+end
+
+function ll_read(): bool
+    return super::has_bit(super::mmio_read(3489660944), 33554432)
+end

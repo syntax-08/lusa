@@ -48,7 +48,12 @@ linker memory map, startup code, Renode platform, GPIO, timer, and UART.
 Module 26 adds hardware interrupt handlers (`#[interrupt]`), generated vector
 tables, and critical sections. Module 27 bundles `lusa::hal`: interrupt-driven,
 ring-buffered UART, SPI, and I2C drivers for those three boards, claimed once
-through `#[peripheral]` move-only tokens.
+through `#[peripheral]` move-only tokens. Module 28 turns `task.run()` into an
+event-driven executor: tasks park on `task.wait` events and `task.sleep`
+deadlines, interrupt handlers wake them, the CPU sleeps in `wfi` in between,
+and `lusa::hal::timer` plus async driver wrappers such as
+`uart::read_async` let several tasks share one microcontroller without an
+RTOS kernel.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -146,6 +151,7 @@ See [`examples/`](examples/):
 | `modern_mcu_esp32c3.lusa` | ESP32-C3 UART0 banner, GPIO output, TIMG polling |
 | `interrupt_driven_timer.lusa` | STM32F4 TIM2 interrupt and critical sections |
 | `interrupt_uart_echo.lusa` | STM32F4 interrupt-driven UART echo server on `lusa::hal` |
+| `async_multitasking_firmware.lusa` | STM32F4 tasks: timer LED blinker, UART echo console, event-driven reporter |
 | `dynamic_heap.lusa`       | `Vec<T>` growth/pop/clear and `Box<T>` owned pointers |
 | `error_handling.lusa`     | `Result`/`Option`, combinators, `?`, and `match` arms |
 | `async_cooperative.lusa`  | lazy tasks, `await`, `task.run`, and postfix `.await` |
@@ -1090,11 +1096,12 @@ print(task.run())          -- 0: queue is empty
 ```
 
 `task.spawn(value)` accepts a task or a function and enqueues it;
-`task.run()` drains the queue in rounds and returns the number of distinct
+`task.run()` polls the queue round-robin and returns the number of distinct
 tasks that received their first poll. `task.yield_now()` suspends the current
 task at an instruction boundary. `task.is_done(t)` is true after success or
-failure, while `task.status(t)` reports `pending`, `running`, `done`, or
-`failed` in hosted programs.
+failure, while `task.status(t)` reports `pending`, `running`, `parked`,
+`done`, or `failed` in hosted programs. Module 28 (below) adds wake events,
+the tick clock, and interrupt-driven idling to the same executor.
 
 The dynamic engines implement tasks on top of their private coroutine
 machines. The C11 backend lowers each async function to a stackless
@@ -1473,6 +1480,118 @@ interrupt priorities to the application. Renode's DesignWare I2C model does
 not report address NACKs, so the RP2040 NACK path is exercised only on
 hardware.
 
+### Embedded async executor and task scheduler (Module 28)
+
+`task.run()` is an event-driven executor. A task parks instead of spinning,
+an interrupt handler wakes it, and when every task is parked the CPU sleeps in
+`wfi` until the next interrupt. Each async function is still a stackless state
+machine, so there is no per-task stack, no context-switch code, and no
+locking: tasks switch only at `await`.
+
+| call | behavior |
+|------|----------|
+| `task.wait(event)` | park the current task until `event` (0-31) is woken |
+| `task.sleep(ticks)` | park the current task until `task.now()` advances by `ticks` |
+| `task.wake(event)` | wake every task parked on `event`; interrupt-safe |
+| `task.tick()` | advance the tick clock by one (the timer interrupt calls it) |
+| `task.now()` | ticks since start-up |
+
+`task.wait` and `task.sleep` are suspension points like `task.yield_now()`:
+call them as statements inside an async function. A wake that lands between a
+task's readiness check and its park is kept, so the usual pattern is a loop
+that rechecks the hardware and waits on the driver's event. When a task awaits
+a child that yields or parks, the parent suspends with it, so tasks interleave
+at every suspension point of every nested call. On the host there are no
+interrupts: the executor jumps its clock to the next deadline (timed code
+runs instantly and deterministically) and returns once only event waiters
+remain, so a test can inject input and call `task.run()` again. A blocking
+`await` outside async code runs the other tasks while its task is parked; if
+nothing can ever wake it, the dynamic engines raise `E2012`.
+
+`lusa::hal::timer` drives the clock from the board's tick interrupt (STM32F4
+TIM2, RP2040 SysTick, ESP32-C3 SYSTIMER), and the drivers gain async
+wrappers whose interrupts wake them:
+
+| module | async API |
+|--------|-----------|
+| `timer` | `take`, `configure(timer, hz)`, `on_interrupt`, `ticks`, `millis`, `ticks_for`, `delay_ms(timer, ms)`, `delay_ticks(timer, n)` |
+| `uart` | `read_async`, `read_exact_async(port, buffer, count)`, `write_async`, `write_all_async(port, buffer, count)`, `flush_async`, `event()` (24) |
+| `spi` | `transfer_async`, `flush_async`, `event()` (25) |
+| `i2c` | `wait_async`, `event()` (26) |
+| `led` | `take`, `configure`, `set`, `toggle`, `is_on`, `toggles` (STM32F4 PA5, RP2040 GP25, ESP32-C3 GPIO8) |
+
+```lusa
+#[no_std]
+use lusa::hal::uart;
+use lusa::hal::timer;
+use lusa::hal::led;
+
+#[interrupt("TIM2")]                -- `SYSTICK` on RP2040
+function tick_irq(): void
+    timer::on_interrupt()
+end
+
+#[interrupt("USART2")]              -- `UART0` on RP2040
+function serial_irq(): void
+    uart::on_interrupt()
+end
+
+async function blinker(clock: timer::Timer, light: led::Led): u32
+    while true do
+        await timer::delay_ms(borrow clock, 500)
+        led::toggle(borrow light)
+    end
+    return 0
+end
+
+async function echo(port: uart::Uart): u32
+    while true do
+        local byte: u32 = await uart::read_async(borrow port)
+        await uart::write_async(borrow port, byte)
+    end
+    return 0
+end
+
+#[entry]
+function main(): void
+    local port: uart::Uart = uart::take():unwrap()
+    local clock: timer::Timer = timer::take():unwrap()
+    local light: led::Led = led::take():unwrap()
+    uart::configure(borrow port, 115200)
+    timer::configure(borrow clock, 1000)
+    led::configure(borrow light)
+    interrupts_enable()
+    task.spawn(blinker(borrow clock, borrow light))
+    task.spawn(echo(borrow port))
+    task.run()                      -- sleeps in `wfi` while both tasks wait
+end
+```
+
+On ESP32-C3 the timer and UART share CPU interrupt 11, so one
+`#[interrupt("machine_external")]` handler calls both `on_interrupt()`
+functions. The host models make the same code testable with `lusalang run`
+and `--vm`: `timer::sim_advance(n)` plays `n` interrupts, and
+`uart::sim_receive` wakes a task parked in `read_async`.
+
+`examples/async_multitasking_firmware.lusa` runs three tasks: an LED blinker
+on `timer::delay_ms`, a UART echo console, and a reporter that a newline wakes
+through application event 1. Natively, every awaited `f(...)` temporary
+returns its task block to a free list, so unbounded `await` loops fit the
+16 KiB `#[no_std]` arena, and Renode gets an ESP32-C3 SYSTIMER model
+(`renode/models/LusaEsp32C3Systimer.cs`).
+
+```sh
+lusalang build examples/async_multitasking_firmware.lusa --target stm32f4
+cargo test --test module28_async_rtos -- --test-threads=1
+```
+
+`tests/module28_async_rtos.rs` checks scheduling order, wakes, sleeps,
+blocking awaits, and arena recycling in the interpreter, the VM, and native
+builds; the async drivers on the host models; and, under Renode, the example
+and a scheduler check on STM32F4, RP2040, and ESP32-C3. Limits: wake events
+are signals, not counters; the timers assume the reset clock trees; and native
+async bodies still take buffers as pointers rather than fixed-array locals.
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -1622,6 +1741,12 @@ Near-term milestones:
   host simulation; `#[peripheral]` move-only resource tokens with single
   `take()` claims; Renode SPI loopback and I2C echo devices plus repository
   models for the blocks Renode 1.17 lacks; and a UART echo server example.
+- **v2.4.0 (shipped):** an event-driven `task.run()` executor with
+  `task.wait`/`task.wake` events, the `task.sleep`/`task.tick`/`task.now`
+  clock, and `wfi` idling; `lusa::hal::timer` and `lusa::hal::led`; async
+  UART, SPI, and I2C wrappers woken by their interrupts; recycled task blocks
+  in the `#[no_std]` arena; an ESP32-C3 SYSTIMER Renode model; and a
+  three-task multitasking firmware example.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

@@ -1,0 +1,38 @@
+-- ESP32-C3 SYSTIMER (0x60023000) alarm 0 in period mode: the executor tick.
+-- Interrupt source 37 (SYSTIMER_TARGET0) is routed to CPU interrupt 11, so
+-- call `timer::on_interrupt()` from the shared
+-- `#[interrupt("machine_external")]` handler.
+--
+-- Registers (word offsets): CONF +0, TARGET0_CONF +13, COMP0_LOAD +20,
+-- INT_ENA +25, INT_RAW +26, INT_CLR +27, INT_ST +28.  Counter unit 0 runs at
+-- 16 MHz; TARGET0_CONF holds the period (26 bits), PERIOD_MODE (bit 30), and
+-- the unit select (bit 31, unit 0 here).
+
+function systimer(word: u32): u32
+    return 1610756096 + word * 4
+end
+
+function ll_configure(hz: u32): void
+    super::peripheral_on(536870912)             -- SYSTIMER (bit 29)
+    local period: u32 = 16000000 // hz
+    super::mmio_write(systimer(25), 0)          -- INT_ENA off while reloading
+    super::mmio_write(systimer(13), period)     -- TARGET0_CONF: period, unit 0
+    super::mmio_write(systimer(20), 1)          -- COMP0_LOAD
+    super::mmio_write(systimer(13), period + 1073741824)   -- + PERIOD_MODE
+    super::mmio_write(systimer(20), 1)
+    -- CONF: CLK_EN | TIMER_UNIT0_WORK_EN | TARGET0_WORK_EN
+    super::mmio_write(systimer(0), 3238002688)
+    super::mmio_write(systimer(27), 1)          -- INT_CLR target 0
+    super::mmio_write(systimer(25), 1)          -- INT_ENA target 0
+    super::route_interrupt(37)
+end
+
+-- The CPU interrupt is shared with the other drivers: only a pending alarm
+-- is a tick.
+function ll_acknowledge(): bool
+    if super::has_bit(super::mmio_read(systimer(28)), 1) then   -- INT_ST
+        super::mmio_write(systimer(27), 1)
+        return true
+    end
+    return false
+end

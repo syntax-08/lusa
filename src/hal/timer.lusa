@@ -1,0 +1,82 @@
+-- lusa::hal::timer -- the periodic tick that drives the executor clock.
+--
+-- `configure(timer, hz)` starts the board's tick interrupt at `hz` ticks per
+-- second.  Each interrupt calls `task.tick()`, which advances `task.now()`
+-- and lets `task.sleep` deadlines expire; the executor sleeps in `wfi` in
+-- between.  Install the handler with `#[interrupt("<vector>")]` and call
+-- `on_interrupt()` from it.  `delay_ms` and `delay_ticks` are the async
+-- delays for tasks.
+
+#[peripheral]
+pub struct Timer { index: u32 }
+
+local claimed: bool = false
+local rate: u32 = 1000
+
+-- Claims the tick timer once; later calls return `None`.
+pub function take(): Option<Timer>
+    local state: u32 = interrupts_disable()
+    local first: bool = not claimed
+    claimed = true
+    interrupts_restore(state)
+    if first then
+        return Some(Timer{index: 0})
+    end
+    return None
+end
+
+-- Starts the periodic tick at `hz` (1 to 100000) ticks per second.
+pub function configure(timer: Timer, hz: u32): void
+    local wanted: u32 = hz
+    if wanted < 1 then
+        wanted = 1
+    end
+    if wanted > 100000 then
+        wanted = 100000
+    end
+    local state: u32 = interrupts_disable()
+    rate = wanted
+    ll_configure(wanted)
+    interrupts_restore(state)
+end
+
+pub function hz(timer: Timer): u32
+    return rate
+end
+
+-- Ticks since start-up (the executor clock, `task.now()`).
+pub function ticks(timer: Timer): u32
+    return task.now()
+end
+
+-- Milliseconds since start-up, from the tick count.
+pub function millis(timer: Timer): u32
+    local now: u32 = task.now()
+    return now // rate * 1000 + now % rate * 1000 // rate
+end
+
+-- Ticks covering `ms` milliseconds, rounded up.
+pub function ticks_for(timer: Timer, ms: u32): u32
+    return ms // 1000 * rate + (ms % 1000 * rate + 999) // 1000
+end
+
+-- Interrupt handler body: acknowledges the tick and advances the clock.
+-- On a shared vector it ignores interrupts that are not the timer's.
+pub function on_interrupt(): void
+    if ll_acknowledge() then
+        task.tick()
+    end
+end
+
+-- Parks the task for `count` ticks and returns the tick count at wake-up.
+pub async function delay_ticks(timer: Timer, count: u32): u32
+    task.sleep(count)
+    return task.now()
+end
+
+-- Parks the task for at least `ms` milliseconds and returns the tick count
+-- at wake-up.
+pub async function delay_ms(timer: Timer, ms: u32): u32
+    task.sleep(ticks_for(borrow timer, ms))
+    return task.now()
+end

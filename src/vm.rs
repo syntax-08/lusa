@@ -1104,6 +1104,30 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             StepOutcome::Continue
         }
         Instr::YieldNow => yield_values(interp, 0, 0, true)?,
+        Instr::Park(kind) => {
+            let value = pop1(interp);
+            let span = current_span(interp);
+            let wait = crate::task::park_request(interp, *kind, &value, span)?;
+            interp.executor.park = Some(wait);
+            yield_values(interp, 0, 0, true)?
+        }
+        Instr::AwaitPoll(exit) => {
+            let span = current_span(interp);
+            let value = interp.vm.stack.last().cloned().unwrap_or(Value::Nil);
+            let task = crate::task::task_from(&value, span)?;
+            match crate::task::poll_child(interp, &task, span)? {
+                Some(result) => {
+                    interp.vm.stack.pop();
+                    interp.vm.stack.push(result);
+                    interp.vm.last_ret = 1;
+                    interp.vm.frames.last_mut().unwrap().pc = *exit as usize;
+                    StepOutcome::Continue
+                }
+                // `poll_child` left the child's park request (if any) for
+                // the task that is polling this frame.
+                None => yield_values(interp, 0, 0, true)?,
+            }
+        }
         Instr::Try => {
             let value = pop1(interp);
             let Some((kind, tag, payload)) = value.base_value().sum_parts() else {

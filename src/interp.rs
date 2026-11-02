@@ -77,8 +77,10 @@ pub struct Interp {
     /// upvalue cells of the running coroutine, used when helper functions are
     /// compiled on demand so they share captures instead of taking snapshots
     pub coroutine_captures: Vec<value::CaptureMap>,
-    /// pending `task.spawn` queue drained by `task.run`
-    pub task_queue: Vec<Rc<RefCell<crate::value::TaskObj>>>,
+    /// ready queue drained by `task.run`, in FIFO order
+    pub task_queue: std::collections::VecDeque<Rc<RefCell<crate::value::TaskObj>>>,
+    /// parked tasks, the tick clock, and the wake stamps of the executor
+    pub executor: crate::task::Executor,
     /// simulated global interrupt mask used by `interrupts_disable` and
     /// friends.  Native builds lower the same calls to CPUI/PRIMASK or
     /// `mstatus.MIE`; the sandbox only needs to return the previous state.
@@ -131,7 +133,8 @@ impl Interp {
             addr_next: 0x8000_0000,
             active_coroutines: Vec::new(),
             coroutine_captures: Vec::new(),
-            task_queue: Vec::new(),
+            task_queue: std::collections::VecDeque::new(),
+            executor: crate::task::Executor::default(),
             interrupts_enabled: true,
         }
     }

@@ -1,4 +1,5 @@
-//! `lusa::hal`: interrupt-driven UART, SPI, and I2C drivers (Module 27).
+//! `lusa::hal`: interrupt-driven UART, SPI, and I2C drivers (Module 27), the
+//! executor tick timer, the user LED, and async driver wrappers (Module 28).
 //!
 //! The drivers are Lusa source embedded in the binary.  Each board family
 //! (`TargetSpec::hal`) supplies the register-level half of every driver; the
@@ -14,6 +15,8 @@
 //! 3. the family backend (`<family>/uart.lusa`, ...), which implements the
 //!    private `ll_*` hooks.
 //!
+//! `timer` and `led` own no buffers, so they skip step 1.
+//!
 //! Module-level state is declared before every function that touches it, so
 //! the dynamic engines resolve it as module locals rather than globals.
 
@@ -24,6 +27,8 @@ const RING: &str = include_str!("hal/ring.lusa");
 const UART: &str = include_str!("hal/uart.lusa");
 const SPI: &str = include_str!("hal/spi.lusa");
 const I2C: &str = include_str!("hal/i2c.lusa");
+const TIMER: &str = include_str!("hal/timer.lusa");
+const LED: &str = include_str!("hal/led.lusa");
 
 /// Every driver owns a 64-byte receive ring and a 64-byte transmit ring.
 const DRIVER_RINGS: &[(&str, u32)] = &[("rx", 64), ("tx", 64)];
@@ -43,6 +48,8 @@ struct Family {
     uart: Backend,
     spi: Backend,
     i2c: Backend,
+    timer: &'static str,
+    led: &'static str,
 }
 
 const fn backend(source: &'static str) -> Backend {
@@ -59,6 +66,8 @@ static FAMILIES: &[Family] = &[
         },
         spi: backend(include_str!("hal/host/spi.lusa")),
         i2c: backend(include_str!("hal/host/i2c.lusa")),
+        timer: include_str!("hal/host/timer.lusa"),
+        led: include_str!("hal/host/led.lusa"),
     },
     Family {
         name: "stm32f4",
@@ -66,6 +75,8 @@ static FAMILIES: &[Family] = &[
         uart: backend(include_str!("hal/stm32f4/uart.lusa")),
         spi: backend(include_str!("hal/stm32f4/spi.lusa")),
         i2c: backend(include_str!("hal/stm32f4/i2c.lusa")),
+        timer: include_str!("hal/stm32f4/timer.lusa"),
+        led: include_str!("hal/stm32f4/led.lusa"),
     },
     Family {
         name: "rp2040",
@@ -73,6 +84,8 @@ static FAMILIES: &[Family] = &[
         uart: backend(include_str!("hal/rp2040/uart.lusa")),
         spi: backend(include_str!("hal/rp2040/spi.lusa")),
         i2c: backend(include_str!("hal/rp2040/i2c.lusa")),
+        timer: include_str!("hal/rp2040/timer.lusa"),
+        led: include_str!("hal/rp2040/led.lusa"),
     },
     Family {
         name: "esp32c3",
@@ -80,6 +93,8 @@ static FAMILIES: &[Family] = &[
         uart: backend(include_str!("hal/esp32c3/uart.lusa")),
         spi: backend(include_str!("hal/esp32c3/spi.lusa")),
         i2c: backend(include_str!("hal/esp32c3/i2c.lusa")),
+        timer: include_str!("hal/esp32c3/timer.lusa"),
+        led: include_str!("hal/esp32c3/led.lusa"),
     },
 ];
 
@@ -105,6 +120,17 @@ fn render_driver(out: &mut String, name: &str, common: &str, backend: &Backend) 
     out.push_str("\n}\n");
 }
 
+/// A module without ring buffers: the common API, then the backend.
+fn render_plain(out: &mut String, name: &str, common: &str, backend: &str) {
+    out.push_str("pub mod ");
+    out.push_str(name);
+    out.push_str(" {\n");
+    out.push_str(common);
+    out.push('\n');
+    out.push_str(backend);
+    out.push_str("\n}\n");
+}
+
 /// Multi-line source of the `lusa` crate for `family`, or `None` when the
 /// family ships no drivers.
 pub fn crate_source(family: &str) -> Option<String> {
@@ -115,6 +141,8 @@ pub fn crate_source(family: &str) -> Option<String> {
     render_driver(&mut out, "uart", UART, &family.uart);
     render_driver(&mut out, "spi", SPI, &family.spi);
     render_driver(&mut out, "i2c", I2C, &family.i2c);
+    render_plain(&mut out, "timer", TIMER, family.timer);
+    render_plain(&mut out, "led", LED, family.led);
     out.push_str("}\n}\n");
     Some(out)
 }
@@ -148,10 +176,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_family_renders_three_drivers() {
+    fn every_family_renders_every_driver() {
         for name in families() {
             let source = crate_source(name).expect("family");
-            for driver in ["pub mod uart", "pub mod spi", "pub mod i2c"] {
+            for driver in [
+                "pub mod uart",
+                "pub mod spi",
+                "pub mod i2c",
+                "pub mod timer",
+                "pub mod led",
+            ] {
                 assert!(source.contains(driver), "{name}: {driver}");
             }
             assert!(!source.contains("@R@") && !source.contains("@CAP@"), "{name}");

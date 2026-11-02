@@ -440,10 +440,15 @@ The executor surface is:
 | call | behavior |
 |---|---|
 | `task.spawn(t)` | enqueue a task (or a plain function wrapped as one) and return it |
-| `task.run()` | drain the queue in rounds; returns how many distinct tasks received their first poll |
-| `task.yield_now()` | suspend the current task at an instruction boundary |
+| `task.run()` | run the executor until every task settles (see below); returns how many distinct tasks received their first poll |
+| `task.yield_now()` | suspend the current task; it goes to the back of the run queue |
+| `task.wait(event)` | park the current task until `task.wake(event)`; events are 0 to 31 |
+| `task.sleep(ticks)` | park the current task until `task.now()` has advanced by `ticks` |
+| `task.wake(event)` | make every task parked on `event` runnable; interrupt-safe |
+| `task.tick()` | advance the executor clock by one tick (called by the timer interrupt) |
+| `task.now()` | the executor clock, in ticks (`u32`) |
 | `task.is_done(t)` | true after success or failure |
-| `task.status(t)` | `pending`, `running`, `done`, or `failed` (hosted only) |
+| `task.status(t)` | `pending`, `running`, `parked`, `done`, or `failed` (hosted only) |
 | `task.await(t)` | drive to completion and return the result |
 
 ```lusa
@@ -454,10 +459,73 @@ print(await a, await b) -- 3 7
 ```
 
 Tasks are cooperative and single-threaded: they never create OS threads, and
-`task.yield_now()` is the only preemption point. Calling an async function
-creates a fresh task whose arguments are captured at the call site. A task
-cannot await itself (`E9999`). Awaiting a non-task value is `E2005`, and
-`task.yield_now()` outside an async function is `E0312`/`E9999`.
+they switch only at `task.yield_now()`, `task.wait`, `task.sleep`, or an
+`await` of a pending task. Calling an async function creates a fresh task
+whose arguments are captured at the call site. A task cannot await itself
+(`E9999`). Awaiting a non-task value is `E2005`. `task.yield_now()`,
+`task.wait`, and `task.sleep` outside an async function are `E0312` natively
+and `E9999` in the dynamic engines.
+
+#### Events, sleeps, and the executor (Module 28)
+
+`task.run()` repeats three steps: move every parked task whose event was woken
+or whose deadline passed back to the run queue (in the order they parked),
+poll the ready tasks round-robin, and idle when nothing is ready. Idling on
+firmware executes `wfi` with interrupts masked across the final check, so the
+interrupt that wakes a task always ends the sleep. A host program has no
+interrupts, so idling jumps `task.now()` to the earliest `task.sleep`
+deadline; when only event waiters remain, `task.run()` returns and a later
+call resumes them:
+
+```lusa
+async function listener(): i32
+    task.wait(7)
+    return task.now()
+end
+
+local l = task.spawn(listener())
+print(task.run(), task.status(l))   -- 1 parked
+task.wake(7)
+print(task.run(), task.status(l))   -- 0 done
+```
+
+Wakes are stamped, not counted. `task.wake(event)` records the next wake
+sequence number for `event`; a task parked on `event` is runnable once that
+number is newer than the one taken when its poll began. A wake that lands
+between a task's readiness check and its `task.wait` is therefore never lost,
+every task waiting on the event wakes, and several wakes before a waiter runs
+count as one. Wait in a loop that rechecks the condition:
+
+```lusa
+async function next_byte(): u32
+    while ring_empty() do
+        task.wait(24)          -- the receive interrupt wakes event 24
+    end
+    return ring_pop()
+end
+```
+
+Awaiting a child inside an async function polls the child inline. When the
+child yields or parks, its parent suspends with it (inheriting the child's
+wait), so tasks interleave at every suspension point of every nested call. A
+blocking `await` outside async code drives its task inline; while the task is
+parked it runs the other tasks and idles, and if nothing can ever wake it the
+dynamic engines raise `E2012`:
+
+```lusa
+async function forever(): i32
+    task.wait(3)
+    return 1
+end
+
+local ok, err = pcall(function() return await forever() end)
+print(ok, err)   -- false E2012: the awaited task is parked on event 3 and nothing is left to wake it
+```
+
+`lusa::hal::timer` feeds the clock from a hardware tick interrupt, and the
+`lusa::hal` drivers wake events 24 (UART), 25 (SPI), and 26 (I2C) from their
+`on_interrupt()` handlers; events 0 to 23 are free for applications (see
+section 9.19).
 
 `string`: `len upper lower sub rep reverse char byte find match gmatch gsub
 format`. `find`, `match`, `gmatch`, and `gsub` use the Lua-style pattern
@@ -574,6 +642,7 @@ Codes `E{category}{n}`, like rustc:
 | E2009  | I/O      | file I/O cannot read/write (missing, unreadable, non-UTF-8, permissions) |
 | E2010  | pattern  | malformed string pattern or replacement |
 | E2011  | pattern  | pattern exceeded the bounded matching budget |
+| E2012  | task     | a blocking `await` waits on a parked task that nothing is left to wake |
 | E0301  | static   | C11 backend: missing/invalid function parameter or return type |
 | E0302  | static   | C11 backend: duplicate struct/field definition or duplicate struct-literal field |
 | E0308  | static   | C11 backend: mismatched types (assignment, return, call, condition) |
@@ -1629,13 +1698,17 @@ call site sees that handle type. The C11 backend lowers it without threads:
   The resumed case reads the typed result through `lusa_task_result_*`, and a
   failed child copies its error and returns `LUSA_TASK_FAIL`.
 - `task.yield_now()` stores the next state and returns `LUSA_TASK_YIELD`.
+  `task.wait`/`task.sleep` return `LUSA_TASK_PARK` through
+  `lusa_task_wait_event`/`lusa_task_sleep_for` (section 9.19).
   `return value` fills the `base->value` union and returns `LUSA_TASK_DONE`.
-- `task.spawn(t)` enqueues a task, `task.run()` drains the queue in rounds, and
+- `task.spawn(t)` enqueues a task, `task.run()` is the executor, and
   `task.is_done(t)`/`task.status(t)` query the state. `task.status` is omitted
   in `#[no_std]` because it returns a string.
+- `lusa_task_poll` polls a task once: a pending awaited child is polled first,
+  and its `LUSA_TASK_YIELD` or `LUSA_TASK_PARK` suspends the parent too.
 - `task.await(t)` and top-level/synchronous `await` use `lusa_task_drive`,
-  which runs a task to completion inline. Parent tasks awaiting children are
-  driven cooperatively, so no call blocks an OS thread.
+  which drives a task inline and runs executor turns while it is parked, so
+  no call blocks an OS thread.
 
 Statement-level await forms supported by the emitter are:
 
@@ -1644,7 +1717,13 @@ local value: i32 = await child()   -- Local initializer
 value = await child()              -- assignment to a name
 return await child()               -- return value
 await child()                      -- standalone call statement
+await settle()                     -- a `task<void>` may be awaited only here
 ```
+
+When the awaited expression is a fresh call such as `child()`, nothing else
+holds the handle, so the emitter releases the child's task block
+(`lusa_task_release`) right after reading its result; the next task of the
+same size reuses it.
 
 Repeated await in `while` loops works; the state machine keeps all hoisted
 locals across suspensions. Async functions may return scalars, `string`,
@@ -2170,9 +2249,10 @@ I2C block is register-compatible). RP2040 uses `PL011`,
 (Renode 1.17 has no PL022). ESP32-C3 uses repository models for all three
 blocks (`LusaEsp32C3Uart.cs`, `LusaEsp32C3Spi.cs`, `LusaEsp32C3I2c.cs`):
 Renode's `ESP32_UART` raises no receive interrupt and Renode ships no ESP32-C3
-SPI or I2C controller. The three ESP32-C3 interrupt lines are OR-ed onto
-`cpu@11` by a `CombinedInput`. The DesignWare model does not report address
-NACKs, so the RP2040 NACK path runs only on hardware.
+SPI or I2C controller. The ESP32-C3 interrupt lines (four since the Module 28
+SYSTIMER model) are OR-ed onto `cpu@11` by a `CombinedInput`. The DesignWare
+model does not report address NACKs, so the RP2040 NACK path runs only on
+hardware.
 
 `examples/interrupt_uart_echo.lusa` is the STM32F4 echo server.
 `tests/module27_drivers.rs` types `hello lusa`, `ping`, and `!` into the UART
@@ -2196,7 +2276,145 @@ lusalang build examples/interrupt_uart_echo.lusa --target stm32f4
 cargo test --test module27_drivers -- --test-threads=1 --nocapture
 ```
 
-### 9.19 Native subset limits
+### 9.19 Embedded async executor and async drivers (Module 28)
+
+The native executor is the C counterpart of the dynamic one in section 6
+("Events, sleeps, and the executor"). Every task header carries
+`wait_kind`, `wait_value` (event number or deadline), and `wait_stamp`, and
+the runtime keeps a FIFO run queue, a parked list, and three volatile words
+that interrupt handlers may write:
+
+| symbol | role |
+|---|---|
+| `lusa_task_ticks` | the tick clock; `task.tick()` increments it, `task.now()` reads it |
+| `lusa_task_wakes` | the wake sequence counter |
+| `lusa_task_signals[32]` | the sequence number of each event's latest `task.wake` |
+
+`task.wake` and `task.tick` only store to these words, so they are safe in an
+`#[interrupt]` handler: no list is touched outside the main context.
+`lusa_task_collect` moves parked tasks whose event stamp is newer than their
+poll stamp, or whose deadline has passed, back to the run queue. On a
+freestanding Arm or RISC-V build (`-ffreestanding`, so `LUSA_TASK_WFI` is 1)
+`lusa_task_idle` masks interrupts, collects once more, executes `wfi` if the
+queue is still empty, and restores the mask; a pending interrupt ends `wfi`
+even while masked. Host builds advance `lusa_task_ticks` to the earliest
+deadline instead. A program that calls any `task.*` operation gets the
+runtime, even without an async function (an ISR that only wakes or ticks).
+
+```lusa
+#[no_std]
+use lusa::hal::uart;
+use lusa::hal::timer;
+
+#[interrupt("TIM2")]
+function tick_irq(): void
+    timer::on_interrupt()           -- acknowledge TIM2, then task.tick()
+end
+
+#[interrupt("USART2")]
+function serial_irq(): void
+    uart::on_interrupt()            -- service the rings, then task.wake(24)
+end
+
+async function echo(port: uart::Uart, clock: timer::Timer): u32
+    while true do
+        local byte: u32 = await uart::read_async(borrow port)
+        await timer::delay_ms(borrow clock, 10)
+        await uart::write_async(borrow port, byte)
+    end
+    return 0
+end
+
+#[entry]
+function main(): void
+    local port: uart::Uart = uart::take():unwrap()
+    local clock: timer::Timer = timer::take():unwrap()
+    uart::configure(borrow port, 115200)
+    timer::configure(borrow clock, 1000)
+    interrupts_enable()
+    task.spawn(echo(borrow port, borrow clock))
+    task.run()
+end
+```
+
+#### `lusa::hal::timer`
+
+| function | behavior |
+|---|---|
+| `take()` | `Some(timer)` once, then `None` |
+| `configure(timer, hz)` | start the tick interrupt at `hz` (clamped to 1-100000) |
+| `on_interrupt()` | acknowledge the tick and call `task.tick()`; ignores other sources on a shared vector |
+| `hz(timer)`, `ticks(timer)`, `millis(timer)` | rate, `task.now()`, and milliseconds since start-up |
+| `ticks_for(timer, ms)` | ticks covering `ms`, rounded up |
+| `delay_ms(timer, ms)`, `delay_ticks(timer, n)` | async; park the task, return `task.now()` at wake-up |
+| `sim_advance(n)` | host only: play `n` timer interrupts |
+
+| board | tick source | vector |
+|---|---|---|
+| `stm32f4` | TIM2: PSC brings the 16 MHz timer clock to 1 MHz, ARR = 1000000 / hz - 1, IRQ 28 | `tim2` (44) |
+| `rp2040` | SysTick on the 125 MHz `clk_sys`, 24-bit reload | `systick` (15) |
+| `esp32c3` | SYSTIMER unit 0 alarm 0 in period mode (16 MHz), source 37 routed to CPU interrupt 11 | `machine_external` (11) |
+| host | virtual: the executor advances the clock | - |
+
+#### `lusa::hal::led`
+
+`take`, `configure` (output, off), `set(led, on)`, `toggle`, `is_on` (read
+back from the output register), and `toggles` (count since `configure`) for
+STM32F4 PA5, RP2040 GP25 (SIO), ESP32-C3 GPIO8, and a host variable.
+
+#### Async driver wrappers
+
+| module | function | parks on | returns |
+|---|---|---|---|
+| `uart` | `read_async(port)` | event 24 until a byte is received | the byte |
+| `uart` | `read_exact_async(port, buffer, count)` | each byte | `count` |
+| `uart` | `write_async(port, byte)` | event 24 while the transmit ring is full | - |
+| `uart` | `write_all_async(port, buffer, count)` | each byte | `count` |
+| `uart` | `flush_async(port)` | event 24 until the transmitter is idle | - |
+| `spi` | `transfer_async(bus, byte)` | event 25 until a reply is received | oldest reply |
+| `spi` | `flush_async(bus)` | event 25 until the burst ends | - |
+| `i2c` | `wait_async(bus)` | event 26 until the transaction ends | 0 ok, 1 NACK, 2 bus error |
+
+Buffers hold one byte per `u32` slot. Each driver's `on_interrupt()` wakes its
+event after servicing the controller, and `uart::event()`, `spi::event()`, and
+`i2c::event()` return the numbers for applications that wait on them
+directly. The host models wake the same events whenever they deliver a
+simulated interrupt, and `uart::sim_receive` wakes event 24, so a task parked
+in `read_async` resumes under `lusalang run`. In the dynamic engines
+`&array[0]` copies the element into simulated memory, so buffers for
+`read_exact_async`/`write_all_async` should come from `unsafe_alloc` there.
+
+#### Example, Renode, and tests
+
+`examples/async_multitasking_firmware.lusa` runs three tasks on STM32F4: an
+LED blinker on `timer::delay_ms(50)`, a console that echoes UART input with
+`uart::read_async`/`write_async`, and a reporter that application event 1
+wakes after each line. Renode 1.17 has no ESP32-C3 system timer, so
+`renode/models/LusaEsp32C3Systimer.cs` models counter unit 0 and alarm 0, and
+the platform's `CombinedInput` ORs four lines onto `cpu@11`.
+`tests/module28_async_rtos.rs` types `hello lusa`, `ping`, and `!` into each
+board and expects:
+
+```text
+LUSA ASYNC READY
+hello lusa
+[ 10 bytes]
+ping
+[ 4 bytes]
+bye lines=2 blinks=ok led=ok tasks=ok
+```
+
+It also boots a scheduler check on every board (two yielding tasks print
+`xyxyxy`, and timer tasks waking at 20, 40, 50, 60, and 80 ms print `aabaa`),
+and checks executor semantics, diagnostics, arena recycling, and the async
+drivers in the interpreter, the VM, and native host builds.
+
+```sh
+lusalang build examples/async_multitasking_firmware.lusa --target stm32f4
+cargo test --test module28_async_rtos -- --test-threads=1 --nocapture
+```
+
+### 9.20 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 table literals, fixed-size `[T; N]` arrays and local array literals, nested keyed
@@ -2207,7 +2425,7 @@ assignments, globals, `print`, `clone`, `borrow`, `move`, the compile-time
 borrow checker, `unsafe` blocks, static `struct` declarations in brace and bare
 form, `#[packed]`/`#[repr(align(N))]` representation attributes,
 `#[peripheral]` resource tokens and the bundled `lusa::hal` drivers
-(section 9.18),
+(sections 9.18 and 9.19),
 `#[no_std]`/`#[entry]`/`#[global_allocator]`/`#[link_section = "..."]`/
 `#[interrupt]`/`#[interrupt("VECTOR")]`
 (sections 9.12, 9.13, and 9.17), struct
@@ -2227,7 +2445,7 @@ safe `*b` reads/writes, `nil` clearing) with their RAII drop helpers,
 `Result<T,E>`/`Option<T>` (`Ok`/`Err`/`Some`/`None`, combinators, constructor
 `match` arms, and `?`) with their RAII helpers, `async function`/`async fn`
 with lazy `task<T>` handles, `await`/`.await`/`::await`, and the
-`task.spawn`/`run`/`yield_now`/`is_done`/`status` executor surface, the
+`task.spawn`/`run`/`yield_now`/`wait`/`sleep`/`wake`/`tick`/`now`/`is_done`/`status` executor surface, the
 string-pattern surface in
 section 9.7, and the restricted
 `coroutine.create/resume/yield/status/close/isyieldable` surface described in

@@ -51,15 +51,20 @@ function ll_service(): void
     end
 end
 
+-- Delivers the pending interrupt like the interrupt controller would,
+-- including the wake of the tasks parked on the driver.
 function ll_idle(): void
     if sim_irq_pending() then
-        ll_service()
+        on_interrupt()
     end
 end
 
--- Simulation: a peer sends `byte` to this port.
+-- Simulation: a peer sends `byte` to this port.  The receive line raises
+-- the interrupt, so tasks parked in `read_async` wake up.
 pub function sim_receive(byte: u32): bool
-    return line_in_push(byte % 256)
+    local stored: bool = line_in_push(byte % 256)
+    task.wake(24)
+    return stored
 end
 
 -- Simulation: next byte the transmitter put on the line, or `None`.

@@ -240,7 +240,7 @@ static RP2040_MODELS: &[RenodeModel] = &[RenodeModel {
 }];
 
 /// Renode 1.17 ships an ESP32 UART without RX interrupts or FIFO counts and no
-/// ESP32-C3 SPI or I2C controllers; these repository models fill the gaps.
+/// ESP32-C3 SPI, I2C, or system timer; these repository models fill the gaps.
 static ESP32C3_MODELS: &[RenodeModel] = &[
     RenodeModel {
         file: "LusaEsp32C3Uart.cs",
@@ -253,6 +253,10 @@ static ESP32C3_MODELS: &[RenodeModel] = &[
     RenodeModel {
         file: "LusaEsp32C3I2c.cs",
         source: include_str!("../renode/models/LusaEsp32C3I2c.cs"),
+    },
+    RenodeModel {
+        file: "LusaEsp32C3Systimer.cs",
+        source: include_str!("../renode/models/LusaEsp32C3Systimer.cs"),
     },
 ];
 

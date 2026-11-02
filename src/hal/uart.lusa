@@ -5,6 +5,9 @@
 -- the transmitter; received bytes land in the `rx` ring from the handler, so
 -- neither direction polls a hardware status register.  Install the handler
 -- with `#[interrupt("<vector>")]` and call `on_interrupt()` from it.
+--
+-- The `*_async` functions are for tasks: instead of spinning they park on
+-- the driver's wake event (24), which every interrupt signals.
 
 #[peripheral]
 pub struct Uart { index: u32 }
@@ -112,8 +115,84 @@ pub function flush(port: Uart): void
     end
 end
 
--- Interrupt handler body: moves received bytes into `rx` and feeds the
--- transmitter from `tx`.
+-- Interrupt handler body: moves received bytes into `rx`, feeds the
+-- transmitter from `tx`, and wakes the tasks parked on the driver.
 pub function on_interrupt(): void
     ll_service()
+    task.wake(24)
+end
+
+-- The executor event this driver's interrupt wakes (`task.wait(uart::event())`).
+pub function event(): u32
+    return 24
+end
+
+-- Waits for the next received byte without blocking the other tasks.
+pub async function read_async(port: Uart): u32
+    while true do
+        ll_idle()
+        local state: u32 = interrupts_disable()
+        local ready: bool = rx_len() > 0
+        local value: u32 = 0
+        if ready then
+            value = rx_pop()
+        end
+        interrupts_restore(state)
+        if ready then
+            return value
+        end
+        task.wait(24)
+    end
+    return 0
+end
+
+-- Receives exactly `count` bytes into `buffer` (one byte per u32 slot) and
+-- returns `count`.
+pub async function read_exact_async(port: Uart, buffer: *mut u32, count: u32): u32
+    local filled: u32 = 0
+    while filled < count do
+        local byte: u32 = await read_async(borrow port)
+        unsafe do
+            local slot: *mut u32 = buffer + filled
+            slot.write_volatile(byte)
+        end
+        filled = filled + 1
+    end
+    return filled
+end
+
+-- Queues one byte, waiting while the transmit ring is full.
+pub async function write_async(port: Uart, byte: u32): void
+    while not write(borrow port, byte) do
+        ll_idle()
+        if tx_len() >= tx_capacity() then
+            task.wait(24)
+        end
+    end
+end
+
+-- Queues `count` bytes from `buffer` (one byte per u32 slot) and returns
+-- `count`.
+pub async function write_all_async(port: Uart, buffer: *mut u32, count: u32): u32
+    local sent: u32 = 0
+    while sent < count do
+        local byte: u32 = 0
+        unsafe do
+            local slot: *mut u32 = buffer + sent
+            byte = slot.read_volatile()
+        end
+        await write_async(borrow port, byte)
+        sent = sent + 1
+    end
+    return sent
+end
+
+-- Waits until the handler has sent every queued byte.
+pub async function flush_async(port: Uart): void
+    while is_busy(borrow port) do
+        ll_idle()
+        if is_busy(borrow port) then
+            task.wait(24)
+        end
+    end
 end

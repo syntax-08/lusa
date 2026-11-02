@@ -1,0 +1,48 @@
+-- lusa::hal::led -- the board's user LED on a GPIO output.
+--
+-- STM32F4 drives PA5 (Nucleo LD2), RP2040 GP25 (Pico), and ESP32-C3 GPIO8;
+-- the host keeps the level in a variable.  `is_on` reads the output
+-- register back, so it reports what the pin actually drives.
+
+#[peripheral]
+pub struct Led { index: u32 }
+
+local claimed: bool = false
+local toggled: u32 = 0
+
+-- Claims the LED once; later calls return `None`.
+pub function take(): Option<Led>
+    local state: u32 = interrupts_disable()
+    local first: bool = not claimed
+    claimed = true
+    interrupts_restore(state)
+    if first then
+        return Some(Led{index: 0})
+    end
+    return None
+end
+
+-- Makes the pin an output and switches the LED off.
+pub function configure(led: Led): void
+    ll_configure()
+    ll_write(false)
+    toggled = 0
+end
+
+pub function set(led: Led, on: bool): void
+    ll_write(on)
+end
+
+pub function toggle(led: Led): void
+    ll_write(not ll_read())
+    toggled = toggled + 1
+end
+
+pub function is_on(led: Led): bool
+    return ll_read()
+end
+
+-- `toggle` calls since `configure`.
+pub function toggles(led: Led): u32
+    return toggled
+end

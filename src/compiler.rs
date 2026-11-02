@@ -161,6 +161,16 @@ pub enum Instr {
     /// `task.yield_now()`: suspends the current task.  On resume the VM
     /// pushes `nil` as the call result (one-value semantics).
     YieldNow,
+    /// `task.wait(event)` (0) / `task.sleep(ticks)` (1) inside an async
+    /// function: pops the operand, records the park request, and suspends
+    /// like `YieldNow`.
+    Park(u8),
+    /// `await` inside an async function.  Peeks the task on top of the stack
+    /// and polls it once; a settled task is replaced by its result and the VM
+    /// jumps to the target.  A pending task suspends the caller with the
+    /// child's park request; the code after this instruction pops the resume
+    /// value and jumps back here.
+    AwaitPoll(i32),
     /// Wraps TOS in a dynamic-engine `Box<T>` (idempotent for existing boxes).
     MakeBox,
     BorrowErr, // borrow is rejected in bytecode mode
@@ -567,6 +577,7 @@ impl Compiler {
             | Instr::JumpIfFalse(t)
             | Instr::JumpIfTrueKeep(t)
             | Instr::JumpIfFalseKeep(t)
+            | Instr::AwaitPoll(t)
             | Instr::ForNumInit { end: t, .. }
             | Instr::ForNumStep { end: t, .. }
             | Instr::ForInSetup { end: t, .. }
@@ -910,7 +921,17 @@ fn compile_expr(c: &mut Compiler, e: &Expr) -> LResult<()> {
             compile_expr(c, inner)?;
             truncate_if_expansion(c, inner);
             c.set_line(e.span);
-            c.em(Instr::Await);
+            if c.cur().is_async {
+                // Poll the child; while it is pending, suspend, discard the
+                // resume value, and poll again.
+                let poll = c.em(Instr::AwaitPoll(0));
+                c.em(Instr::Pop);
+                c.em(Instr::Jump(poll as i32));
+                let exit = c.cur().code.len();
+                c.patch(poll, exit);
+            } else {
+                c.em(Instr::Await);
+            }
         }
         ExprKind::Move { e: inner } => {
             let dest = crate::eval::label_of(inner);
@@ -999,17 +1020,34 @@ fn compile_call(
     span: Span,
     _end: Span,
 ) -> LResult<()> {
-    if is_direct_task_yield(c, callee) {
-        if !args.is_empty() {
-            return Err(LusaError::new(
-                crate::error::E_CALL,
-                Some(span),
-                "`task.yield_now` does not take arguments".to_string(),
-            ));
+    match direct_task_suspension(c, callee) {
+        Some("yield_now") => {
+            if !args.is_empty() {
+                return Err(LusaError::new(
+                    crate::error::E_CALL,
+                    Some(span),
+                    "`task.yield_now` does not take arguments".to_string(),
+                ));
+            }
+            c.set_line(span);
+            c.em(Instr::YieldNow);
+            return Ok(());
         }
-        c.set_line(span);
-        c.em(Instr::YieldNow);
-        return Ok(());
+        Some(name) => {
+            if args.len() != 1 {
+                return Err(LusaError::new(
+                    crate::error::E_CALL,
+                    Some(span),
+                    format!("`task.{name}` takes exactly one argument"),
+                ));
+            }
+            compile_expr(c, &args[0])?;
+            truncate_if_expansion(c, &args[0]);
+            c.set_line(span);
+            c.em(Instr::Park(if name == "wait" { 0 } else { 1 }));
+            return Ok(());
+        }
+        None => {}
     }
     if is_direct_coroutine_yield(c, callee) {
         let n = args.len();
@@ -1069,23 +1107,32 @@ fn is_direct_coroutine_yield(c: &mut Compiler, callee: &Expr) -> bool {
     root.as_str() == "coroutine" && matches!(resolve(c, "coroutine"), Resolved::Global)
 }
 
-/// `true` for a direct `task.yield_now()` call inside an async function whose
-/// `task` root resolves to the standard-library global.  Outside async code
-/// the call remains an ordinary builtin call and reports a runtime error.
-fn is_direct_task_yield(c: &mut Compiler, callee: &Expr) -> bool {
+/// The suspension point named by a direct `task.yield_now()`,
+/// `task.wait(event)`, or `task.sleep(ticks)` call inside an async function
+/// whose `task` root resolves to the standard-library global.  Outside async
+/// code the call remains an ordinary builtin call and reports a runtime
+/// error.
+fn direct_task_suspension(c: &mut Compiler, callee: &Expr) -> Option<&'static str> {
     if !c.cur().is_async {
-        return false;
+        return None;
     }
     let ExprKind::Field { obj, name } = &callee.kind else {
-        return false;
+        return None;
     };
-    if name.as_str() != "yield_now" {
-        return false;
-    }
+    let suspension = match name.as_str() {
+        "yield_now" => "yield_now",
+        "wait" => "wait",
+        "sleep" => "sleep",
+        _ => return None,
+    };
     let ExprKind::Var(root) = &obj.kind else {
-        return false;
+        return None;
     };
-    root.as_str() == "task" && matches!(resolve(c, "task"), Resolved::Global)
+    if root.as_str() == "task" && matches!(resolve(c, "task"), Resolved::Global) {
+        Some(suspension)
+    } else {
+        None
+    }
 }
 
 /// Compiles a function literal that must be callable without a surrounding

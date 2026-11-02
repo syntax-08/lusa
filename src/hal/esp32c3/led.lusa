@@ -1,0 +1,22 @@
+-- ESP32-C3 user LED on GPIO8.  The GPIO matrix drives the pin from the GPIO
+-- output register (FUNC8_OUT_SEL_CFG = 128); GPIO_OUT (0x60004004) and
+-- GPIO_ENABLE (0x60004020) are updated read-modify-write, bit 8 (256).
+
+function ll_configure(): void
+    super::mmio_write(1610630484 + 8 * 4, 128)
+    super::iomux_function(8, 1)
+    super::mmio_write(1610629152, super::with_bit(super::mmio_read(1610629152), 256))
+end
+
+function ll_write(on: bool): void
+    local out: u32 = super::mmio_read(1610629124)
+    if on then
+        super::mmio_write(1610629124, super::with_bit(out, 256))
+    else
+        super::mmio_write(1610629124, super::without_bit(out, 256))
+    end
+end
+
+function ll_read(): bool
+    return super::has_bit(super::mmio_read(1610629124), 256)
+end

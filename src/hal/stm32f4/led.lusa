@@ -1,0 +1,19 @@
+-- STM32F4 user LED on PA5 (GPIOA 0x40020000): MODER +0x00 (2 bits per pin,
+-- 01 = output), ODR +0x14, BSRR +0x18 (bit 5 sets, bit 21 resets).
+
+function ll_configure(): void
+    super::clock_ahb1(1)                                -- GPIOAEN
+    super::mmio_field(1073872896, super::pow2(10), 4, 1)
+end
+
+function ll_write(on: bool): void
+    if on then
+        super::mmio_write(1073872920, 32)
+    else
+        super::mmio_write(1073872920, 2097152)
+    end
+end
+
+function ll_read(): bool
+    return super::has_bit(super::mmio_read(1073872916), 32)
+end

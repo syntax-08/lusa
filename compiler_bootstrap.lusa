@@ -1248,6 +1248,12 @@ local check_unsafe_depth = 0
 local check_return_type = "i32"
 local check_in_function = false
 local check_in_async = false
+-- Set by any `task.*` call, so a program that only wakes or ticks the
+-- executor (an interrupt handler, for example) still gets the task runtime.
+local check_uses_tasks = false
+-- True while checking the value of an `await` statement, the one place a
+-- `task<void>` may be awaited.
+local check_await_statement = false
 local check_current_function = nil
 local check_no_std = false
 local check_entry_key = nil
@@ -2335,6 +2341,57 @@ end
 local function check_task_call(expr, method)
     local args = expr.args or {}
     local checked_args = {}
+    check_uses_tasks = true
+    if method == "wait" or method == "sleep" then
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`task." .. method .. "` takes one integer")
+        end
+        if not check_in_async then
+            type_fail("E0312", expr.line, expr.column,
+                "`task." .. method .. "` can only be used inside an `async function`")
+        end
+        local checked, actual = check_expr(args[1])
+        if not is_integer_type(actual) then
+            check_mismatch(checked.line, checked.column,
+                "`task." .. method .. "` argument", "integer", actual)
+        end
+        checked_args[1] = checked
+        expr.builtin = "task_" .. method
+        expr.ctype = "void"
+        expr.args = checked_args
+        return expr, "void"
+    end
+    if method == "wake" then
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`task.wake` takes one event number")
+        end
+        local checked, actual = check_expr(args[1])
+        if not is_integer_type(actual) then
+            check_mismatch(checked.line, checked.column,
+                "`task.wake` argument", "integer", actual)
+        end
+        checked_args[1] = checked
+        expr.builtin = "task_wake"
+        expr.ctype = "void"
+        expr.args = checked_args
+        return expr, "void"
+    end
+    if method == "tick" or method == "now" then
+        if #args ~= 0 then
+            type_fail("E0311", expr.line, expr.column,
+                "`task." .. method .. "` takes no arguments")
+        end
+        expr.builtin = "task_" .. method
+        expr.args = {}
+        if method == "now" then
+            expr.ctype = "u32"
+            return expr, "u32"
+        end
+        expr.ctype = "void"
+        return expr, "void"
+    end
     if method == "spawn" then
         if #args ~= 1 then
             type_fail("E0311", expr.line, expr.column,
@@ -3475,15 +3532,17 @@ check_expr = function(expr)
     end
 
     if tag == "Await" then
+        local statement = check_await_statement
+        check_await_statement = false
         local checked, inner = check_expr(expr.value)
         local result_type = task_info(inner)
         if result_type == nil then
             check_mismatch(checked.line, checked.column, "await",
                 "task<T>", inner)
         end
-        if result_type == "void" then
+        if result_type == "void" and not statement then
             type_fail("E0312", line, column,
-                "cannot await a `task<void>` value")
+                "cannot await a `task<void>` value here; write `await` as its own statement")
         end
         if result_type == "nil" then
             type_fail("E0312", line, column,
@@ -4810,7 +4869,9 @@ check_stmt = function(stmt, top_level)
     end
 
     if tag == "CallStmt" then
+        check_await_statement = stmt.value ~= nil and stmt.value.tag == "Await"
         local checked_value, _ = check_expr(stmt.value)
+        check_await_statement = false
         stmt.value = checked_value
         return stmt
     end
@@ -5154,6 +5215,8 @@ local function check_program(ast)
     check_return_type = "i32"
     check_in_function = false
     check_in_async = false
+    check_uses_tasks = false
+    check_await_statement = false
     check_current_function = nil
     check_no_std = false
     check_entry_key = nil
@@ -6859,196 +6922,22 @@ local HEAP_RUNTIME = {
 -- ---- cooperative async task runtime --------------------------------------
 
 -- Every `async function` lowers to a stackless state-machine step function.
--- Tasks are heap-allocated handles linked through a cooperative run queue;
--- there are no OS threads.  `lusa_task_run` is the minimal freestanding
--- executor used by hosted and `#[no_std]` programs.
-local TASK_RUNTIME = {
+-- The executor (modules 22 and 28) keeps ready tasks in a FIFO run queue and
+-- tasks parked by `task.wait`/`task.sleep` in a parked list; there are no OS
+-- threads.  Interrupt handlers only store to the volatile tick clock and wake
+-- stamps, so they never touch either list.  Hosted programs take task blocks
+-- from the heap and `#[no_std]` programs from a static arena; both recycle
+-- the block of a finished `await f(...)` temporary.
+local TASK_ALLOC_HOSTED = {
     "static void *lusa_heap_alloc(uint32_t size, uint32_t align);",
     "",
-    "typedef struct LusaTask LusaTask;",
-    "typedef int (*LusaTaskStep)(LusaTask *);",
-    "",
-    "enum {",
-    "    LUSA_TASK_DONE = 0,",
-    "    LUSA_TASK_YIELD = 1,",
-    "    LUSA_TASK_WAIT = 2,",
-    "    LUSA_TASK_FAIL = 3",
-    "};",
-    "",
-    "struct LusaTask {",
-    "    LusaTaskStep step;",
-    "    int state;",
-    "    int status; /* 0 pending, 1 done, 2 failed */",
-    "    int queued;",
-    "    LusaTask *awaiting;",
-    "    LusaTask *next;",
-    "    const char *error;",
-    "    union {",
-    "        int32_t i32;",
-    "        uint32_t u32;",
-    "        float f32;",
-    "        bool boolean;",
-    "        lusa_i128 i128;",
-    "        void *ptr;",
-    "    } value;",
-    "};",
-    "",
-    "static LusaTask *lusa_task_queue_head = NULL;",
-    "static LusaTask *lusa_task_queue_tail = NULL;",
-    "",
-    "static LusaTask *lusa_task_new(uint32_t size, LusaTaskStep step) {",
-    "    LusaTask *task = (LusaTask *)lusa_heap_alloc(size, 16u);",
-    "    unsigned char *bytes = (unsigned char *)task;",
-    "    uint32_t i = 0u;",
-    "    if (task == NULL) return NULL;",
-    "    while (i < size) { bytes[i] = 0u; i = i + 1u; }",
-    "    task->step = step;",
-    "    task->state = 0;",
-    "    task->status = 0;",
-    "    task->queued = 0;",
-    "    task->awaiting = NULL;",
-    "    task->next = NULL;",
-    "    task->error = NULL;",
-    "    return task;",
-    "}",
-    "",
-    "static void lusa_task_push(LusaTask *task) {",
-    "    if (task == NULL || task->queued) return;",
-    "    task->queued = 1;",
-    "    task->next = NULL;",
-    "    if (lusa_task_queue_tail == NULL) {",
-    "        lusa_task_queue_head = task;",
-    "        lusa_task_queue_tail = task;",
-    "    } else {",
-    "        lusa_task_queue_tail->next = task;",
-    "        lusa_task_queue_tail = task;",
-    "    }",
-    "}",
-    "",
-    "static LusaTask *lusa_task_pop(void) {",
-    "    LusaTask *task = lusa_task_queue_head;",
-    "    if (task == NULL) return NULL;",
-    "    lusa_task_queue_head = task->next;",
-    "    if (lusa_task_queue_head == NULL) lusa_task_queue_tail = NULL;",
-    "    task->next = NULL;",
-    "    task->queued = 0;",
-    "    return task;",
-    "}",
-    "",
-    "static LusaTask *lusa_task_spawn(LusaTask *task) {",
-    "    if (task != NULL && task->status == 0) lusa_task_push(task);",
-    "    return task;",
-    "}",
-    "",
-    "static bool lusa_task_done(LusaTask *task) {",
-    "    return task != NULL && task->status == 1;",
-    "}",
-    "",
-    "static bool lusa_task_failed(LusaTask *task) {",
-    "    return task != NULL && task->status == 2;",
-    "}",
-    "",
-    "static int32_t lusa_task_result_i32(LusaTask *task) {",
-    "    return task == NULL ? 0 : task->value.i32;",
-    "}",
-    "",
-    "static uint32_t lusa_task_result_u32(LusaTask *task) {",
-    "    return task == NULL ? 0u : task->value.u32;",
-    "}",
-    "",
-    "static float lusa_task_result_f32(LusaTask *task) {",
-    "    return task == NULL ? 0.0f : task->value.f32;",
-    "}",
-    "",
-    "static bool lusa_task_result_bool(LusaTask *task) {",
-    "    return task == NULL ? false : task->value.boolean;",
-    "}",
-    "",
-    "static lusa_i128 lusa_task_result_i128(LusaTask *task) {",
-    "    return task == NULL ? (lusa_i128)0 : task->value.i128;",
-    "}",
-    "",
-    "static void *lusa_task_result_ptr(LusaTask *task) {",
-    "    return task == NULL ? NULL : task->value.ptr;",
-    "}",
-    "",
-    "static LusaString *lusa_task_status(LusaTask *task) {",
-    "    if (task == NULL || task->status == 2) {",
-    '        return lusa_string_new("failed", 6u);',
-    "    }",
-    "    if (task->status == 1) {",
-    '        return lusa_string_new("done", 4u);',
-    "    }",
-    "    if (task->state != 0 || task->queued) {",
-    '        return lusa_string_new("running", 7u);',
-    "    }",
-    '    return lusa_string_new("pending", 7u);',
-    "}",
-    "",
-    "static void lusa_task_drive(LusaTask *task) {",
-    "    while (task != NULL && task->status == 0) {",
-    "        int rc = task->step(task);",
-    "        if (rc == LUSA_TASK_WAIT) {",
-    "            if (task->awaiting == NULL) {",
-    "                task->status = 2;",
-    '                task->error = "await has no child task";',
-    "                return;",
-    "            }",
-    "            lusa_task_drive(task->awaiting);",
-    "            if (task->awaiting->status == 2) {",
-    "                task->status = 2;",
-    "                task->error = task->awaiting->error;",
-    "                return;",
-    "            }",
-    "            continue;",
-    "        }",
-    "        if (rc == LUSA_TASK_YIELD) continue;",
-    "        if (rc == LUSA_TASK_FAIL) {",
-    "            task->status = 2;",
-    '            if (task->error == NULL) task->error = "task failed";',
-    "            return;",
-    "        }",
-    "        task->status = 1;",
-    "        return;",
-    "    }",
-    "}",
-    "",
-    "static int32_t lusa_task_run(void) {",
-    "    int32_t ran = 0;",
-    "    while (lusa_task_queue_head != NULL) {",
-    "        LusaTask *task = lusa_task_pop();",
-    "        int rc;",
-    "        if (task->status != 0) continue;",
-    "        if (task->state == 0) ran = ran + 1;",
-    "        rc = task->step(task);",
-    "        if (rc == LUSA_TASK_WAIT) {",
-    "            if (task->awaiting == NULL) {",
-    "                task->status = 2;",
-    '                task->error = "await has no child task";',
-    "            } else {",
-    "                lusa_task_drive(task->awaiting);",
-    "                if (task->awaiting->status == 2) {",
-    "                    task->status = 2;",
-    "                    task->error = task->awaiting->error;",
-    "                } else if (task->status == 0) {",
-    "                    lusa_task_push(task);",
-    "                }",
-    "            }",
-    "        } else if (rc == LUSA_TASK_YIELD) {",
-    "            lusa_task_push(task);",
-    "        } else if (rc == LUSA_TASK_FAIL) {",
-    "            task->status = 2;",
-    '            if (task->error == NULL) task->error = "task failed";',
-    "        } else {",
-    "            task->status = 1;",
-    "        }",
-    "    }",
-    "    return ran;",
+    "static void *lusa_task_alloc(uint32_t size, uint32_t align) {",
+    "    return lusa_heap_alloc(size, align);",
     "}",
     ""
 }
 
-local NO_STD_TASK_RUNTIME = {
+local TASK_ALLOC_NO_STD = {
     "#ifndef LUSA_TASK_ARENA_BYTES",
     "#define LUSA_TASK_ARENA_BYTES 16384u",
     "#endif",
@@ -7065,7 +6954,10 @@ local NO_STD_TASK_RUNTIME = {
     "    lusa_task_arena_used = start + (size_t)size;",
     "    return (void *)&lusa_task_arena[start];",
     "}",
-    "",
+    ""
+}
+
+local TASK_RUNTIME = {
     "typedef struct LusaTask LusaTask;",
     "typedef int (*LusaTaskStep)(LusaTask *);",
     "",
@@ -7073,14 +6965,26 @@ local NO_STD_TASK_RUNTIME = {
     "    LUSA_TASK_DONE = 0,",
     "    LUSA_TASK_YIELD = 1,",
     "    LUSA_TASK_WAIT = 2,",
-    "    LUSA_TASK_FAIL = 3",
+    "    LUSA_TASK_FAIL = 3,",
+    "    LUSA_TASK_PARK = 4",
+    "};",
+    "",
+    "enum {",
+    "    LUSA_TASK_WAIT_NONE = 0,",
+    "    LUSA_TASK_WAIT_EVENT = 1,",
+    "    LUSA_TASK_WAIT_TIME = 2",
     "};",
     "",
     "struct LusaTask {",
     "    LusaTaskStep step;",
     "    int state;",
-    "    int status;",
+    "    int status; /* 0 pending, 1 done, 2 failed */",
     "    int queued;",
+    "    int parked;",
+    "    int wait_kind;",
+    "    uint32_t wait_value; /* event number or deadline tick */",
+    "    uint32_t wait_stamp; /* wake sequence when the poll began */",
+    "    uint32_t size;",
     "    LusaTask *awaiting;",
     "    LusaTask *next;",
     "    const char *error;",
@@ -7094,23 +6998,57 @@ local NO_STD_TASK_RUNTIME = {
     "    } value;",
     "};",
     "",
+    "#define LUSA_TASK_EVENTS 32u",
+    "#if (defined(__arm__) || defined(__riscv)) && defined(__STDC_HOSTED__) && __STDC_HOSTED__ == 0",
+    "#define LUSA_TASK_WFI 1",
+    "#else",
+    "#define LUSA_TASK_WFI 0",
+    "#endif",
+    "",
+    "static volatile uint32_t lusa_task_ticks = 0u;",
+    "static volatile uint32_t lusa_task_wakes = 0u;",
+    "static volatile uint32_t lusa_task_signals[LUSA_TASK_EVENTS];",
+    "static uint32_t lusa_task_poll_stamp = 0u;",
     "static LusaTask *lusa_task_queue_head = NULL;",
     "static LusaTask *lusa_task_queue_tail = NULL;",
+    "static LusaTask *lusa_task_parked_head = NULL;",
+    "static LusaTask *lusa_task_parked_tail = NULL;",
+    "static LusaTask *lusa_task_spare = NULL;",
     "",
+    "/* Reuses a released block of the same size before taking new memory, so",
+    "   a loop that awaits `f(...)` runs in constant space. */",
     "static LusaTask *lusa_task_new(uint32_t size, LusaTaskStep step) {",
-    "    LusaTask *task = (LusaTask *)lusa_task_alloc(size, 16u);",
-    "    unsigned char *bytes = (unsigned char *)task;",
+    "    LusaTask *task = NULL;",
+    "    LusaTask **link = &lusa_task_spare;",
+    "    unsigned char *bytes;",
     "    uint32_t i = 0u;",
+    "    while (*link != NULL) {",
+    "        if ((*link)->size == size) {",
+    "            task = *link;",
+    "            *link = task->next;",
+    "            break;",
+    "        }",
+    "        link = &(*link)->next;",
+    "    }",
+    "    if (task == NULL) task = (LusaTask *)lusa_task_alloc(size, 16u);",
     "    if (task == NULL) return NULL;",
+    "    bytes = (unsigned char *)task;",
     "    while (i < size) { bytes[i] = 0u; i = i + 1u; }",
     "    task->step = step;",
-    "    task->state = 0;",
-    "    task->status = 0;",
+    "    task->size = size;",
     "    return task;",
     "}",
     "",
+    "/* The compiler releases an awaited `f(...)` temporary once its result is",
+    "   read: nothing else can reach that handle. */",
+    "static void lusa_task_release(LusaTask *task) {",
+    "    if (task == NULL || task->status == 0 || task->queued || task->parked) return;",
+    "    task->next = lusa_task_spare;",
+    "    lusa_task_spare = task;",
+    "}",
+    "",
     "static void lusa_task_push(LusaTask *task) {",
-    "    if (task == NULL || task->queued) return;",
+    "    if (task == NULL || task->queued || task->parked || task->status != 0) return;",
     "    task->queued = 1;",
     "    task->next = NULL;",
     "    if (lusa_task_queue_tail == NULL) {",
@@ -7130,6 +7068,35 @@ local NO_STD_TASK_RUNTIME = {
     "    task->next = NULL;",
     "    task->queued = 0;",
     "    return task;",
+    "}",
+    "",
+    "static void lusa_task_unqueue(LusaTask *task) {",
+    "    LusaTask **link = &lusa_task_queue_head;",
+    "    LusaTask *previous = NULL;",
+    "    while (*link != NULL) {",
+    "        if (*link == task) {",
+    "            *link = task->next;",
+    "            if (lusa_task_queue_tail == task) lusa_task_queue_tail = previous;",
+    "            task->next = NULL;",
+    "            task->queued = 0;",
+    "            return;",
+    "        }",
+    "        previous = *link;",
+    "        link = &(*link)->next;",
+    "    }",
+    "}",
+    "",
+    "static void lusa_task_park(LusaTask *task) {",
+    "    if (task->parked) return;",
+    "    if (task->queued) lusa_task_unqueue(task);",
+    "    task->parked = 1;",
+    "    task->next = NULL;",
+    "    if (lusa_task_parked_tail == NULL) {",
+    "        lusa_task_parked_head = task;",
+    "    } else {",
+    "        lusa_task_parked_tail->next = task;",
+    "    }",
+    "    lusa_task_parked_tail = task;",
     "}",
     "",
     "static LusaTask *lusa_task_spawn(LusaTask *task) {",
@@ -7169,65 +7136,240 @@ local NO_STD_TASK_RUNTIME = {
     "    return task == NULL ? NULL : task->value.ptr;",
     "}",
     "",
-    "static void lusa_task_drive(LusaTask *task) {",
-    "    while (task != NULL && task->status == 0) {",
-    "        int rc = task->step(task);",
-    "        if (rc == LUSA_TASK_WAIT) {",
-    "            if (task->awaiting == NULL) {",
-    "                task->status = 2;",
-    '                task->error = "await has no child task";',
-    "                return;",
-    "            }",
-    "            lusa_task_drive(task->awaiting);",
-    "            if (task->awaiting->status == 2) {",
-    "                task->status = 2;",
-    "                task->error = task->awaiting->error;",
-    "                return;",
-    "            }",
-    "            continue;",
-    "        }",
-    "        if (rc == LUSA_TASK_YIELD) continue;",
-    "        if (rc == LUSA_TASK_FAIL) {",
-    "            task->status = 2;",
-    '            if (task->error == NULL) task->error = "task failed";',
-    "            return;",
-    "        }",
-    "        task->status = 1;",
-    "        return;",
-    "    }",
+    "/* `task.wake(event)` is interrupt-safe: two stores, no list access.  A",
+    "   task parked on `event` is runnable once the event's stamp is newer than",
+    "   the stamp its poll began with, so a wake that lands between a readiness",
+    "   check and the park is never lost. */",
+    "static void lusa_task_wake(uint32_t event) {",
+    "    uint32_t stamp;",
+    "    if (event >= LUSA_TASK_EVENTS) return;",
+    "    stamp = lusa_task_wakes + 1u;",
+    "    lusa_task_wakes = stamp;",
+    "    lusa_task_signals[event] = stamp;",
     "}",
     "",
-    "static int32_t lusa_task_run(void) {",
-    "    int32_t ran = 0;",
-    "    while (lusa_task_queue_head != NULL) {",
-    "        LusaTask *task = lusa_task_pop();",
+    "/* `task.tick()`: the timer interrupt advances the executor clock. */",
+    "static void lusa_task_tick(void) {",
+    "    lusa_task_ticks = lusa_task_ticks + 1u;",
+    "}",
+    "",
+    "static uint32_t lusa_task_now(void) {",
+    "    return lusa_task_ticks;",
+    "}",
+    "",
+    "static int lusa_task_wait_event(LusaTask *task, uint32_t event) {",
+    "    if (event >= LUSA_TASK_EVENTS) {",
+    '        task->error = "task.wait event is out of range (0 to 31)";',
+    "        return LUSA_TASK_FAIL;",
+    "    }",
+    "    task->wait_kind = LUSA_TASK_WAIT_EVENT;",
+    "    task->wait_value = event;",
+    "    task->wait_stamp = lusa_task_poll_stamp;",
+    "    return LUSA_TASK_PARK;",
+    "}",
+    "",
+    "static int lusa_task_sleep_for(LusaTask *task, uint32_t ticks) {",
+    "    task->wait_kind = LUSA_TASK_WAIT_TIME;",
+    "    task->wait_value = lusa_task_ticks + ticks;",
+    "    return LUSA_TASK_PARK;",
+    "}",
+    "",
+    "static bool lusa_task_ready(LusaTask *task) {",
+    "    if (task->wait_kind == LUSA_TASK_WAIT_EVENT) {",
+    "        return (int32_t)(lusa_task_signals[task->wait_value] - task->wait_stamp) > 0;",
+    "    }",
+    "    if (task->wait_kind == LUSA_TASK_WAIT_TIME) {",
+    "        return (int32_t)(lusa_task_ticks - task->wait_value) >= 0;",
+    "    }",
+    "    return true;",
+    "}",
+    "",
+    "/* Moves every parked task whose condition holds to the run queue, in park",
+    "   order.  Event waiters that stay parked take the current wake sequence",
+    "   as their stamp, so stamps never fall far enough behind to wrap. */",
+    "static void lusa_task_collect(void) {",
+    "    uint32_t seen = lusa_task_wakes;",
+    "    LusaTask *task = lusa_task_parked_head;",
+    "    LusaTask *keep_head = NULL;",
+    "    LusaTask *keep_tail = NULL;",
+    "    lusa_task_parked_head = NULL;",
+    "    lusa_task_parked_tail = NULL;",
+    "    while (task != NULL) {",
+    "        LusaTask *next = task->next;",
+    "        task->next = NULL;",
+    "        if (task->status != 0 || lusa_task_ready(task)) {",
+    "            task->parked = 0;",
+    "            task->wait_kind = LUSA_TASK_WAIT_NONE;",
+    "            lusa_task_push(task);",
+    "        } else {",
+    "            if (task->wait_kind == LUSA_TASK_WAIT_EVENT) task->wait_stamp = seen;",
+    "            if (keep_tail == NULL) {",
+    "                keep_head = task;",
+    "            } else {",
+    "                keep_tail->next = task;",
+    "            }",
+    "            keep_tail = task;",
+    "        }",
+    "        task = next;",
+    "    }",
+    "    lusa_task_parked_head = keep_head;",
+    "    lusa_task_parked_tail = keep_tail;",
+    "}",
+    "",
+    "/* Polls a task once.  An awaited child is polled inline first: when it",
+    "   yields or parks, so does its parent (which inherits the child's wait),",
+    "   so only top-level tasks ever sit in the run queue or the parked list. */",
+    "static int lusa_task_poll(LusaTask *task) {",
+    "    for (;;) {",
     "        int rc;",
-    "        if (task->status != 0) continue;",
-    "        if (task->state == 0) ran = ran + 1;",
+    "        LusaTask *child = task->awaiting;",
+    "        if (child != NULL && child->status == 0) {",
+    "            rc = lusa_task_poll(child);",
+    "            if (rc == LUSA_TASK_YIELD) return rc;",
+    "            if (rc == LUSA_TASK_PARK) {",
+    "                task->wait_kind = child->wait_kind;",
+    "                task->wait_value = child->wait_value;",
+    "                task->wait_stamp = child->wait_stamp;",
+    "                return rc;",
+    "            }",
+    "        }",
+    "        task->wait_kind = LUSA_TASK_WAIT_NONE;",
     "        rc = task->step(task);",
     "        if (rc == LUSA_TASK_WAIT) {",
     "            if (task->awaiting == NULL) {",
     "                task->status = 2;",
     '                task->error = "await has no child task";',
-    "            } else {",
-    "                lusa_task_drive(task->awaiting);",
-    "                if (task->awaiting->status == 2) {",
-    "                    task->status = 2;",
-    "                    task->error = task->awaiting->error;",
-    "                } else if (task->status == 0) {",
-    "                    lusa_task_push(task);",
-    "                }",
+    "                return LUSA_TASK_FAIL;",
     "            }",
-    "        } else if (rc == LUSA_TASK_YIELD) {",
-    "            lusa_task_push(task);",
-    "        } else if (rc == LUSA_TASK_FAIL) {",
+    "            continue;",
+    "        }",
+    "        if (rc == LUSA_TASK_YIELD || rc == LUSA_TASK_PARK) return rc;",
+    "        if (rc == LUSA_TASK_FAIL) {",
     "            task->status = 2;",
     '            if (task->error == NULL) task->error = "task failed";',
-    "        } else {",
-    "            task->status = 1;",
+    "            return rc;",
     "        }",
+    "        task->status = 1;",
+    "        return LUSA_TASK_DONE;",
+    "    }",
+    "}",
+    "",
+    "static void lusa_task_dispatch(LusaTask *task) {",
+    "    int rc;",
+    "    lusa_task_poll_stamp = lusa_task_wakes;",
+    "    rc = lusa_task_poll(task);",
+    "    if (rc == LUSA_TASK_YIELD) {",
+    "        lusa_task_push(task);",
+    "    } else if (rc == LUSA_TASK_PARK) {",
+    "        lusa_task_park(task);",
+    "    }",
+    "}",
+    "",
+    "/* Nothing is ready but tasks are parked.  Firmware sleeps until the next",
+    "   interrupt: the check and `wfi` run with interrupts masked, and a pending",
+    "   interrupt still ends `wfi`, so a wake landing in between is not lost.",
+    "   A host program has no interrupts, so its clock jumps to the earliest",
+    "   deadline; with only event waiters left there is no progress to make. */",
+    "static bool lusa_task_idle(void) {",
+    "#if LUSA_TASK_WFI",
+    "    uint32_t state = lusa_interrupts_disable();",
+    "    lusa_task_collect();",
+    "    if (lusa_task_queue_head == NULL) {",
+    '        __asm__ __volatile__("wfi" : : : "memory");',
+    "    }",
+    "    lusa_interrupts_restore(state);",
+    "    return true;",
+    "#else",
+    "    LusaTask *task = lusa_task_parked_head;",
+    "    uint32_t now = lusa_task_ticks;",
+    "    uint32_t best = 0u;",
+    "    bool found = false;",
+    "    while (task != NULL) {",
+    "        if (task->wait_kind == LUSA_TASK_WAIT_TIME) {",
+    "            uint32_t ahead = task->wait_value - now;",
+    "            if (!found || ahead < best) {",
+    "                best = ahead;",
+    "                found = true;",
+    "            }",
+    "        }",
+    "        task = task->next;",
+    "    }",
+    "    if (!found) return false;",
+    "    if ((int32_t)best > 0) lusa_task_ticks = now + best;",
+    "    return true;",
+    "#endif",
+    "}",
+    "",
+    "/* One executor step for a blocking `await`: false when nothing can make",
+    "   progress. */",
+    "static bool lusa_task_turn(void) {",
+    "    LusaTask *task;",
+    "    if (lusa_task_parked_head != NULL) lusa_task_collect();",
+    "    task = lusa_task_pop();",
+    "    if (task != NULL) {",
+    "        if (task->status == 0) lusa_task_dispatch(task);",
+    "        return true;",
+    "    }",
+    "    if (lusa_task_parked_head == NULL) return false;",
+    "    return lusa_task_idle();",
+    "}",
+    "",
+    "/* Blocking `await` outside async code: drives the task inline, absorbing",
+    "   yields; while it is parked, the executor runs the other tasks. */",
+    "static void lusa_task_drive(LusaTask *task) {",
+    "    uint32_t saved = lusa_task_poll_stamp;",
+    "    while (task != NULL && task->status == 0) {",
+    "        if (task->parked) {",
+    "            if (!lusa_task_turn()) {",
+    "                task->status = 2;",
+    '                task->error = "E2012: the awaited task is parked and nothing is left to wake it";',
+    "                lusa_task_collect();",
+    "            }",
+    "            continue;",
+    "        }",
+    "        lusa_task_poll_stamp = lusa_task_wakes;",
+    "        if (lusa_task_poll(task) == LUSA_TASK_PARK) lusa_task_park(task);",
+    "    }",
+    "    lusa_task_poll_stamp = saved;",
+    "}",
+    "",
+    "/* The executor: runs until every task has settled.  Firmware idles in",
+    "   `wfi` while tasks are parked; a host program returns once only event",
+    "   waiters remain.  Returns the number of tasks polled for the first time. */",
+    "static int32_t lusa_task_run(void) {",
+    "    int32_t ran = 0;",
+    "    for (;;) {",
+    "        LusaTask *task;",
+    "        if (lusa_task_parked_head != NULL) lusa_task_collect();",
+    "        task = lusa_task_pop();",
+    "        if (task == NULL) {",
+    "            if (lusa_task_parked_head == NULL || !lusa_task_idle()) break;",
+    "            continue;",
+    "        }",
+    "        if (task->status != 0) continue;",
+    "        if (task->state == 0) ran = ran + 1;",
+    "        lusa_task_dispatch(task);",
     "    }",
     "    return ran;",
+    "}",
+    ""
+}
+
+local TASK_STATUS_RUNTIME = {
+    "static LusaString *lusa_task_status(LusaTask *task) {",
+    "    if (task == NULL || task->status == 2) {",
+    '        return lusa_string_new("failed", 6u);',
+    "    }",
+    "    if (task->status == 1) {",
+    '        return lusa_string_new("done", 4u);',
+    "    }",
+    "    if (task->wait_kind != LUSA_TASK_WAIT_NONE) {",
+    '        return lusa_string_new("parked", 6u);',
+    "    }",
+    "    if (task->state != 0 || task->queued) {",
+    '        return lusa_string_new("running", 7u);',
+    "    }",
+    '    return lusa_string_new("pending", 7u);',
     "}",
     ""
 }
@@ -9062,6 +9204,15 @@ local function emit_try_expr(expr)
     return out
 end
 
+-- True when `await_expr` awaits a fresh `f(...)` call: nothing else holds
+-- that task handle, so its block is recycled once the result has been read.
+local function await_owns_child(await_expr)
+    if await_expr.value.tag ~= "Call" or await_expr.value.fn_name == nil then
+        return false
+    end
+    return emit_async_function_names[await_expr.value.fn_name] == true
+end
+
 emit_expr = function(expr)
     if expr == nil then
         fail(0, 0, "internal: nil expression reached the C emitter")
@@ -9075,13 +9226,26 @@ emit_expr = function(expr)
         -- Outside an async function (top level or a synchronous helper) the
         -- executor drives the lazy task to completion inline.  Bind the
         -- handle once: evaluating a lazy constructor twice would await a
-        -- fresh, unstarted task.
+        -- fresh, unstarted task.  A fresh `f(...)` temporary is read into a
+        -- local and its block recycled.
+        local owned = await_owns_child(borrow expr)
         local target = emit_expr(expr.value)
         local holder = fresh("await_task")
         line("LusaTask *" .. holder .. " = " .. target .. ";")
         line("lusa_task_drive(" .. holder .. ");")
         local result = "lusa_task_result_" .. task_result_suffix(expr.ctype)
             .. "(" .. holder .. ")"
+        if owned then
+            if expr.ctype == "void" then
+                line("lusa_task_release(" .. holder .. ");")
+                return "0"
+            end
+            local value = fresh("await_value")
+            line(c_type(expr.ctype) .. " " .. value .. " = "
+                .. emit_cast_to(expr.ctype, result) .. ";")
+            line("lusa_task_release(" .. holder .. ");")
+            return value
+        end
         return emit_cast_to(expr.ctype, result)
     end
     if tag == "Try" then
@@ -9276,6 +9440,20 @@ emit_expr = function(expr)
         if expr.builtin == "task_yield_now" then
             fail(expr.line, expr.column,
                 "`task.yield_now()` must be used as a standalone statement")
+        end
+        if expr.builtin == "task_wait" or expr.builtin == "task_sleep" then
+            fail(expr.line, expr.column,
+                "`task." .. string.sub(expr.builtin, 6)
+                .. "(...)` must be used as a standalone statement")
+        end
+        if expr.builtin == "task_wake" then
+            return "lusa_task_wake((uint32_t)(" .. emit_expr(expr.args[1]) .. "))"
+        end
+        if expr.builtin == "task_tick" then
+            return "lusa_task_tick()"
+        end
+        if expr.builtin == "task_now" then
+            return "lusa_task_now()"
         end
         if expr.builtin == "task_await" then
             local target = emit_expr(expr.args[1])
@@ -10483,14 +10661,25 @@ local function emit_async_store_result(type_name, value)
     end
 end
 
+local function emit_async_release_child(owned)
+    if owned then
+        line("lusa_task_release(base->awaiting);")
+        line("base->awaiting = NULL;")
+    end
+end
+
 -- Emits one suspension point and returns a C expression for the awaited
--- result.  The lazy child constructor runs only on the first pass; resuming
--- jumps straight to the `case` label below the wait block.
+-- result, plus whether the caller must release the child after reading it.
+-- The lazy child constructor runs only on the first pass; resuming jumps
+-- straight to the `case` label below the wait block.  While the child is
+-- pending the executor polls it inline and parks or requeues this task
+-- with it.
 local function emit_async_await(await_expr)
     if emit_async_for_depth > 0 then
         fail(await_expr.line, await_expr.column,
             "`await` is not supported inside a `for ... in` loop in the native backend; use a `while` loop")
     end
+    local owned = await_owns_child(borrow await_expr)
     emit_async_state = emit_async_state + 1
     local state = emit_async_state
     local child = emit_expr(clone await_expr.value)
@@ -10518,7 +10707,7 @@ local function emit_async_await(await_expr)
     line("}")
     local result = "lusa_task_result_" .. task_result_suffix(await_expr.ctype)
         .. "(base->awaiting)"
-    return emit_cast_to(await_expr.ctype, result)
+    return emit_cast_to(await_expr.ctype, result), owned
 end
 
 local function emit_async_local(stmt)
@@ -10545,8 +10734,9 @@ local function emit_async_local(stmt)
         if value == nil then
             line(entry.cname .. " = " .. default_c(types[i]) .. ";")
         elseif value.tag == "Await" then
-            local result = emit_async_await(value)
+            local result, owned = emit_async_await(value)
             line(entry.cname .. " = " .. emit_cast_to(types[i], result) .. ";")
+            emit_async_release_child(owned)
         else
             local rendered = emit_expr(clone value)
             line(entry.cname .. " = " .. emit_cast_to(types[i], rendered)
@@ -10589,9 +10779,10 @@ local function emit_async_assign(stmt)
             "internal: assignment target `" .. target.name
             .. "` was not declared")
     end
-    local result = emit_async_await(values[1])
+    local result, owned = emit_async_await(values[1])
     local target_type = stmt.target_types[1]
     line(entry.cname .. " = " .. emit_cast_to(target_type, result) .. ";")
+    emit_async_release_child(owned)
 end
 
 local function emit_async_return(stmt)
@@ -10603,12 +10794,14 @@ local function emit_async_return(stmt)
     end
     local value = values[1]
     local rendered
+    local owned = false
     if value.tag == "Await" then
-        rendered = emit_async_await(value)
+        rendered, owned = emit_async_await(value)
     else
         rendered = emit_expr(clone value)
     end
     emit_async_store_result(emit_return_type, rendered)
+    emit_async_release_child(owned)
     line("base->status = 1;")
     line("return LUSA_TASK_DONE;")
 end
@@ -10636,8 +10829,9 @@ local function emit_async_stmt(stmt)
     if tag == "CallStmt" then
         local value = stmt.value
         if value ~= nil and value.tag == "Await" then
-            local result = emit_async_await(value)
+            local result, owned = emit_async_await(value)
             line("(void)(" .. result .. ");")
+            emit_async_release_child(owned)
             return
         end
         if value ~= nil and value.builtin == "task_yield_now" then
@@ -10649,6 +10843,28 @@ local function emit_async_stmt(stmt)
             local state = emit_async_state
             line("base->state = " .. tostring(state) .. ";")
             line("return LUSA_TASK_YIELD;")
+            line("case " .. tostring(state) .. ": ;")
+            return
+        end
+        if value ~= nil and (value.builtin == "task_wait"
+            or value.builtin == "task_sleep") then
+            local helper = "lusa_task_wait_event"
+            local name = "wait"
+            if value.builtin == "task_sleep" then
+                helper = "lusa_task_sleep_for"
+                name = "sleep"
+            end
+            if emit_async_for_depth > 0 then
+                fail(stmt.line, stmt.column,
+                    "`task." .. name .. "(...)` is not supported inside a `for ... in` loop in the native backend; use a `while` loop")
+            end
+            -- The helper records the wait and returns LUSA_TASK_PARK (or
+            -- LUSA_TASK_FAIL for an event out of range).
+            local operand = emit_expr(value.args[1])
+            emit_async_state = emit_async_state + 1
+            local state = emit_async_state
+            line("base->state = " .. tostring(state) .. ";")
+            line("return " .. helper .. "(base, (uint32_t)(" .. operand .. "));")
             line("case " .. tostring(state) .. ": ;")
             return
         end
@@ -11268,15 +11484,27 @@ local function emit_c_impl(ast)
         put(HEAP_RUNTIME[i])
         i = i + 1
     end
-    if emit_async_has then
-        local task_runtime = TASK_RUNTIME
+    if emit_async_has or check_uses_tasks then
+        local task_alloc = TASK_ALLOC_HOSTED
         if ast.no_std then
-            task_runtime = NO_STD_TASK_RUNTIME
+            task_alloc = TASK_ALLOC_NO_STD
         end
         i = 1
-        while i <= #task_runtime do
-            put(task_runtime[i])
+        while i <= #task_alloc do
+            put(task_alloc[i])
             i = i + 1
+        end
+        i = 1
+        while i <= #TASK_RUNTIME do
+            put(TASK_RUNTIME[i])
+            i = i + 1
+        end
+        if not ast.no_std then
+            i = 1
+            while i <= #TASK_STATUS_RUNTIME do
+                put(TASK_STATUS_RUNTIME[i])
+                i = i + 1
+            end
         end
     end
     put("")

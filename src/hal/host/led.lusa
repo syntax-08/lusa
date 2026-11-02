@@ -1,0 +1,14 @@
+-- Host LED (simulation): the pin level is a variable.
+
+local sim_level: bool = false
+
+function ll_configure(): void
+end
+
+function ll_write(on: bool): void
+    sim_level = on
+end
+
+function ll_read(): bool
+    return sim_level
+end

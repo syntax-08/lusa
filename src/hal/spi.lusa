@@ -109,7 +109,7 @@ pub function flush(bus: Spi): void
     end
 end
 
--- Interrupt handler body.
+-- Interrupt handler body.  Wakes the tasks parked on the driver (event 25).
 pub function on_interrupt(): void
     if ll_rx_ready() then
         rx_push(ll_receive())
@@ -118,6 +118,41 @@ pub function on_interrupt(): void
         else
             ll_stop()
             active = false
+        end
+    end
+    task.wake(25)
+end
+
+-- The executor event this driver's interrupt wakes.
+pub function event(): u32
+    return 25
+end
+
+-- Exchanges one byte and returns the oldest byte in the receive ring: the
+-- reply to this byte when no earlier replies are waiting.  Drain earlier
+-- replies with `read` before mixing `transfer` and `transfer_async`.
+pub async function transfer_async(bus: Spi, byte: u32): u32
+    while not transfer(borrow bus, byte) do
+        ll_idle()
+        if tx_len() >= tx_capacity() then
+            task.wait(25)
+        end
+    end
+    while rx_len() == 0 do
+        ll_idle()
+        if rx_len() == 0 then
+            task.wait(25)
+        end
+    end
+    return rx_pop()
+end
+
+-- Waits until every queued byte has been exchanged.
+pub async function flush_async(bus: Spi): void
+    while is_busy(borrow bus) do
+        ll_idle()
+        if is_busy(borrow bus) then
+            task.wait(25)
         end
     end
 end

@@ -152,6 +152,7 @@ pub const E_NUM: &str = "E2008";
 pub const E_IO: &str = "E2009"; // native file I/O failure
 pub const E_PATTERN: &str = "E2010"; // malformed string pattern or replacement
 pub const E_PATTERN_COMPLEX: &str = "E2011"; // bounded matcher budget exhausted
+pub const E_DEADLOCK: &str = "E2012"; // awaited task is parked and nothing can wake it
 
 // user raised
 pub const E_ERROR: &str = "E9000"; // error()

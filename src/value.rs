@@ -248,8 +248,20 @@ pub enum TaskState {
     Failed,
 }
 
+/// What a parked task waits for before the executor polls it again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskWait {
+    /// `task.wait(event)`: runnable once `event` is woken after `stamp`, the
+    /// wake sequence number observed when the poll began.
+    Event { event: u32, stamp: u32 },
+    /// `task.sleep(ticks)`: runnable once the executor clock reaches
+    /// `deadline`.
+    Until { deadline: u32 },
+}
+
 /// A cooperative async task handle.  It owns no OS thread: stepping the task
-/// resumes its private VM until the next `task.yield_now` or completion.
+/// resumes its private VM until the next `task.yield_now`, park, or
+/// completion.
 pub struct TaskObj {
     pub id: u64,
     pub state: TaskState,
@@ -258,6 +270,10 @@ pub struct TaskObj {
     pub error: Option<String>,
     pub started: bool,
     pub queued: bool,
+    /// linked into the executor's parked list
+    pub parked: bool,
+    /// set while the task (or the child it awaits) is parked
+    pub wait: Option<TaskWait>,
     /// call arguments supplied on the first resume
     pub args: Vec<Value>,
 }

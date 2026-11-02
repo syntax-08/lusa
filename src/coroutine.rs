@@ -236,6 +236,14 @@ pub fn resume(
         }
     }
 
+    // A coroutine resumed from inside another one (an awaited child task)
+    // must see the enclosing coroutine's writes, and the enclosing one must
+    // see the child's: flush the outer cells to their scopes now and reload
+    // them once the child suspends.
+    let enclosing = i.coroutine_captures.last().cloned();
+    if let Some(outer) = &enclosing {
+        sync_to_scopes(outer);
+    }
     sync_from_scopes(&target.borrow().capture_env);
 
     let (id, entry, resume_one) = {
@@ -269,6 +277,9 @@ pub fn resume(
     i.active_coroutines.pop();
     let capture_env = i.coroutine_captures.pop().unwrap_or_default();
     sync_to_scopes(&capture_env);
+    if let Some(outer) = &enclosing {
+        sync_from_scopes(outer);
+    }
 
     enum Done {
         Yield(Vec<Value>, bool),

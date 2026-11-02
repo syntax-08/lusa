@@ -778,7 +778,7 @@ fn renode_platforms_wire_the_driver_peripherals() {
     }
 
     let dir = workdir("models");
-    for (target, count) in [(&targets::STM32F4, 0), (&targets::RP2040, 1), (&targets::ESP32C3, 3)] {
+    for (target, count) in [(&targets::STM32F4, 0), (&targets::RP2040, 1), (&targets::ESP32C3, 4)] {
         let lines = target.write_renode_models(&dir).expect("write models");
         assert_eq!(lines.lines().filter(|l| l.starts_with("include @")).count(), count, "{}", target.name);
         for model in target.renode_models {
