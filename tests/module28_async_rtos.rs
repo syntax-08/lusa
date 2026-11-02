@@ -163,9 +163,12 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// Reads a repository file with `\n` line endings, whatever the checkout
+/// uses (Git on Windows checks out CRLF).
 fn read_repo(relative: &str) -> String {
     std::fs::read_to_string(manifest_dir().join(relative))
         .unwrap_or_else(|e| panic!("read {relative}: {e}"))
+        .replace("\r\n", "\n")
 }
 
 /// The example with its STM32F4 handlers replaced by `handlers`.
