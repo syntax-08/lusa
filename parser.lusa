@@ -458,6 +458,15 @@ parse_type = function()
         expect_value(">", "`>` to close the `Result` type")
         return "result<" .. ok .. "," .. err .. ">"
     end
+    -- Module 29: `HashMap<K, V>` is spelled `map<K,V>` like the Rust parser.
+    if (name == "HashMap" or name == "map") and at_value("<") then
+        advance()
+        local key = parse_type()
+        expect_value(",", "`,` between the `HashMap` key and value types")
+        local value = parse_type()
+        expect_value(">", "`>` to close the `HashMap` type")
+        return "map<" .. key .. "," .. value .. ">"
+    end
     if (name == "Option" or name == "option") and at_value("<") then
         advance()
         local inner = parse_type()

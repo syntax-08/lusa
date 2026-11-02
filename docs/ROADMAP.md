@@ -1325,6 +1325,95 @@ stackless state machine, and tasks switch only at `await`.
 - Native async bodies still cannot hold fixed arrays or drop owned locals, so
   buffers come in as pointers.
 
+## Module 29 - Host software ecosystem (shipped in v2.5.0)
+
+Module 29 gives programs that run on Linux, macOS, and Windows the building
+blocks of everyday host software: typed heap collections, file system access,
+and sockets. Every piece runs in the interpreter, the bytecode VM, and native
+C11 builds with the same output, and none of it reaches `#[no_std]` firmware.
+
+### 29.1 Heap collections
+
+- `HashMap<K, V>` is canonicalised to `map<K,V>` by both parsers. Keys are
+  `string`, `i32`, or `u32`; values are `string`, `i32`, `u32`, `f32`, or
+  `bool`. Methods: `insert`, `get` (`Option<V>`), `get_or`,
+  `contains_key`, `remove`, `len`, `is_empty`, `clear`, and `iter`.
+- The native map is an insertion-ordered open-addressing table: entries keep
+  their order, `remove` leaves a tombstone, and growth compacts. Keys and
+  values travel as 64-bit payloads, so one generic runtime serves every
+  instantiation; strings are owned and released with the map. The dynamic
+  engines keep the entries in an inner table, which iterates in insertion
+  order and keeps that order on removal.
+- `String` is a growable text buffer. Natively it is a `LusaString` whose
+  bytes grow in place and whose `obj.size` records the allocation, so
+  `print`, drops, and clones work unchanged; dynamically it is a tagged
+  table. Methods: `push_str`, `push`, `pop`, `len`, `is_empty`, `clear`,
+  `as_str`, `contains`, `starts_with`, `ends_with`.
+- `Vec<T>` gains `get`, `insert`, `remove`, `contains`, and `iter`, built
+  natively on byte-generic rotation helpers that also serve `#[no_std]`.
+- `for k, v in x:iter()` lowers natively to an index loop with borrowed loop
+  variables; dynamically `iter()` returns an iterator over a snapshot.
+- `use lusa::collections::{Vec, HashMap, String}` names the built-in types.
+
+### 29.2 `lusa::fs` and `lusa::net`
+
+- Both are Lusa modules in the bundled crate (`src/std/*.lusa`), spliced in
+  for hosted host programs that name them. They wrap a set of host
+  intrinsics (`__fs_*`, `__net_*`, `__io_ok`, `__io_error`, `__io_eof`)
+  implemented in `src/host.rs` for the dynamic engines and in the native
+  runtime over stdio, POSIX sockets, and Winsock, with a fixed table of 64
+  handles.
+- `lusa::fs`: whole-file `read_to_string`/`write`/`append`, `exists`,
+  `is_dir`, `size`, `create_dir(_all)`, `remove_file`, `remove_dir`, and
+  `File` handles (`open`, `create`, `open_append`, `read_line`,
+  `read_all`, `write_str`, `close`).
+- `lusa::net`: IPv4 TCP (`listen`, `accept`, `connect`, `send`, `recv`,
+  `recv_line`, `peer`, `local_port`, closes) and UDP (`udp_bind`,
+  `send_to`, `recv_from`, `last_sender`, `udp_port`, `close_udp`).
+- Handles are `#[peripheral]` structs: operations borrow them and `close`
+  consumes them. Fallible calls return `Result<T, string>`.
+- The C backend emits each runtime only when used, links Winsock (pragma
+  for MSVC, `-lws2_32` for GNU drivers on Windows), and defines
+  `WIN32_LEAN_AND_MEAN` before `<windows.h>`.
+
+### 29.3 Supporting changes
+
+- Native `tostring` for `i32`, `u32`, `f32`, `bool`, and strings.
+- Fixed: moving a local string into `Some`/`Ok`/`Err`, `Box`, an
+  `unwrap_or` fallback, or a fixed-array literal cleared the local before
+  the constructor read it in native code; `hand_over_moved` copies it into
+  a temporary first.
+- The crate splicer now adds `lusa::hal` only when a host program names it
+  (boards always get it), and the standard modules only when named.
+
+### 29.4 Example, tests, and CI
+
+- `examples/host_http_server.lusa` is an HTTP/1.0 server with a greeting,
+  file serving from a web root, per-path statistics in a `HashMap`, and an
+  access log.
+- `tests/module29_host_software.rs` covers collections, files, and TCP/UDP
+  loopback in all three engines, diagnostics, runtime selection, crate
+  splicing, the constructor fix, and the example answering HTTP requests in
+  the interpreter, the VM, and a native build.
+
+**Acceptance criteria**
+
+- Collections, file operations, and loopback sockets print identical output
+  in the interpreter, the VM, and native builds on Windows, Linux, and macOS.
+- The example server answers `/`, `/files/<name>`, `/stats`, and refuses
+  unsafe file names in every engine.
+- Programs that do not use the new features compile to the same C as before.
+- The full `cargo test --all-targets -- --test-threads=1` suite stays green.
+
+**Risks**
+
+- Sockets are IPv4 and blocking; there is no TLS, no timeouts, and no
+  integration with the Module 28 executor yet.
+- Text crosses engine boundaries as strings, so binary payloads are not
+  supported in the dynamic engines.
+- `HashMap` keys and values are limited to scalars and strings, and
+  `String`/`HashMap` cannot be struct fields yet.
+
 ## Cross-cutting work
 
 - **Single semantics source:** extend `docs/LANGUAGE.md` first, then implement
@@ -1363,6 +1452,7 @@ stackless state machine, and tasks switch only at `await`.
 | v2.2.0 | Hardware interrupts and exception vectors (shipped) | bare and explicit `#[interrupt]` in both front ends, target vector registries and default timer resolution, generated Arm vector tables and RISC-V trap tables, linker `PROVIDE` fallbacks, `interrupts_disable`/`interrupts_enable`/`interrupts_restore` in all engines, Renode TIM2/SysTick/CLINT interrupt boots, module 26 tests |
 | v2.3.0 | Safe, interrupt-driven peripheral drivers (shipped) | `#[peripheral]` move-only tokens in both front ends and all engines (`E1006`), bundled target-aware `lusa::hal` crate with stable line numbers, ring-buffered UART/SPI/I2C drivers for STM32F4, RP2040, ESP32-C3, and host models, new SPI/I2C vectors, Renode loopback/echo devices and repository peripheral models, UART echo and SPI/I2C Renode runs on all three boards, module 27 tests |
 | v2.4.0 | Embedded async executor and cooperative scheduler (shipped) | `task.wait`/`task.wake` events with interrupt-safe wake stamps, `task.sleep`/`task.tick`/`task.now` tick clock, event-driven `task.run()` with `wfi` idling and a host virtual clock, yields and parks propagated through awaited children, blocking `await` with `E2012`, recycled task blocks in the `#[no_std]` arena, `lusa::hal::timer` and `lusa::hal::led`, async UART/SPI/I2C wrappers woken by their interrupts, ESP32-C3 SYSTIMER Renode model, three-task firmware example and scheduler check under Renode on all three boards, module 28 tests |
+| v2.5.0 | Host software ecosystem (shipped) | built-in `HashMap<K, V>` (insertion-ordered native table) and growable `String`, `Vec<T>` `get`/`insert`/`remove`/`contains`/`iter`, `lusa::collections`, `lusa::fs` files, directories, and move-only handles, `lusa::net` TCP/UDP over POSIX and Winsock, native `tostring`, per-use runtime emission, fix for moved strings in native constructors, HTTP server example, module 29 tests |
 
 Each release uses the curated English template with `## Impact Introduction`,
 `## Feature Highlights`, and `## How to Use`, and attaches `lusa-setup.zip`,

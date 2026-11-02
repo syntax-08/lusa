@@ -1,0 +1,141 @@
+-- lusa::net -- TCP and UDP sockets on the host.
+--
+-- Addresses are `"host:port"` strings (`"127.0.0.1:8080"`,
+-- `"localhost:0"`); port 0 asks the system for a free port, which
+-- `local_port` reports.  Calls block until they complete.  Fallible calls
+-- return `Result` with the operating system's reason as the error.  Sockets
+-- are move-only handles (`#[peripheral]`): operations borrow them and the
+-- `close_*` calls consume them.  Data is text: the dynamic engines replace
+-- bytes that are not valid UTF-8.
+
+#[peripheral]
+pub struct TcpListener { handle: i32 }
+
+#[peripheral]
+pub struct TcpStream { handle: i32 }
+
+#[peripheral]
+pub struct UdpSocket { handle: i32 }
+
+-- Listens for TCP connections on `address`.
+pub function listen(address: string): Result<TcpListener, string>
+    local handle: i32 = __net_listen(address)
+    if __io_ok() then
+        local listener: TcpListener = TcpListener{handle: handle}
+        return Ok(listener)
+    end
+    return Err(__io_error())
+end
+
+-- The local port a listener is bound to.
+pub function local_port(listener: TcpListener): u32
+    return __net_port(listener.handle)
+end
+
+-- Waits for the next connection.
+pub function accept(listener: TcpListener): Result<TcpStream, string>
+    local handle: i32 = __net_accept(listener.handle)
+    if __io_ok() then
+        local stream: TcpStream = TcpStream{handle: handle}
+        return Ok(stream)
+    end
+    return Err(__io_error())
+end
+
+-- Opens a TCP connection to `address`.
+pub function connect(address: string): Result<TcpStream, string>
+    local handle: i32 = __net_connect(address)
+    if __io_ok() then
+        local stream: TcpStream = TcpStream{handle: handle}
+        return Ok(stream)
+    end
+    return Err(__io_error())
+end
+
+-- Sends all of `data`; returns the byte count.
+pub function send(stream: TcpStream, data: string): Result<u32, string>
+    local count: u32 = __net_send(stream.handle, data)
+    if __io_ok() then
+        return Ok(count)
+    end
+    return Err(__io_error())
+end
+
+-- Receives up to `max` bytes; an empty string means the peer closed.
+pub function recv(stream: TcpStream, max: u32): Result<string, string>
+    local data: string = __net_recv(stream.handle, max)
+    if __io_ok() then
+        return Ok(data)
+    end
+    return Err(__io_error())
+end
+
+-- Receives one line without its `\n` (or `\r\n`).  `None` means the peer
+-- closed before sending anything more; an empty line is `Some("")`.
+pub function recv_line(stream: TcpStream): Option<string>
+    local line: string = __net_recv_line(stream.handle)
+    if __io_ok() and not __io_eof() then
+        return Some(line)
+    end
+    return None
+end
+
+-- The remote `"ip:port"` of a connection.
+pub function peer(stream: TcpStream): string
+    return __net_peer(stream.handle)
+end
+
+pub function close(stream: TcpStream): void
+    __net_close(stream.handle)
+end
+
+pub function close_listener(listener: TcpListener): void
+    __net_close(listener.handle)
+end
+
+-- Binds a UDP socket to `address`.
+pub function udp_bind(address: string): Result<UdpSocket, string>
+    local handle: i32 = __net_udp_bind(address)
+    if __io_ok() then
+        local socket: UdpSocket = UdpSocket{handle: handle}
+        return Ok(socket)
+    end
+    return Err(__io_error())
+end
+
+pub function udp_port(socket: UdpSocket): u32
+    return __net_port(socket.handle)
+end
+
+-- Sends one datagram to `address`; returns the byte count.
+pub function send_to(socket: UdpSocket, data: string, address: string): Result<u32, string>
+    local count: u32 = __net_send_to(socket.handle, data, address)
+    if __io_ok() then
+        return Ok(count)
+    end
+    return Err(__io_error())
+end
+
+-- Waits for one datagram of up to `max` bytes.  `last_sender` reports
+-- where it came from.
+pub function recv_from(socket: UdpSocket, max: u32): Result<string, string>
+    local data: string = __net_recv_from(socket.handle, max)
+    if __io_ok() then
+        return Ok(data)
+    end
+    return Err(__io_error())
+end
+
+-- The `"ip:port"` that sent the last datagram `recv_from` returned.
+pub function last_sender(socket: UdpSocket): string
+    return __net_peer(socket.handle)
+end
+
+pub function close_udp(socket: UdpSocket): void
+    __net_close(socket.handle)
+end
+
+-- `"host:port"` for `listen`, `connect`, `udp_bind`, and `send_to`.
+pub function address(host: string, port: u32): string
+    return host .. ":" .. tostring(port)
+end

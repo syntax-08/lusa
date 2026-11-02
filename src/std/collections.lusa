@@ -1,0 +1,12 @@
+-- lusa::collections -- the standard heap-backed collections.
+--
+-- `Vec<T>`, `HashMap<K, V>`, and `String` are built into every engine, so
+-- this module declares no items of its own: `use lusa::collections::HashMap`
+-- (and `Vec`, `String`) resolves to the built-in type.
+--
+-- * `Vec<T>`: push, pop, insert, remove, get, contains, len, capacity,
+--   is_empty, reserve, clear, iter.
+-- * `HashMap<K, V>` (keys `string`, `i32`, or `u32`): insert, get, get_or,
+--   contains_key, remove, len, is_empty, clear, iter (insertion order).
+-- * `String`: push_str, push, pop, len, is_empty, clear, as_str, contains,
+--   starts_with, ends_with.

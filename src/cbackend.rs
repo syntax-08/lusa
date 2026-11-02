@@ -491,6 +491,13 @@ fn compile_c_file(
     output: &Path,
     workdir: &Path,
 ) -> Result<(), String> {
+    // Programs using `lusa::net` need Winsock.  MSVC picks it up from a
+    // `#pragma comment(lib, ...)` in the runtime; GNU-style drivers need
+    // the library on the command line.
+    let winsock = cfg!(windows)
+        && std::fs::read_to_string(c_path)
+            .map(|c| c.contains("/* lusa:net */"))
+            .unwrap_or(false);
     match cc.kind {
         CompilerKind::Gnu => {
             let mut command = Command::new(&cc.path);
@@ -501,6 +508,9 @@ fn compile_c_file(
                 .arg("-o")
                 .arg(output)
                 .arg(c_path);
+            if winsock {
+                command.arg("-lws2_32");
+            }
             // libm is required by the C runtime's `powf`.  TCC on Windows has
             // no libm archive, and some Windows GCC/Clang distributions fold
             // math into the CRT; retry without `-lm` if linking rejects it.
@@ -519,6 +529,9 @@ fn compile_c_file(
                         .arg("-o")
                         .arg(output)
                         .arg(c_path);
+                    if winsock {
+                        retry.arg("-lws2_32");
+                    }
                     run_compiler(retry, "C compiler (without -lm)").map_err(|_| first)
                 }
                 Err(e) => Err(e),

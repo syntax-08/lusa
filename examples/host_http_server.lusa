@@ -1,0 +1,144 @@
+-- Module 29 example: a small HTTP/1.0 server on the host.
+--
+--   lusalang run examples/host_http_server.lusa
+--   lusalang run examples/host_http_server.lusa --native
+--
+-- It listens on 127.0.0.1:8080 and answers one request per connection:
+--
+--   GET /              a greeting
+--   GET /files/<name>  the file `<name>` from the `www` directory, read with
+--                      `fs::read_to_string` (a sample `index.html` is written
+--                      at start-up)
+--   GET /stats         how often each path was requested, counted in a
+--                      `HashMap` and rendered with a growable `String`
+--   anything else      404 Not Found
+--
+-- Every request line is appended to `www/access.log`.  MAX_REQUESTS stops
+-- the server after that many requests (0 serves forever);
+-- tests/module29_host_software.rs runs it on a free port with a limit and
+-- checks every response.
+--
+-- Try it with `curl http://127.0.0.1:8080/files/index.html`.
+
+use lusa::collections::HashMap
+use lusa::fs
+use lusa::net
+
+local ADDRESS = "127.0.0.1:8080"
+local ROOT = "www"
+local MAX_REQUESTS: i32 = 0
+
+-- A complete response: status line, headers, and body.
+function response(status: string, kind: string, body: string): string
+    local text: String = "HTTP/1.0 "
+    text:push_str(status)
+    text:push_str("\r\nContent-Type: ")
+    text:push_str(kind)
+    text:push_str("\r\nContent-Length: ")
+    text:push_str(tostring(#body))
+    text:push_str("\r\nConnection: close\r\n\r\n")
+    text:push_str(body)
+    return text:as_str()
+end
+
+-- The target of `GET <target> HTTP/1.x`, or "" for any other request line.
+function request_target(line: string): string
+    local target: string = string.gsub(line, "^GET (%S+) HTTP/1%.%d$", "%1")
+    local slash: i32 = string.find(target, "^/")
+    if slash == 1 then
+        return target
+    end
+    return ""
+end
+
+-- Serves `<root>/<name>`.  Only plain names such as `index.html` are
+-- allowed, so a request cannot leave the directory.
+function file_response(root: string, name: string): string
+    local verdict: string = string.gsub(name, "^[%w_%-]+%.%w+$", "ok")
+    if verdict ~= "ok" then
+        return response("400 Bad Request", "text/plain", "bad file name\n")
+    end
+    match fs::read_to_string(root .. "/" .. name) with
+    | Ok(body) => return response("200 OK", "text/html", body)
+    | Err(reason) => return response("404 Not Found", "text/plain", "no such file\n")
+    end
+    return ""
+end
+
+-- Appends one line to the access log.
+function log_request(root: string, target: string): void
+    match fs::append(root .. "/access.log", target .. "\n") with
+    | Err(reason) => print("log failed:", reason)
+    | _ =>
+    end
+end
+
+match fs::create_dir_all(ROOT) with
+| Err(reason) => print("cannot create the web root:", reason)
+| _ =>
+end
+match fs::write(ROOT .. "/index.html", "<h1>Hello from Lusa</h1>\n") with
+| Err(reason) => print("cannot write the sample page:", reason)
+| _ =>
+end
+
+local listener = net::listen(ADDRESS):unwrap()
+print("listening on " .. ADDRESS)
+
+local hits: HashMap<string, i32> = {}
+local served: i32 = 0
+local running = true
+while running do
+    match net::accept(borrow listener) with
+    | Ok(client) =>
+        local target: string = ""
+        match net::recv_line(borrow client) with
+        | Some(line) => target = request_target(line)
+        | None => target = ""
+        end
+        -- The headers end with an empty line.
+        local reading = true
+        while reading do
+            match net::recv_line(borrow client) with
+            | Some(header) => reading = #header > 0
+            | None => reading = false
+            end
+        end
+
+        local count: i32 = hits:get_or(target, 0) + 1
+        hits:insert(clone target, count)
+        local file_start: i32 = string.find(target, "^/files/")
+        local reply: string = ""
+        if target == "/" then
+            reply = response("200 OK", "text/plain", "Hello from Lusa!\n")
+        elseif target == "/stats" then
+            local report: String = ""
+            for path, seen in hits:iter() do
+                report:push_str(path)
+                report:push_str(" ")
+                report:push_str(tostring(seen))
+                report:push_str("\n")
+            end
+            reply = response("200 OK", "text/plain", report:as_str())
+        elseif file_start == 1 then
+            local name: string = string.gsub(target, "^/files/", "")
+            reply = file_response(ROOT, name)
+        else
+            reply = response("404 Not Found", "text/plain", "not found\n")
+        end
+        match net::send(borrow client, reply) with
+        | Err(reason) => print("send failed:", reason)
+        | _ =>
+        end
+        net::close(client)
+        log_request(ROOT, target)
+
+        served = served + 1
+        if MAX_REQUESTS > 0 and served >= MAX_REQUESTS then
+            running = false
+        end
+    | Err(reason) => print("accept failed:", reason)
+    end
+end
+net::close_listener(listener)
+print("served " .. tostring(served) .. " requests")

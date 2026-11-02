@@ -507,6 +507,13 @@ impl Parser {
             self.expect(TK::Gt, "`>` to close the `Result` type")?;
             return Ok(format!("result<{ok},{err}>"));
         }
+        if matches!(name.as_str(), "HashMap" | "map") && self.eat(TK::Lt) {
+            let key = self.parse_type_annotation()?;
+            self.expect(TK::Comma, "`,` between the `HashMap` key and value types")?;
+            let value = self.parse_type_annotation()?;
+            self.expect(TK::Gt, "`>` to close the `HashMap` type")?;
+            return Ok(format!("map<{key},{value}>"));
+        }
         if matches!(name.as_str(), "Option" | "option") && self.eat(TK::Lt) {
             let inner = self.parse_type_annotation()?;
             self.expect(TK::Gt, "`>` to close the `Option` type")?;

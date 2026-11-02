@@ -742,9 +742,10 @@ pub fn eval_method(
                     }
                 }
                 return interp.sum_method_call(&t, name, argv, span);
-            } else if Interp::is_vec_method(name) {
-                // `Vec<T>` is a 0-based table in the dynamic engines; the
-                // vector surface is a fallback when no real field shadows it.
+            } else if crate::collections::handles(&t, name) {
+                // `Vec<T>` is a 0-based table in the dynamic engines and
+                // `String`/`HashMap` are tagged tables; their surfaces are a
+                // fallback when no real field shadows them.
                 let mut argv = Vec::new();
                 let n = args.len();
                 for (i, e) in args.iter().enumerate() {
@@ -757,7 +758,7 @@ pub fn eval_method(
                         argv.push(v);
                     }
                 }
-                return interp.vec_method_call(&t, name, argv, span);
+                return crate::collections::call(interp, &t, name, argv, span);
             } else {
                 return Err(LusaError::new(
                     E_CALL,

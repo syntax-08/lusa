@@ -53,7 +53,10 @@ event-driven executor: tasks park on `task.wait` events and `task.sleep`
 deadlines, interrupt handlers wake them, the CPU sleeps in `wfi` in between,
 and `lusa::hal::timer` plus async driver wrappers such as
 `uart::read_async` let several tasks share one microcontroller without an
-RTOS kernel.
+RTOS kernel. Module 29 rebalances toward the host: built-in
+`HashMap<K, V>` and growable `String` collections, more `Vec<T>` methods,
+`lusa::fs` for files and directories, and `lusa::net` for TCP and UDP
+sockets, all identical in the interpreter, the VM, and native builds.
 
 ```
 lusa> local t = {1, 2, 3}
@@ -152,6 +155,7 @@ See [`examples/`](examples/):
 | `interrupt_driven_timer.lusa` | STM32F4 TIM2 interrupt and critical sections |
 | `interrupt_uart_echo.lusa` | STM32F4 interrupt-driven UART echo server on `lusa::hal` |
 | `async_multitasking_firmware.lusa` | STM32F4 tasks: timer LED blinker, UART echo console, event-driven reporter |
+| `host_http_server.lusa` | HTTP/1.0 server on `lusa::net`: files via `lusa::fs`, stats in a `HashMap` |
 | `dynamic_heap.lusa`       | `Vec<T>` growth/pop/clear and `Box<T>` owned pointers |
 | `error_handling.lusa`     | `Result`/`Option`, combinators, `?`, and `match` arms |
 | `async_cooperative.lusa`  | lazy tasks, `await`, `task.run`, and postfix `.await` |
@@ -1592,6 +1596,115 @@ and a scheduler check on STM32F4, RP2040, and ESP32-C3. Limits: wake events
 are signals, not counters; the timers assume the reset clock trees; and native
 async bodies still take buffers as pointers rather than fixed-array locals.
 
+### Host software: collections, files, and sockets (Module 29)
+
+Programs that run on Linux, macOS, or Windows get typed heap collections,
+file system access, and sockets. Everything below behaves the same in the
+interpreter, the VM, and native builds.
+
+**Collections.** `HashMap<K, V>` and `String` join `Vec<T>` as built-in,
+heap-backed types released by RAII (`use lusa::collections::HashMap` names
+them explicitly):
+
+```lusa
+local ages: HashMap<string, i32> = {}
+ages:insert("ada", 36)
+ages:insert("grace", 85)
+print(ages:get("ada"), ages:get_or("bob", 0), ages:contains_key("grace"))
+for name, age in ages:iter() do        -- insertion order
+    print(name, age)
+end
+
+local text: String = "lusa"
+text:push_str(" ")
+text:push_str(tostring(2.5))
+print(text, text:len())                -- lusa 2.5 8
+
+local v: Vec<i32> = [10, 30]
+v:insert(1, 20)
+print(v:get(1), v:remove(0), v:contains(30))
+for i, value in v:iter() do
+    print(i, value)
+end
+```
+
+| type | methods |
+|------|---------|
+| `HashMap<K, V>` (keys `string`/`i32`/`u32`; values `string`/`i32`/`u32`/`f32`/`bool`) | `insert`, `get` → `Option<V>`, `get_or`, `contains_key`, `remove`, `len`, `is_empty`, `clear`, `iter` |
+| `String` | `push_str`, `push`, `pop`, `len`, `is_empty`, `clear`, `as_str`, `contains`, `starts_with`, `ends_with` |
+| `Vec<T>` (added) | `get` → `Option<T>`, `insert`, `remove`, `contains`, `iter` |
+
+A `HashMap` iterates in insertion order in every engine, and natively it is
+an insertion-ordered open-addressing table. A `String` grows its bytes in
+place. Native builds also gain `tostring` for scalars and strings.
+
+**`lusa::fs`.** Whole-file helpers, directories, and move-only `File`
+handles; fallible calls return `Result<T, string>` with the operating
+system's reason:
+
+```lusa
+use lusa::fs
+
+fs::create_dir_all("out/logs")
+fs::write("out/logs/today.txt", "first\n")
+fs::append("out/logs/today.txt", "second\n")
+match fs::open("out/logs/today.txt") with
+| Ok(file) =>
+    local more = true
+    while more do
+        match fs::read_line(borrow file) with
+        | Some(line) => print(line)
+        | None => more = false
+        end
+    end
+    fs::close(file)                    -- consumes the handle
+| Err(reason) => print("cannot open:", reason)
+end
+```
+
+`read_to_string`, `write`, `append`, `exists`, `is_dir`, `size`,
+`create_dir`, `create_dir_all`, `remove_file`, `remove_dir`, `open`,
+`create`, `open_append`, `read_line`, `read_all`, `write_str`, `close`.
+
+**`lusa::net`.** Blocking IPv4 TCP and UDP sockets on POSIX and Winsock.
+Addresses are `"host:port"` strings, port 0 binds a free port, and
+`recv_line` reads one text line:
+
+```lusa
+use lusa::net
+
+local listener = net::listen("127.0.0.1:0"):unwrap()
+local port = net::local_port(borrow listener)
+local client = net::connect(net::address("127.0.0.1", port)):unwrap()
+local server = net::accept(borrow listener):unwrap()
+net::send(borrow client, "ping\n")
+print(net::recv_line(borrow server))   -- Some(ping)
+```
+
+TCP: `listen`, `accept`, `connect`, `send`, `recv`, `recv_line`, `peer`,
+`local_port`, `close`, `close_listener`. UDP: `udp_bind`, `send_to`,
+`recv_from`, `last_sender`, `udp_port`, `close_udp`. `File`, `TcpListener`,
+`TcpStream`, and `UdpSocket` are `#[peripheral]` tokens: lend them with
+`borrow`, and a use after `close` is `E1001`.
+
+`examples/host_http_server.lusa` puts it together: an HTTP/1.0 server that
+serves files from a web root, counts requests per path in a `HashMap`,
+renders `/stats` with a `String`, and appends an access log.
+
+```sh
+lusalang run examples/host_http_server.lusa             # 127.0.0.1:8080
+lusalang run examples/host_http_server.lusa --native
+curl http://127.0.0.1:8080/stats
+cargo test --test module29_host_software -- --test-threads=1
+```
+
+The C backend emits the map, string-buffer, and I/O runtimes only when a
+program uses them and links Winsock on Windows when it uses `lusa::net`.
+Limits: these features need the hosted runtime (`#[no_std]` reports
+`E0312`); a native `HashMap` starts from an empty `{}`; `String` and
+`HashMap` cannot be struct fields yet; sockets are blocking IPv4; and the
+dynamic engines carry text as UTF-8.
+
 ### Host compiler discovery
 
 `--cc` → `LUSA_CC` → `CC` → `cc`/`gcc`/`clang`/`tcc`/`cl` on `PATH` → Visual
@@ -1747,6 +1860,10 @@ Near-term milestones:
   UART, SPI, and I2C wrappers woken by their interrupts; recycled task blocks
   in the `#[no_std]` arena; an ESP32-C3 SYSTIMER Renode model; and a
   three-task multitasking firmware example.
+- **v2.5.0 (shipped):** built-in `HashMap<K, V>` and growable `String`,
+  `Vec<T>` `get`/`insert`/`remove`/`contains`/`iter`, `lusa::fs` files,
+  directories, and handles, `lusa::net` TCP and UDP sockets, native
+  `tostring`, and an HTTP server example.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of

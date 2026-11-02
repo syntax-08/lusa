@@ -63,8 +63,19 @@ Download `lusa-setup.zip` or the platform tarball.
 
 ## Current release
 
-The v2.4.0 body is [`.github/release-notes/v2.4.0.md`](../.github/release-notes/v2.4.0.md).
-It follows this structure and documents the event-driven executor behind
+The v2.5.0 body is [`.github/release-notes/v2.5.0.md`](../.github/release-notes/v2.5.0.md).
+It follows this structure and documents the host software ecosystem: the
+built-in `HashMap<K, V>` and growable `String`, the new `Vec<T>` methods
+(`get`, `insert`, `remove`, `contains`, `iter`), `lusa::collections`,
+`lusa::fs` (whole-file helpers, directories, and move-only `File` handles),
+`lusa::net` (TCP listeners and streams, UDP sockets, line reads), native
+`tostring`, runtime selection and Winsock linking in the C backend, the fix
+for moved strings in native constructors, the
+`examples/host_http_server.lusa` HTTP server, and the module 29 suite.
+
+The v2.4.0 body remains at
+[`.github/release-notes/v2.4.0.md`](../.github/release-notes/v2.4.0.md) and
+documents the event-driven executor behind
 `task.run()` (`task.wait`/`task.wake` events, `task.sleep`/`task.tick`/
 `task.now` on the tick clock, `wfi` idling on firmware and a virtual clock on
 the host, yields and parks propagated through awaited children, blocking

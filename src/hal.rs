@@ -29,6 +29,9 @@ const SPI: &str = include_str!("hal/spi.lusa");
 const I2C: &str = include_str!("hal/i2c.lusa");
 const TIMER: &str = include_str!("hal/timer.lusa");
 const LED: &str = include_str!("hal/led.lusa");
+const COLLECTIONS: &str = include_str!("std/collections.lusa");
+const FS: &str = include_str!("std/fs.lusa");
+const NET: &str = include_str!("std/net.lusa");
 
 /// Every driver owns a 64-byte receive ring and a 64-byte transmit ring.
 const DRIVER_RINGS: &[(&str, u32)] = &[("rx", 64), ("tx", 64)];
@@ -134,16 +137,37 @@ fn render_plain(out: &mut String, name: &str, common: &str, backend: &str) {
 /// Multi-line source of the `lusa` crate for `family`, or `None` when the
 /// family ships no drivers.
 pub fn crate_source(family: &str) -> Option<String> {
+    crate_source_for(family, true, &[])
+}
+
+/// The standard modules of the host crate (Module 29), which need an
+/// operating system.
+pub const STD_MODULES: &[&str] = &["collections", "fs", "net"];
+
+/// Like [`crate_source`], choosing the parts: `hal` adds the drivers, and
+/// `std_modules` names the [`STD_MODULES`] to add (host family only).
+pub fn crate_source_for(family: &str, hal: bool, std_modules: &[&str]) -> Option<String> {
     let family = FAMILIES.iter().find(|candidate| candidate.name == family)?;
-    let mut out = String::from("pub mod lusa {\npub mod hal {\n");
-    out.push_str(family.board);
-    out.push('\n');
-    render_driver(&mut out, "uart", UART, &family.uart);
-    render_driver(&mut out, "spi", SPI, &family.spi);
-    render_driver(&mut out, "i2c", I2C, &family.i2c);
-    render_plain(&mut out, "timer", TIMER, family.timer);
-    render_plain(&mut out, "led", LED, family.led);
-    out.push_str("}\n}\n");
+    let mut out = String::from("pub mod lusa {\n");
+    if hal {
+        out.push_str("pub mod hal {\n");
+        out.push_str(family.board);
+        out.push('\n');
+        render_driver(&mut out, "uart", UART, &family.uart);
+        render_driver(&mut out, "spi", SPI, &family.spi);
+        render_driver(&mut out, "i2c", I2C, &family.i2c);
+        render_plain(&mut out, "timer", TIMER, family.timer);
+        render_plain(&mut out, "led", LED, family.led);
+        out.push_str("}\n");
+    }
+    if family.name == "host" {
+        for (name, source) in [("collections", COLLECTIONS), ("fs", FS), ("net", NET)] {
+            if std_modules.contains(&name) {
+                render_plain(&mut out, name, source, "");
+            }
+        }
+    }
+    out.push_str("}\n");
     Some(out)
 }
 

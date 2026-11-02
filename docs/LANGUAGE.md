@@ -613,6 +613,119 @@ local out = json.encode({ name = "game", score = 12.5 })
 
 ---
 
+### Collections - `HashMap<K, V>`, `String`, and `Vec<T>` (Module 29)
+
+`HashMap<K, V>`, `String`, and `Vec<T>` are built-in, heap-backed types in
+every engine; `use lusa::collections::HashMap` (or `Vec`, `String`) names
+them explicitly but is not required. A typed local builds them from its
+initializer:
+
+```lusa
+local ages: HashMap<string, i32> = {}     -- an empty map
+local text: String = "lusa"               -- a buffer holding a copy of the text
+local values: Vec<i32> = [1, 2]
+```
+
+`HashMap<K, V>` keys are `string`, `i32`, or `u32`; values are `string`,
+`i32`, `u32`, `f32`, or `bool`.
+
+| method | result |
+|---|---|
+| `insert(k, v)` | stores `v`, replacing any earlier value; the key keeps its position |
+| `get(k)` | `Some(copy of the value)` or `None` |
+| `get_or(k, fallback)` | the value, or `fallback` |
+| `contains_key(k)` | `bool` |
+| `remove(k)` | `true` when the key was present |
+| `len()`, `is_empty()`, `clear()` | size queries and reset |
+| `iter()` | `for key, value in map:iter() do`, in insertion order |
+
+Iteration follows insertion order in every engine; removing a key keeps the
+order of the others, and re-inserting it appends it at the end. A key that
+is not a string or an integer is `E2007` in the dynamic engines.
+
+`String` is a growable text buffer, while `string` stays immutable:
+
+| method | result |
+|---|---|
+| `push_str(text)` | appends a `string` or `String` |
+| `push(code)` | appends one ASCII byte (`E2005` outside 0-127 in the dynamic engines) |
+| `pop()` | removes and returns the last byte code (`0` when empty) |
+| `len()`, `is_empty()`, `clear()` | length in bytes, emptiness, reset |
+| `as_str()` | an owned `string` copy of the text |
+| `contains(t)`, `starts_with(t)`, `ends_with(t)` | substring tests |
+
+`print(s)` and `tostring(s)` show the text. `Vec<T>` adds to its Module 20
+methods:
+
+| method | result |
+|---|---|
+| `get(i)` | `Some(copy of v[i])`, or `None` when `i` is out of range |
+| `insert(i, v)` | inserts at `0 <= i <= len()`, shifting later elements up |
+| `remove(i)` | removes and returns `v[i]`, shifting later elements down |
+| `contains(v)` | membership for scalar and string elements |
+| `iter()` | `for i, value in v:iter() do`, with 0-based indices |
+
+An out-of-range `insert` or `remove` raises `E2006`. `iter()` only drives a
+`for ... in` loop over a named collection; the dynamic engines iterate over
+a snapshot taken when the loop starts.
+
+### Host I/O - `lusa::fs` and `lusa::net` (Module 29)
+
+The bundled crate gives programs running on Linux, macOS, or Windows file
+and socket access. Both modules are spliced in when a hosted program names
+them; `#[no_std]` programs and board targets do not have them. Fallible
+calls return `Result<T, string>` whose error carries the operating system's
+reason, and handles are `#[peripheral]` tokens: operations borrow them and
+`close` consumes them, so a use after `close` is `E1001`.
+
+```lusa
+use lusa::fs
+
+match fs::read_to_string("notes.txt") with
+| Ok(text) => print(#text)
+| Err(reason) => print("cannot read:", reason)
+end
+```
+
+| `lusa::fs` | result |
+|---|---|
+| `read_to_string(path)` | `Result<string, string>` |
+| `write(path, text)`, `append(path, text)` | `Result<u32, string>` (bytes written); `write` creates or truncates |
+| `exists(path)`, `is_dir(path)` | `bool` |
+| `size(path)` | `Result<u32, string>` |
+| `create_dir(path)`, `create_dir_all(path)` | `Result<bool, string>` |
+| `remove_file(path)`, `remove_dir(path)` | `Result<bool, string>`; `remove_dir` needs an empty directory |
+| `open(path)`, `create(path)`, `open_append(path)` | `Result<File, string>` for reading, truncating writes, or appends |
+| `read_line(file)` | `Some(line)` without its line ending, or `None` at the end |
+| `read_all(file)` | `Result<string, string>`: the rest of the file |
+| `write_str(file, text)` | `Result<u32, string>` |
+| `close(file)` | consumes the handle |
+
+| `lusa::net` | result |
+|---|---|
+| `listen(address)` | `Result<TcpListener, string>`; port 0 binds a free port |
+| `local_port(listener)` | `u32` |
+| `accept(listener)` | `Result<TcpStream, string>`, waiting for a connection |
+| `connect(address)` | `Result<TcpStream, string>` |
+| `send(stream, data)` | `Result<u32, string>`; sends all of `data` |
+| `recv(stream, max)` | `Result<string, string>`: up to `max` bytes, `""` once the peer closed |
+| `recv_line(stream)` | `Some(line)` without `\n`/`\r\n`, `Some("")` for an empty line, `None` once the peer closed |
+| `peer(stream)` | the remote `"ip:port"` |
+| `close(stream)`, `close_listener(listener)` | consume the handle |
+| `udp_bind(address)` | `Result<UdpSocket, string>` |
+| `udp_port(socket)` | `u32` |
+| `send_to(socket, data, address)` | `Result<u32, string>`: one datagram |
+| `recv_from(socket, max)` | `Result<string, string>`: one datagram |
+| `last_sender(socket)` | the `"ip:port"` of the last datagram |
+| `close_udp(socket)` | consumes the handle |
+| `address(host, port)` | `"host:port"` |
+
+Addresses are IPv4 `"host:port"` strings (`"127.0.0.1:8080"`,
+`"localhost:0"`), and every call blocks until it completes. The dynamic
+engines carry data as UTF-8 text and replace invalid bytes.
+`examples/host_http_server.lusa` is an HTTP/1.0 server built from these
+pieces; section 9.20 describes the native runtime.
+
 ## 7. Error-code table
 
 Codes `E{category}{n}`, like rustc:
@@ -2414,7 +2527,59 @@ lusalang build examples/async_multitasking_firmware.lusa --target stm32f4
 cargo test --test module28_async_rtos -- --test-threads=1 --nocapture
 ```
 
-### 9.20 Native subset limits
+### 9.20 Host collections and I/O (Module 29)
+
+Both parsers spell `HashMap<K, V>` as `map<K,V>`; `String` keeps its name.
+The C backend lowers the section 6 surface without per-type helpers:
+
+- `HashMap<K, V>` is a `LusaMap *`: an entries array in insertion order plus
+  an open-addressing index (`-1` empty, `-2` removed). Keys and values are
+  64-bit payloads tagged with `LUSA_ELEM_*` kinds (integers, `f32` bits,
+  booleans, or an owned `LusaString *`), so one runtime serves every
+  instantiation. `remove` leaves a tombstone that growth compacts. `get`
+  builds the program's `Option<V>` through `lusa_map_get_option`.
+- `String` is a `LusaString *`. Appends grow the bytes in place and record
+  the allocation in `obj.size`, doubling the capacity, so printing, moves,
+  clones, and drops are the `string` ones. A `String` initializer always
+  starts from its own heap copy.
+- `Vec:get/insert/remove/contains` use byte-generic helpers
+  (`lusa_vec_rotate_in`/`_out`, `lusa_vec_contains_bytes`) that also build
+  under `#[no_std]`. `get` and `insert` evaluate the index twice.
+- `for k, v in x:iter()` becomes an index loop over the vector or the map's
+  live entries; the loop variables are borrowed views, so nothing is cloned
+  or dropped per iteration.
+- `tostring(x)` for `i32`, `u32`, `f32`, `bool`, and strings returns an owned
+  string formatted like `print`.
+- `lusa::fs` and `lusa::net` call host intrinsics (`__fs_*`, `__net_*`,
+  `__io_ok`, `__io_error`, `__io_eof`) that the checker types from a fixed
+  table and the runtime implements as `lusa_host_*` over stdio, POSIX
+  sockets, and Winsock, with up to 64 open handles. The dynamic engines
+  implement the same intrinsics in `src/host.rs`.
+- Each runtime is appended only when the program uses it. A program using
+  sockets carries a `/* lusa:net */` marker: MSVC links Winsock through
+  `#pragma comment(lib, "ws2_32.lib")`, and GNU-style drivers on Windows get
+  `-lws2_32`. The coroutine runtime defines `WIN32_LEAN_AND_MEAN` before
+  `<windows.h>` so `<winsock2.h>` can follow it.
+- `HashMap`, `String`, the host intrinsics, and native `tostring` report
+  `E0312` in `#[no_std]` programs. `String` and `HashMap` cannot be struct
+  fields yet; a native `HashMap` initializer must be an empty `{}`.
+
+Moving a local string into a constructor (`Some(line)`, `Ok(text)`,
+`Box(name)`, an `unwrap_or` fallback, or a fixed-array literal) copies it
+into a temporary before the local is cleared, so the constructor reads the
+value rather than `NULL`.
+
+`tests/module29_host_software.rs` checks the collections, files, and loopback
+TCP/UDP in all three engines, the diagnostics and runtime selection, and
+`examples/host_http_server.lusa` answering HTTP requests in the interpreter,
+the VM, and a native build.
+
+```sh
+lusalang run examples/host_http_server.lusa --native
+cargo test --test module29_host_software -- --test-threads=1
+```
+
+### 9.21 Native subset limits
 
 Supported: typed and inferred locals, named typed functions, calls, string and
 table literals, fixed-size `[T; N]` arrays and local array literals, nested keyed
@@ -2425,7 +2590,8 @@ assignments, globals, `print`, `clone`, `borrow`, `move`, the compile-time
 borrow checker, `unsafe` blocks, static `struct` declarations in brace and bare
 form, `#[packed]`/`#[repr(align(N))]` representation attributes,
 `#[peripheral]` resource tokens and the bundled `lusa::hal` drivers
-(sections 9.18 and 9.19),
+(sections 9.18 and 9.19), `HashMap<K, V>`, `String`, the Module 29 `Vec<T>`
+methods, `lusa::fs`, `lusa::net`, and `tostring` (section 9.20),
 `#[no_std]`/`#[entry]`/`#[global_allocator]`/`#[link_section = "..."]`/
 `#[interrupt]`/`#[interrupt("VECTOR")]`
 (sections 9.12, 9.13, and 9.17), struct

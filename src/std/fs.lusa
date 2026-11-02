@@ -1,0 +1,146 @@
+-- lusa::fs -- files and directories on the host.
+--
+-- Fallible calls return `Result`: `Ok(value)` or `Err(message)`, where the
+-- message names the path and the operating system's reason.  A `File` is a
+-- move-only handle (`#[peripheral]`): `read_line`, `read_all`, and
+-- `write_str` borrow it, and `close` consumes it, so a closed file cannot be
+-- used again.  The `__fs_*` intrinsics live in the runtime of every engine.
+
+#[peripheral]
+pub struct File { handle: i32 }
+
+-- The whole file as text.
+pub function read_to_string(path: string): Result<string, string>
+    local text: string = __fs_read(path)
+    if __io_ok() then
+        return Ok(text)
+    end
+    return Err(__io_error())
+end
+
+-- Creates or truncates `path`, writes `contents`, and returns the byte count.
+pub function write(path: string, contents: string): Result<u32, string>
+    local count: u32 = __fs_write(path, contents, false)
+    if __io_ok() then
+        return Ok(count)
+    end
+    return Err(__io_error())
+end
+
+-- Appends `contents` to `path` (creating it) and returns the byte count.
+pub function append(path: string, contents: string): Result<u32, string>
+    local count: u32 = __fs_write(path, contents, true)
+    if __io_ok() then
+        return Ok(count)
+    end
+    return Err(__io_error())
+end
+
+pub function exists(path: string): bool
+    return __fs_exists(path)
+end
+
+pub function is_dir(path: string): bool
+    return __fs_is_dir(path)
+end
+
+-- Size of a file in bytes.
+pub function size(path: string): Result<u32, string>
+    local bytes: u32 = __fs_size(path)
+    if __io_ok() then
+        return Ok(bytes)
+    end
+    return Err(__io_error())
+end
+
+-- Creates one directory; its parent must exist.
+pub function create_dir(path: string): Result<bool, string>
+    local made: bool = __fs_mkdir(path, false)
+    if __io_ok() then
+        return Ok(made)
+    end
+    return Err(__io_error())
+end
+
+-- Creates a directory and every missing parent.
+pub function create_dir_all(path: string): Result<bool, string>
+    local made: bool = __fs_mkdir(path, true)
+    if __io_ok() then
+        return Ok(made)
+    end
+    return Err(__io_error())
+end
+
+pub function remove_file(path: string): Result<bool, string>
+    local removed: bool = __fs_remove(path, false)
+    if __io_ok() then
+        return Ok(removed)
+    end
+    return Err(__io_error())
+end
+
+-- Removes an empty directory.
+pub function remove_dir(path: string): Result<bool, string>
+    local removed: bool = __fs_remove(path, true)
+    if __io_ok() then
+        return Ok(removed)
+    end
+    return Err(__io_error())
+end
+
+-- Mode 0 reads, 1 creates or truncates, 2 appends.
+function open_mode(path: string, mode: u32): Result<File, string>
+    local handle: i32 = __fs_open(path, mode)
+    if __io_ok() then
+        local file: File = File{handle: handle}
+        return Ok(file)
+    end
+    return Err(__io_error())
+end
+
+-- Opens an existing file for reading.
+pub function open(path: string): Result<File, string>
+    return open_mode(path, 0)
+end
+
+-- Creates or truncates a file for writing.
+pub function create(path: string): Result<File, string>
+    return open_mode(path, 1)
+end
+
+-- Opens a file for appending, creating it if needed.
+pub function open_append(path: string): Result<File, string>
+    return open_mode(path, 2)
+end
+
+-- The next line without its line ending, or `None` at the end of the file.
+pub function read_line(file: File): Option<string>
+    local line: string = __fs_read_line(file.handle)
+    if __io_ok() and not __io_eof() then
+        return Some(line)
+    end
+    return None
+end
+
+-- Everything from the current position to the end of the file.
+pub function read_all(file: File): Result<string, string>
+    local text: string = __fs_read_all(file.handle)
+    if __io_ok() then
+        return Ok(text)
+    end
+    return Err(__io_error())
+end
+
+-- Writes `text` and returns the byte count.
+pub function write_str(file: File, text: string): Result<u32, string>
+    local count: u32 = __fs_write_handle(file.handle, text)
+    if __io_ok() then
+        return Ok(count)
+    end
+    return Err(__io_error())
+end
+
+-- Closes the file; the token is consumed.
+pub function close(file: File): void
+    __fs_close(file.handle)
+end

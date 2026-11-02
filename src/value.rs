@@ -420,6 +420,9 @@ impl Value {
             Value::Number(n) => format_number(*n),
             Value::Str(s) => s.to_string(),
             Value::Table(t) => {
+                if let Some(text) = crate::collections::string_text(self) {
+                    return text.to_string();
+                }
                 if let Some((_, tag, payload)) = self.sum_parts() {
                     match tag {
                         "ok" => return format!("Ok({})", payload.fmt_value()),
@@ -674,6 +677,25 @@ impl TableObj {
             n -= 1;
         }
         n
+    }
+
+    /// Removes `key`, keeping the insertion order of the other entries
+    /// (`HashMap:remove`, `Vec:remove`).  Returns the removed value.
+    pub fn remove(&self, key: &Value) -> Option<Value> {
+        let i = self.index_of(key)?;
+        let mut cell = self.cell.borrow_mut();
+        let (_, slot) = cell.entries.remove(i);
+        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (index, (k, _)) in cell.entries.iter().enumerate() {
+            if let Some(h) = key_hash_loose(k) {
+                by_hash.entry(h).or_default().push(index);
+            }
+        }
+        cell.by_hash = by_hash;
+        match slot {
+            SlotV::Set(v) => Some(v),
+            SlotV::Moved(_) => None,
+        }
     }
 
     /// clears all slots (reserved for future stdlib pieces)

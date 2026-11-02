@@ -40,11 +40,32 @@ pub fn expand_modules_for(
 ) -> LResult<String> {
     let tokens = lexer::lex(src)?;
     let inject = mentions_lusa_crate(&tokens);
-    match expand_once(src, &tokens, base, root_file, target, inject) {
+    // The drivers come along when the root names `lusa::hal` or the target is
+    // a board; a hosted host program that only uses `lusa::fs` and friends
+    // does not need them (and the C backend cannot build their module state
+    // outside `#[no_std]`).
+    // Likewise, only the standard modules the root names are spliced, so a
+    // program using `lusa::collections` does not link the socket runtime.
+    let glob = mentions_module(&tokens, "*");
+    let hal = !target.is_host() || glob || mentions_module(&tokens, "hal");
+    let std_modules: Vec<&str> = crate::hal::STD_MODULES
+        .iter()
+        .copied()
+        .filter(|name| glob || mentions_module(&tokens, name))
+        .collect();
+    match expand_once(src, &tokens, base, root_file, target, inject, hal, &std_modules) {
         // A file module used `lusa::` although the root did not mention it.
-        Err((_, true)) if !inject => {
-            expand_once(src, &tokens, base, root_file, target, true).map_err(|(err, _)| err)
-        }
+        Err((_, true)) if !inject => expand_once(
+            src,
+            &tokens,
+            base,
+            root_file,
+            target,
+            true,
+            true,
+            crate::hal::STD_MODULES,
+        )
+        .map_err(|(err, _)| err),
         result => result.map_err(|(err, _)| err),
     }
 }
@@ -65,6 +86,19 @@ fn mentions_lusa_crate(tokens: &[Token]) -> bool {
         }
     }
     mentioned
+}
+
+/// True when the root names `lusa::<module>` (`"*"` matches `lusa::*`).
+fn mentions_module(tokens: &[Token], module: &str) -> bool {
+    tokens.windows(3).any(|w| {
+        is_name(&w[0], "lusa")
+            && matches!(w[1].kind, TK::ColonColon)
+            && if module == "*" {
+                matches!(w[2].kind, TK::Star)
+            } else {
+                is_name(&w[2], module)
+            }
+    })
 }
 
 /// Character offset just past a leading `#[no_std]` statement, if any.
@@ -97,13 +131,18 @@ fn expand_once(
     root_file: Option<&Path>,
     target: &crate::targets::TargetSpec,
     inject: bool,
+    hal: bool,
+    std_modules: &[&str],
 ) -> Result<String, (LusaError, bool)> {
     let mut spliced = String::new();
     let mut src = src;
     // (character offset of the splice, characters inserted)
     let mut splice = (0usize, 0usize);
     if inject {
-        let source = crate::hal::crate_source(target.hal).ok_or_else(|| {
+        // Only a hosted program on the host gets the standard modules.
+        let hosted = target.is_host() && no_std_end(tokens).is_none();
+        let std_modules: &[&str] = if hosted { std_modules } else { &[] };
+        let source = crate::hal::crate_source_for(target.hal, hal, std_modules).ok_or_else(|| {
             let err = LusaError::new(
                 E_MODULE,
                 None,
@@ -888,6 +927,9 @@ impl Resolver {
             let mut retry: Vec<(usize, UseDecl, LusaError)> = Vec::new();
             let mut progress = false;
             for (id, use_decl) in pending {
+                if is_builtin_collection_use(&use_decl) {
+                    continue;
+                }
                 match self.resolve_path(id, &use_decl.path, true, use_decl.span) {
                     Ok(symbol) => {
                         self.install_use(id, &use_decl, symbol)?;
@@ -1582,6 +1624,16 @@ fn insert_item(items: &mut HashMap<String, ItemDecl>, decl: ItemDecl) -> LResult
     }
     items.insert(decl.name.clone(), decl);
     Ok(())
+}
+
+/// `use lusa::collections::Vec` (or `HashMap`, `String`) names a built-in type:
+/// there is no item to import, so the declaration is accepted as is.
+fn is_builtin_collection_use(use_decl: &UseDecl) -> bool {
+    !use_decl.glob
+        && use_decl.path.len() == 3
+        && use_decl.path[0] == "lusa"
+        && use_decl.path[1] == "collections"
+        && matches!(use_decl.path[2].as_str(), "Vec" | "HashMap" | "String")
 }
 
 fn insert_or_reuse_item(items: &mut HashMap<String, ItemDecl>, decl: ItemDecl) {

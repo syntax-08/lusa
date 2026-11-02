@@ -840,7 +840,7 @@ fn b_require(parent: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<V
 // ===== modules =====
 
 pub fn all() -> Vec<(&'static str, BF)> {
-    vec![
+    let mut all: Vec<(&'static str, BF)> = vec![
         ("print", Box::new(b_print)),
         ("type", Box::new(b_type)),
         ("tostring", Box::new(b_tostring)),
@@ -873,7 +873,9 @@ pub fn all() -> Vec<(&'static str, BF)> {
         ("io_write_binary", Box::new(b_io_write_binary)),
         ("io_read_binary", Box::new(b_io_read_binary)),
         ("require", Box::new(b_require)),
-    ]
+    ];
+    all.extend(crate::host::builtins());
+    all
 }
 
 pub fn modules() -> Vec<(&'static str, Vec<(String, BF)>)> {

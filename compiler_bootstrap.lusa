@@ -496,7 +496,7 @@ end
 
 local TYPE_NAMES = {
     i32 = true, u32 = true, i128 = true, f32 = true,
-    bool = true, string = true, table = true,
+    bool = true, string = true, table = true, String = true,
     ["nil"] = true, void = true, auto = true
 }
 
@@ -546,6 +546,33 @@ end
 local function is_box_type(type_name)
     return box_element(type_name) ~= nil
 end
+
+-- Module 29: `HashMap<K, V>` is spelled `map<K,V>` by both parsers.  Keys
+-- and values are scalars or strings, so the first comma splits them.
+local function map_info(type_name)
+    if type_name == nil or string.sub(type_name, 1, 4) ~= "map<"
+        or string.sub(type_name, #type_name, #type_name) ~= ">" then
+        return nil
+    end
+    local body = string.sub(type_name, 5, #type_name - 1)
+    local comma = string.find(body, ",", 1, true)
+    if comma == nil then
+        return nil
+    end
+    return string.sub(body, 1, comma - 1), string.sub(body, comma + 1)
+end
+
+local function is_map_type(type_name)
+    return map_info(type_name) ~= nil
+end
+
+-- Set while checking when a program uses a `HashMap`, a `String`, a
+-- Module 29 `Vec` method, or a host I/O intrinsic, so the emitter appends
+-- only the runtimes the program needs.
+local uses_map_runtime = false
+local uses_strbuf_runtime = false
+local uses_vec_extra_runtime = false
+local uses_host_runtime = false
 
 -- ---- built-in Result / Option sums (module 21) ---------------------------
 
@@ -739,6 +766,29 @@ local function canonical_type(name, line, column)
     end
     if name == "coroutine" then
         return name
+    end
+    if name == "String" then
+        uses_strbuf_runtime = true
+        return name
+    end
+    local map_key, map_value = map_info(name)
+    if map_key ~= nil then
+        local key = canonical_type(map_key, line, column)
+        local value = canonical_type(map_value, line, column)
+        if key ~= "string" and key ~= "i32" and key ~= "u32" then
+            type_fail("E0301", line, column,
+                "HashMap keys must be `string`, `i32`, or `u32`, found `"
+                .. tostring(key) .. "`")
+        end
+        if value ~= "string" and value ~= "i32" and value ~= "u32"
+            and value ~= "f32" and value ~= "bool" then
+            type_fail("E0301", line, column,
+                "HashMap values must be `string`, `i32`, `u32`, `f32`, or `bool`, found `"
+                .. tostring(value) .. "`")
+        end
+        uses_map_runtime = true
+        register_sum_type("option<" .. value .. ">")
+        return "map<" .. key .. "," .. value .. ">"
     end
     if TYPE_NAMES[name] == true then
         return name
@@ -952,6 +1002,7 @@ end
 
 local function is_heap_type(type_name)
     if type_name == "string" or type_name == "table"
+        or type_name == "String" or is_map_type(type_name)
         or type_name == "coroutine" or type_name == "gmatch"
         or table_element(type_name) ~= nil
         or vec_element(type_name) ~= nil
@@ -1254,6 +1305,9 @@ local check_uses_tasks = false
 -- True while checking the value of an `await` statement, the one place a
 -- `task<void>` may be awaited.
 local check_await_statement = false
+-- True while checking the iterator of a `for ... in` loop, the one place
+-- `Vec:iter()` and `HashMap:iter()` may appear.
+local check_iter_allowed = false
 local check_current_function = nil
 local check_no_std = false
 local check_entry_key = nil
@@ -2472,6 +2526,38 @@ local function check_task_call(expr, method)
         "unsupported native task operation `" .. tostring(method) .. "`")
 end
 
+-- Module 29 host intrinsics behind `lusa::fs` and `lusa::net`: parameter
+-- and result types.  The C runtime implements each as `lusa_host_<name>`.
+local HOST_INTRINSICS = {
+    __io_ok = { params = {}, ret = "bool" },
+    __io_error = { params = {}, ret = "string" },
+    __io_eof = { params = {}, ret = "bool" },
+    __fs_read = { params = { "string" }, ret = "string" },
+    __fs_write = { params = { "string", "string", "bool" }, ret = "u32" },
+    __fs_exists = { params = { "string" }, ret = "bool" },
+    __fs_is_dir = { params = { "string" }, ret = "bool" },
+    __fs_mkdir = { params = { "string", "bool" }, ret = "bool" },
+    __fs_remove = { params = { "string", "bool" }, ret = "bool" },
+    __fs_size = { params = { "string" }, ret = "u32" },
+    __fs_open = { params = { "string", "u32" }, ret = "i32" },
+    __fs_read_line = { params = { "i32" }, ret = "string" },
+    __fs_read_all = { params = { "i32" }, ret = "string" },
+    __fs_write_handle = { params = { "i32", "string" }, ret = "u32" },
+    __fs_close = { params = { "i32" }, ret = "void" },
+    __net_listen = { params = { "string" }, ret = "i32" },
+    __net_accept = { params = { "i32" }, ret = "i32" },
+    __net_connect = { params = { "string" }, ret = "i32" },
+    __net_port = { params = { "i32" }, ret = "u32" },
+    __net_send = { params = { "i32", "string" }, ret = "u32" },
+    __net_recv = { params = { "i32", "u32" }, ret = "string" },
+    __net_recv_line = { params = { "i32" }, ret = "string" },
+    __net_close = { params = { "i32" }, ret = "void" },
+    __net_udp_bind = { params = { "string" }, ret = "i32" },
+    __net_send_to = { params = { "i32", "string", "string" }, ret = "u32" },
+    __net_recv_from = { params = { "i32", "u32" }, ret = "string" },
+    __net_peer = { params = { "i32" }, ret = "string" }
+}
+
 local function check_call(expr)
     local callee = borrow expr.callee
     if callee.tag == "Field" then
@@ -2512,6 +2598,46 @@ local function check_call(expr)
     local name = callee.name
     local args = expr.args
     local i = 1
+
+    if name ~= nil and HOST_INTRINSICS[name] ~= nil then
+        local host = borrow HOST_INTRINSICS[name]
+        if check_no_std then
+            type_fail("E0312", expr.line, expr.column,
+                "`" .. name .. "` needs the hosted runtime; host I/O is unavailable in `#[no_std]` programs")
+        end
+        if #args ~= #host.params then
+            type_fail("E0311", expr.line, expr.column,
+                "`" .. name .. "` takes " .. tostring(#host.params)
+                .. " argument(s), found " .. tostring(#args))
+        end
+        while i <= #args do
+            local expected = host.params[i]
+            local checked_arg, arg_type = check_expr(args[i])
+            if expected == "string" then
+                if arg_type ~= "string" and arg_type ~= "String" then
+                    check_mismatch(checked_arg.line, checked_arg.column,
+                        "argument " .. tostring(i) .. " of `" .. name .. "`",
+                        "string", arg_type)
+                end
+            else
+                if not assignable(expected, arg_type, clone checked_arg) then
+                    check_mismatch(checked_arg.line, checked_arg.column,
+                        "argument " .. tostring(i) .. " of `" .. name .. "`",
+                        expected, arg_type)
+                end
+                checked_arg = coerce_literal(checked_arg, expected)
+            end
+            args[i] = checked_arg
+            i = i + 1
+        end
+        uses_host_runtime = true
+        expr.builtin = "host"
+        expr.host_name = name
+        expr.args = args
+        expr.ctype = host.ret
+        expr.own = host.ret == "string"
+        return expr, host.ret
+    end
 
     if name == "Box" then
         if #args ~= 1 then
@@ -2788,6 +2914,35 @@ local function check_call(expr)
         return expr, "void"
     end
 
+    if name == "tostring" then
+        -- Module 29: scalars and strings become owned strings, formatted
+        -- like `print` formats them.
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`tostring` takes one value, found " .. tostring(#args))
+        end
+        local checked_arg, arg_type = check_expr(args[1])
+        if arg_type ~= "i32" and arg_type ~= "u32" and arg_type ~= "f32"
+            and arg_type ~= "bool" and arg_type ~= "string"
+            and arg_type ~= "String" then
+            type_fail("E0308", checked_arg.line, checked_arg.column,
+                "native `tostring` converts `i32`, `u32`, `f32`, `bool`, or string values, not `"
+                .. tostring(arg_type) .. "`")
+        end
+        if check_no_std then
+            type_fail("E0312", expr.line, expr.column,
+                "`tostring` needs the hosted runtime; it is unavailable in `#[no_std]` programs")
+        end
+        args[1] = checked_arg
+        uses_strbuf_runtime = true
+        expr.builtin = "tostring"
+        expr.tostring_type = arg_type
+        expr.args = args
+        expr.ctype = "string"
+        expr.own = true
+        return expr, "string"
+    end
+
     if name == "print" then
         while i <= #args do
             local checked_arg, arg_type = check_expr(args[i])
@@ -2926,16 +3081,233 @@ local function check_vec_method(expr, receiver, vec_type)
                 "`Vec:clear` takes no arguments, found " .. tostring(#args))
         end
         result = "void"
+    elseif name == "get" or name == "remove" or name == "insert" then
+        local wanted = 1
+        if name == "insert" then
+            wanted = 2
+        end
+        if #args ~= wanted then
+            type_fail("E0311", expr.line, expr.column,
+                "`Vec:" .. name .. "` takes " .. tostring(wanted)
+                .. " argument(s), found " .. tostring(#args))
+        end
+        local checked_index, index_type = check_expr(args[1])
+        if not is_integer_type(index_type) then
+            check_mismatch(checked_index.line, checked_index.column,
+                "Vec:" .. name .. " index", "integer", index_type)
+        end
+        method_args[1] = checked_index
+        uses_vec_extra_runtime = true
+        if name == "get" then
+            result = "option<" .. element .. ">"
+            register_sum_type(result)
+            own = true
+        elseif name == "remove" then
+            result = element
+            own = true
+        else
+            local checked, actual = check_expr(args[2])
+            if not assignable(element, actual, clone checked) then
+                check_mismatch(checked.line, checked.column,
+                    "Vec:insert value", element, actual)
+            end
+            checked = coerce_literal(checked, element)
+            if is_sum_type(element) then
+                checked = coerce_sum(checked, element)
+            end
+            if checked.tag ~= "Clone" and checked.tag ~= "Borrow"
+                and checked.tag ~= "Move" then
+                consume_expr(clone checked, checked.line, checked.column)
+            end
+            method_args[2] = checked
+            result = "void"
+        end
+    elseif name == "contains" then
+        if #args ~= 1 then
+            type_fail("E0311", expr.line, expr.column,
+                "`Vec:contains` takes one value, found " .. tostring(#args))
+        end
+        if element ~= "i32" and element ~= "u32" and element ~= "i128"
+            and element ~= "f32" and element ~= "bool"
+            and element ~= "string" then
+            type_fail("E0312", expr.line, expr.column,
+                "`Vec:contains` compares scalar or string elements, not `"
+                .. element .. "`")
+        end
+        local checked, actual = check_expr(args[1])
+        if not assignable(element, actual, clone checked) then
+            check_mismatch(checked.line, checked.column,
+                "Vec:contains value", element, actual)
+        end
+        method_args[1] = coerce_literal(checked, element)
+        uses_vec_extra_runtime = true
+        result = "bool"
+    elseif name == "iter" then
+        if not check_iter_allowed then
+            type_fail("E0312", expr.line, expr.column,
+                "`iter()` drives a `for ... in` loop: write `for i, value in v:iter() do`")
+        end
+        result = "iter"
     else
         type_fail("E0318", expr.line, expr.column,
             "unknown Vec method `" .. tostring(name)
-            .. "`; use push, pop, len, capacity, is_empty, reserve, or clear")
+            .. "`; use push, pop, insert, remove, get, contains, len, capacity, is_empty, reserve, clear, or iter")
     end
     expr.obj = receiver
     expr.args = method_args
     expr.ctype = result
     expr.own = own
     expr.vec_method = name
+    return expr, result
+end
+
+-- Checks one argument against `expected`, coercing literals.
+local function check_typed_arg(arg, expected, what)
+    local checked, actual = check_expr(arg)
+    if not assignable(expected, actual, clone checked) then
+        check_mismatch(checked.line, checked.column, what, expected, actual)
+    end
+    return coerce_literal(checked, expected)
+end
+
+-- Checks a text argument: a `string` or a `String`, both read in place.
+local function check_text_arg(arg, what)
+    local checked, actual = check_expr(arg)
+    if actual ~= "string" and actual ~= "String" then
+        check_mismatch(checked.line, checked.column, what, "string", actual)
+    end
+    return checked
+end
+
+local function check_arity(count, wanted, what, line, column)
+    if count ~= wanted then
+        type_fail("E0311", line, column,
+            "`" .. what .. "` takes " .. tostring(wanted)
+            .. " argument(s), found " .. tostring(count))
+    end
+end
+
+-- `HashMap<K, V>` methods (Module 29).
+local function check_map_method(expr, receiver, map_type)
+    local key_type, value_type = map_info(map_type)
+    local name = expr.name
+    local args = expr.args or {}
+    local method_args = {}
+    local result = nil
+    local own = false
+    if name == "insert" then
+        check_arity(#args, 2, "HashMap:insert", expr.line, expr.column)
+        local checked_key = check_typed_arg(args[1], key_type, "HashMap:insert key")
+        local checked_value = check_typed_arg(args[2], value_type,
+            "HashMap:insert value")
+        if checked_key.tag ~= "Clone" and checked_key.tag ~= "Borrow"
+            and checked_key.tag ~= "Move" then
+            consume_expr(clone checked_key, checked_key.line, checked_key.column)
+        end
+        if checked_value.tag ~= "Clone" and checked_value.tag ~= "Borrow"
+            and checked_value.tag ~= "Move" then
+            consume_expr(clone checked_value, checked_value.line,
+                checked_value.column)
+        end
+        method_args[1] = checked_key
+        method_args[2] = checked_value
+        result = "void"
+    elseif name == "get" or name == "contains_key" or name == "remove" then
+        check_arity(#args, 1, "HashMap:" .. name, expr.line, expr.column)
+        method_args[1] = check_typed_arg(args[1], key_type,
+            "HashMap:" .. name .. " key")
+        if name == "get" then
+            result = "option<" .. value_type .. ">"
+            register_sum_type(result)
+            own = true
+        else
+            result = "bool"
+        end
+    elseif name == "get_or" then
+        check_arity(#args, 2, "HashMap:get_or", expr.line, expr.column)
+        method_args[1] = check_typed_arg(args[1], key_type, "HashMap:get_or key")
+        method_args[2] = check_typed_arg(args[2], value_type,
+            "HashMap:get_or default")
+        result = value_type
+        own = is_heap_type(value_type)
+    elseif name == "len" or name == "is_empty" or name == "clear" then
+        check_arity(#args, 0, "HashMap:" .. name, expr.line, expr.column)
+        if name == "len" then
+            result = "i32"
+        elseif name == "is_empty" then
+            result = "bool"
+        else
+            result = "void"
+        end
+    elseif name == "iter" then
+        if not check_iter_allowed then
+            type_fail("E0312", expr.line, expr.column,
+                "`iter()` drives a `for ... in` loop: write `for key, value in map:iter() do`")
+        end
+        result = "iter"
+    else
+        type_fail("E0318", expr.line, expr.column,
+            "unknown HashMap method `" .. tostring(name)
+            .. "`; use insert, get, get_or, contains_key, remove, len, is_empty, clear, or iter")
+    end
+    expr.obj = receiver
+    expr.args = method_args
+    expr.ctype = result
+    expr.own = own
+    expr.map_method = name
+    return expr, result
+end
+
+-- `String` methods (Module 29).  Text arguments are read, never consumed.
+local function check_strbuf_method(expr, receiver)
+    local name = expr.name
+    local args = expr.args or {}
+    local method_args = {}
+    local result = nil
+    local own = false
+    if name == "push_str" or name == "contains" or name == "starts_with"
+        or name == "ends_with" then
+        check_arity(#args, 1, "String:" .. name, expr.line, expr.column)
+        method_args[1] = check_text_arg(args[1], "String:" .. name .. " text")
+        if name == "push_str" then
+            result = "void"
+        else
+            result = "bool"
+        end
+    elseif name == "push" then
+        check_arity(#args, 1, "String:push", expr.line, expr.column)
+        local checked, actual = check_expr(args[1])
+        if not is_integer_type(actual) then
+            check_mismatch(checked.line, checked.column, "String:push code",
+                "integer", actual)
+        end
+        method_args[1] = checked
+        result = "void"
+    elseif name == "pop" or name == "len" or name == "is_empty"
+        or name == "clear" or name == "as_str" then
+        check_arity(#args, 0, "String:" .. name, expr.line, expr.column)
+        if name == "pop" then
+            result = "u32"
+        elseif name == "len" then
+            result = "i32"
+        elseif name == "is_empty" then
+            result = "bool"
+        elseif name == "clear" then
+            result = "void"
+        else
+            result = "string"
+            own = true
+        end
+    else
+        type_fail("E0318", expr.line, expr.column,
+            "unknown String method `" .. tostring(name)
+            .. "`; use push_str, push, pop, len, is_empty, clear, as_str, contains, starts_with, or ends_with")
+    end
+    expr.obj = receiver
+    expr.args = method_args
+    expr.ctype = result
+    expr.own = own
+    expr.strbuf_method = name
     return expr, result
 end
 
@@ -2956,6 +3328,12 @@ check_method_call = function(expr)
     end
     if is_vec_type(obj_type) then
         return check_vec_method(expr, checked_obj, obj_type)
+    end
+    if is_map_type(obj_type) then
+        return check_map_method(expr, checked_obj, obj_type)
+    end
+    if obj_type == "String" then
+        return check_strbuf_method(expr, checked_obj)
     end
     if is_sum_type(obj_type) then
         return check_sum_method(expr, checked_obj, obj_type)
@@ -3086,6 +3464,45 @@ local function check_box_value(checked, actual, box_type, line, column)
         column = column
     }
     return wrapped, box_type
+end
+
+-- Module 29 initializers: a `string` becomes a `String` buffer, and an empty
+-- `{}` becomes an empty `HashMap`.  Values of the target type pass through.
+local function check_collection_init(checked, actual, target, line, column)
+    if actual == target then
+        return checked, actual
+    end
+    if check_no_std then
+        type_fail("E0312", line, column,
+            "`" .. target .. "` needs the hosted runtime; it is unavailable in `#[no_std]` programs")
+    end
+    if target == "String" then
+        if actual ~= "string" then
+            check_mismatch(line, column, "`String` initializer", "string", actual)
+        end
+        local wrapped = {
+            tag = "StrBufNew",
+            value = checked,
+            ctype = "String",
+            own = true,
+            line = line,
+            column = column
+        }
+        return wrapped, "String"
+    end
+    if checked.tag ~= "Table" or #(checked.items or {}) ~= 0
+        or #(checked.keys or {}) ~= 0 then
+        type_fail("E0308", line, column,
+            "a `HashMap` starts from an empty `{}`; add entries with `insert`")
+    end
+    local fresh_map = {
+        tag = "MapNew",
+        ctype = target,
+        own = true,
+        line = line,
+        column = column
+    }
+    return fresh_map, target
 end
 
 local function check_table(expr)
@@ -4160,6 +4577,11 @@ local function check_local(stmt)
                 local value_column = checked.column
                 checked, actual = check_box_value(checked, actual, final_type,
                     value_line, value_column)
+            elseif final_type == "String" or is_map_type(final_type) then
+                local value_line = checked.line
+                local value_column = checked.column
+                checked, actual = check_collection_init(checked, actual,
+                    final_type, value_line, value_column)
             end
             if not assignable(final_type, actual, clone checked) then
                 check_mismatch(checked.line, checked.column,
@@ -4974,9 +5396,50 @@ check_stmt = function(stmt, top_level)
             scope_leave()
             return stmt
         end
+        if iter.tag == "MethodCall" and iter.name == "iter" then
+            -- Module 29: `for i, v in vec:iter()` and `for k, v in map:iter()`
+            -- bind borrowed views of the elements, in order.
+            if #stmt.vars < 1 or #stmt.vars > 2 then
+                type_fail("E0311", line, column,
+                    "`iter()` loops bind one or two loop variables")
+            end
+            check_iter_allowed = true
+            local checked_iter, _ = check_expr(iter)
+            check_iter_allowed = false
+            if checked_iter.obj.tag ~= "Name" then
+                type_fail("E0319", line, column,
+                    "`iter()` loops need a named `Vec` or `HashMap`")
+            end
+            local key_type = nil
+            local value_type = nil
+            if checked_iter.vec_method == "iter" then
+                stmt.iter_kind = "vec_iter"
+                key_type = "i32"
+                value_type = vec_element(checked_iter.obj.ctype)
+            elseif checked_iter.map_method == "iter" then
+                stmt.iter_kind = "map_iter"
+                key_type, value_type = map_info(checked_iter.obj.ctype)
+            else
+                type_fail("E0319", line, column,
+                    "`iter()` loops need a `Vec` or a `HashMap`")
+            end
+            stmt.iter = checked_iter
+            stmt.key_type = key_type
+            stmt.value_type = value_type
+            scope_enter()
+            scope_declare(stmt.vars[1], key_type, false, true)
+            if #stmt.vars == 2 then
+                scope_declare(stmt.vars[2], value_type, false, true)
+            end
+            check_loop_depth = check_loop_depth + 1
+            stmt.body = check_block(stmt.body, false)
+            check_loop_depth = check_loop_depth - 1
+            scope_leave()
+            return stmt
+        end
         if iter.tag ~= "Call" or iter.callee.tag ~= "Name" then
             type_fail("E0319", line, column,
-                "generic `for` requires a direct `pairs(table)` or `ipairs(table)` call")
+                "generic `for` requires a direct `pairs(table)` or `ipairs(table)` call or `x:iter()`")
         end
         local iter_name = iter.callee.name
         if iter_name ~= "pairs" and iter_name ~= "ipairs" then
@@ -5217,6 +5680,10 @@ local function check_program(ast)
     check_in_async = false
     check_uses_tasks = false
     check_await_statement = false
+    uses_map_runtime = false
+    uses_strbuf_runtime = false
+    uses_vec_extra_runtime = false
+    uses_host_runtime = false
     check_current_function = nil
     check_no_std = false
     check_entry_key = nil
@@ -5404,7 +5871,8 @@ local function c_type(type_name)
     if type_name == "i128" then return "lusa_i128" end
     if type_name == "f32" then return "float" end
     if type_name == "bool" then return "bool" end
-    if type_name == "string" then return "LusaString *" end
+    if type_name == "string" or type_name == "String" then return "LusaString *" end
+    if is_map_type(type_name) then return "LusaMap *" end
     if type_name == "coroutine" then return "LusaCoro *" end
     if is_task_type(type_name) then return "LusaTask *" end
     if type_name == "gmatch" then return "LusaGmatch *" end
@@ -5444,9 +5912,26 @@ local function c_decl(type_name, name)
     return c_type(type_name) .. " " .. name
 end
 
+-- The `LUSA_ELEM_*` kind of a `HashMap` key or value (Module 29).
+local function map_elem_kind(type_name)
+    if type_name == "i32" then return "LUSA_ELEM_I32" end
+    if type_name == "u32" then return "LUSA_ELEM_U32" end
+    if type_name == "f32" then return "LUSA_ELEM_F32" end
+    if type_name == "bool" then return "LUSA_ELEM_BOOL" end
+    return "LUSA_ELEM_STRING"
+end
+
 local function default_c(type_name)
     if is_array_type(type_name) then
         return "{0}"
+    end
+    if type_name == "String" then
+        return 'lusa_string_new("", 0u)'
+    end
+    if is_map_type(type_name) then
+        local key_type, value_type = map_info(type_name)
+        return "lusa_map_new(" .. map_elem_kind(key_type) .. ", "
+            .. map_elem_kind(value_type) .. ")"
     end
     if type_name == "f32" then return "0.0f" end
     if type_name == "bool" then return "false" end
@@ -5643,8 +6128,10 @@ local function emit_scope_pop_without_drops()
 end
 
 local function emit_clone_place(type_name, access)
-    if type_name == "string" then
+    if type_name == "string" or type_name == "String" then
         line(access .. " = lusa_string_clone(" .. access .. ");")
+    elseif is_map_type(type_name) then
+        line(access .. " = lusa_map_clone(" .. access .. ");")
     elseif is_table_type(type_name) then
         line(access .. " = lusa_table_clone(" .. access .. ");")
     elseif is_vec_type(type_name) then
@@ -5665,10 +6152,12 @@ local function emit_clone_place(type_name, access)
 end
 
 local function emit_drop_place(type_name, access)
-    if type_name == "string" then
+    if type_name == "string" or type_name == "String" then
         line("lusa_drop_string(&" .. access .. ");")
     elseif type_name == "table" or table_element(type_name) ~= nil then
         line("lusa_drop_table(&" .. access .. ");")
+    elseif is_map_type(type_name) then
+        line("lusa_map_drop(&" .. access .. ");")
     elseif is_vec_type(type_name) then
         line("lusa_drop_vec_" .. collection_tag(vec_element(type_name)) .. "(&"
             .. access .. ");")
@@ -5898,6 +6387,22 @@ local function null_moved_source(expr, skip)
     end
     line(entry.cname .. " = NULL;")
     entry.moved = true
+end
+
+-- Hands a heap value read from a local over to the expression being built.
+-- `null_moved_source` clears a pointer local at once, so when the
+-- surrounding expression has not consumed `rendered` yet, the value is
+-- copied into a temporary first.
+local function hand_over_moved(arg, type_name, rendered)
+    local entry = direct_heap_name(clone arg)
+    if entry ~= nil and not is_struct_type(entry.type)
+        and not is_vec_type(entry.type) and not is_sum_type(entry.type) then
+        local held = fresh("moved")
+        line(c_type(type_name) .. " " .. held .. " = " .. rendered .. ";")
+        rendered = held
+    end
+    null_moved_source(arg, nil)
+    return rendered
 end
 
 -- ---- C runtime -----------------------------------------------------------
@@ -6919,6 +7424,1215 @@ local HEAP_RUNTIME = {
     ""
 }
 
+-- ---- Module 29: Vec methods, String, HashMap, and host I/O ---------------
+
+-- `Vec:get/insert/remove/contains` helpers.  They only move bytes, so they
+-- serve hosted and `#[no_std]` programs alike.
+local VEC_EXTRA_RUNTIME = {
+    "static bool lusa_vec_has(const LusaVec *vec, int64_t index) {",
+    "    return vec != NULL && index >= 0 && (uint64_t)index < (uint64_t)vec->len;",
+    "}",
+    "",
+    "static bool lusa_vec_insert_ok(const LusaVec *vec, int64_t index) {",
+    "    if (vec != NULL && index >= 0 && (uint64_t)index <= (uint64_t)vec->len) return true;",
+    '    lusa_throw("E2006", "Vec:insert index is out of bounds");',
+    "    return false;",
+    "}",
+    "",
+    "static void lusa_vec_swap(unsigned char *data, uint32_t size, uint32_t a, uint32_t b) {",
+    "    uint32_t i;",
+    "    for (i = 0u; i < size; i++) {",
+    "        unsigned char held = data[a * size + i];",
+    "        data[a * size + i] = data[b * size + i];",
+    "        data[b * size + i] = held;",
+    "    }",
+    "}",
+    "",
+    "/* Moves the last element to `index`; the elements after it shift up. */",
+    "static void lusa_vec_rotate_in(LusaVec *vec, uint32_t size, int64_t index) {",
+    "    uint32_t at;",
+    "    if (vec == NULL || vec->len == 0u) return;",
+    "    at = vec->len - 1u;",
+    "    while (index >= 0 && at > (uint32_t)index) {",
+    "        lusa_vec_swap((unsigned char *)vec->data, size, at - 1u, at);",
+    "        at = at - 1u;",
+    "    }",
+    "}",
+    "",
+    "/* Moves element `index` to the end, so `pop` returns it. */",
+    "static bool lusa_vec_rotate_out(LusaVec *vec, uint32_t size, int64_t index) {",
+    "    uint32_t at;",
+    "    if (!lusa_vec_has(vec, index)) {",
+    '        lusa_throw("E2006", "Vec:remove index is out of bounds");',
+    "        return false;",
+    "    }",
+    "    at = (uint32_t)index;",
+    "    while (at + 1u < vec->len) {",
+    "        lusa_vec_swap((unsigned char *)vec->data, size, at, at + 1u);",
+    "        at = at + 1u;",
+    "    }",
+    "    return true;",
+    "}",
+    "",
+    "static bool lusa_vec_contains_bytes(const LusaVec *vec, uint32_t size, const void *needle) {",
+    "    const unsigned char *data;",
+    "    const unsigned char *want = (const unsigned char *)needle;",
+    "    uint32_t i;",
+    "    uint32_t b;",
+    "    if (vec == NULL) return false;",
+    "    data = (const unsigned char *)vec->data;",
+    "    for (i = 0u; i < vec->len; i++) {",
+    "        for (b = 0u; b < size; b++) {",
+    "            if (data[i * size + b] != want[b]) break;",
+    "        }",
+    "        if (b == size) return true;",
+    "    }",
+    "    return false;",
+    "}",
+    ""
+}
+
+-- Native `tostring`, and `String`: a `LusaString` whose bytes grow in place.
+-- `obj.size` records the allocation, so appends double the capacity instead
+-- of copying each time.  Also the string test of `Vec<string>:contains`.
+local STRBUF_RUNTIME = {
+    "static LusaString *lusa_tostring_text(const char *text) {",
+    "    return lusa_string_new(text, (uint64_t)strlen(text));",
+    "}",
+    "",
+    "static LusaString *lusa_tostring_i32(int32_t value) {",
+    "    char text[16];",
+    '    snprintf(text, sizeof(text), "%" PRId32, value);',
+    "    return lusa_tostring_text(text);",
+    "}",
+    "",
+    "static LusaString *lusa_tostring_u32(uint32_t value) {",
+    "    char text[16];",
+    '    snprintf(text, sizeof(text), "%" PRIu32, value);',
+    "    return lusa_tostring_text(text);",
+    "}",
+    "",
+    "static LusaString *lusa_tostring_f32(float value) {",
+    "    char text[48];",
+    '    snprintf(text, sizeof(text), "%.9g", (double)value);',
+    "    return lusa_tostring_text(text);",
+    "}",
+    "",
+    "static LusaString *lusa_tostring_bool(bool value) {",
+    '    return lusa_tostring_text(value ? "true" : "false");',
+    "}",
+    "",
+    "static uint64_t lusa_strbuf_capacity(const LusaString *s) {",
+    "    uint64_t header = (uint64_t)sizeof(LusaString);",
+    "    if (s->obj.size > header + s->obj.length) return s->obj.size - header;",
+    "    return s->obj.length + 1u;",
+    "}",
+    "",
+    "static void lusa_strbuf_append(LusaString *s, const char *bytes, uint64_t count) {",
+    "    uint64_t length;",
+    "    uint64_t capacity;",
+    "    size_t offset = 0u;",
+    "    bool inside;",
+    "    char *grown;",
+    "    if (s == NULL || count == 0u) return;",
+    "    length = s->obj.length;",
+    "    inside = bytes >= s->data && bytes < s->data + length;",
+    "    if (inside) offset = (size_t)(bytes - s->data);",
+    "    capacity = lusa_strbuf_capacity(s);",
+    "    if (length + count + 1u > capacity) {",
+    "        if (capacity < 16u) capacity = 16u;",
+    "        while (capacity < length + count + 1u) capacity = capacity * 2u;",
+    "        grown = (char *)realloc(s->data, (size_t)capacity);",
+    '        if (grown == NULL) { lusa_panic("out of memory"); return; }',
+    "        s->data = grown;",
+    "        s->obj.size = (uint64_t)sizeof(LusaString) + capacity;",
+    "        if (inside) bytes = s->data + offset;",
+    "    }",
+    "    memmove(s->data + length, bytes, (size_t)count);",
+    "    s->obj.length = length + count;",
+    "    s->data[s->obj.length] = 0;",
+    "}",
+    "",
+    "static void lusa_strbuf_push_str(LusaString *s, LusaString *text) {",
+    "    if (text == NULL) return;",
+    "    lusa_strbuf_append(s, text->data, text->obj.length);",
+    "}",
+    "",
+    "static void lusa_strbuf_push(LusaString *s, uint32_t code) {",
+    "    char byte = (char)(code & 255u);",
+    "    lusa_strbuf_append(s, &byte, 1u);",
+    "}",
+    "",
+    "static uint32_t lusa_strbuf_pop(LusaString *s) {",
+    "    uint32_t code;",
+    "    if (s == NULL || s->obj.length == 0u) return 0u;",
+    "    s->obj.length = s->obj.length - 1u;",
+    "    code = (uint32_t)(unsigned char)s->data[s->obj.length];",
+    "    s->data[s->obj.length] = 0;",
+    "    return code;",
+    "}",
+    "",
+    "static int32_t lusa_strbuf_len(LusaString *s) {",
+    "    return s == NULL ? 0 : (int32_t)s->obj.length;",
+    "}",
+    "",
+    "static void lusa_strbuf_clear(LusaString *s) {",
+    "    if (s == NULL) return;",
+    "    s->obj.length = 0u;",
+    "    s->data[0] = 0;",
+    "}",
+    "",
+    "/* Where `needle` occurs in `s` (mode 0 anywhere, 1 at the start, 2 at",
+    "   the end). */",
+    "static bool lusa_strbuf_match(LusaString *s, LusaString *needle, int mode) {",
+    "    uint64_t length = s == NULL ? 0u : s->obj.length;",
+    "    uint64_t count = needle == NULL ? 0u : needle->obj.length;",
+    "    uint64_t at;",
+    "    if (count == 0u) return true;",
+    "    if (count > length) return false;",
+    "    if (mode == 1) return memcmp(s->data, needle->data, (size_t)count) == 0;",
+    "    if (mode == 2) return memcmp(s->data + length - count, needle->data, (size_t)count) == 0;",
+    "    for (at = 0u; at + count <= length; at++) {",
+    "        if (memcmp(s->data + at, needle->data, (size_t)count) == 0) return true;",
+    "    }",
+    "    return false;",
+    "}",
+    "",
+    "static bool lusa_strbuf_contains(LusaString *s, LusaString *needle) {",
+    "    return lusa_strbuf_match(s, needle, 0);",
+    "}",
+    "",
+    "static bool lusa_strbuf_starts_with(LusaString *s, LusaString *needle) {",
+    "    return lusa_strbuf_match(s, needle, 1);",
+    "}",
+    "",
+    "static bool lusa_strbuf_ends_with(LusaString *s, LusaString *needle) {",
+    "    return lusa_strbuf_match(s, needle, 2);",
+    "}",
+    "",
+    "static bool lusa_vec_contains_string(const LusaVec *vec, LusaString *needle) {",
+    "    LusaString **items;",
+    "    uint64_t count = needle == NULL ? 0u : needle->obj.length;",
+    "    uint32_t i;",
+    "    if (vec == NULL) return false;",
+    "    items = (LusaString **)vec->data;",
+    "    for (i = 0u; i < vec->len; i++) {",
+    "        LusaString *item = items[i];",
+    "        uint64_t length = item == NULL ? 0u : item->obj.length;",
+    "        if (length == count && (count == 0u || memcmp(item->data, needle->data, (size_t)count) == 0)) {",
+    "            return true;",
+    "        }",
+    "    }",
+    "    return false;",
+    "}",
+    ""
+}
+
+-- `HashMap<K, V>`: keys and values are 64-bit payloads (integers, f32 bits,
+-- booleans, or owned `LusaString *`).  Entries stay in insertion order;
+-- `remove` leaves a tombstone that growth compacts away, so iteration order
+-- matches the dynamic engines.  The open-addressing index stores entry
+-- positions (-1 empty, -2 removed) and keeps at least half its slots free.
+local MAP_RUNTIME = {
+    "typedef struct LusaMapEntry {",
+    "    uint64_t key;",
+    "    uint64_t value;",
+    "    uint32_t hash;",
+    "    uint32_t live;",
+    "} LusaMapEntry;",
+    "",
+    "typedef struct LusaMap {",
+    "    uint32_t key_kind;",
+    "    uint32_t value_kind;",
+    "    uint32_t len;",
+    "    uint32_t used;",
+    "    uint32_t capacity;",
+    "    uint32_t slots;",
+    "    LusaMapEntry *entries;",
+    "    int32_t *index;",
+    "} LusaMap;",
+    "",
+    "static float lusa_map_f32(uint64_t payload) {",
+    "    uint32_t bits = (uint32_t)payload;",
+    "    float value;",
+    "    memcpy(&value, &bits, sizeof(value));",
+    "    return value;",
+    "}",
+    "",
+    "static uint32_t lusa_map_hash(uint32_t kind, uint64_t key) {",
+    "    if (kind == LUSA_ELEM_STRING) {",
+    "        LusaString *text = (LusaString *)(uintptr_t)key;",
+    "        uint64_t length = text == NULL ? 0u : text->obj.length;",
+    "        uint64_t i;",
+    "        uint32_t hash = 2166136261u;",
+    "        for (i = 0u; i < length; i++) {",
+    "            hash = (hash ^ (uint32_t)(unsigned char)text->data[i]) * 16777619u;",
+    "        }",
+    "        return hash;",
+    "    }",
+    "    key = key ^ (key >> 33);",
+    "    key = key * 0xff51afd7ed558ccdULL;",
+    "    key = key ^ (key >> 33);",
+    "    return (uint32_t)key;",
+    "}",
+    "",
+    "static bool lusa_map_same(uint32_t kind, uint64_t a, uint64_t b) {",
+    "    if (kind == LUSA_ELEM_STRING) {",
+    "        LusaString *x = (LusaString *)(uintptr_t)a;",
+    "        LusaString *y = (LusaString *)(uintptr_t)b;",
+    "        uint64_t xl = x == NULL ? 0u : x->obj.length;",
+    "        uint64_t yl = y == NULL ? 0u : y->obj.length;",
+    "        return xl == yl && (xl == 0u || memcmp(x->data, y->data, (size_t)xl) == 0);",
+    "    }",
+    "    return a == b;",
+    "}",
+    "",
+    "static void lusa_map_release(uint32_t kind, uint64_t payload) {",
+    "    if (kind == LUSA_ELEM_STRING) {",
+    "        LusaString *text = (LusaString *)(uintptr_t)payload;",
+    "        lusa_drop_string(&text);",
+    "    }",
+    "}",
+    "",
+    "static uint64_t lusa_map_copy(uint32_t kind, uint64_t payload) {",
+    "    if (kind == LUSA_ELEM_STRING) {",
+    "        return (uint64_t)(uintptr_t)lusa_string_clone((LusaString *)(uintptr_t)payload);",
+    "    }",
+    "    return payload;",
+    "}",
+    "",
+    "static LusaMap *lusa_map_new(uint32_t key_kind, uint32_t value_kind) {",
+    "    LusaMap *map = (LusaMap *)calloc(1u, sizeof(LusaMap));",
+    '    if (map == NULL) { lusa_panic("out of memory"); return NULL; }',
+    "    map->key_kind = key_kind;",
+    "    map->value_kind = value_kind;",
+    "    return map;",
+    "}",
+    "",
+    "/* Compacts the live entries into a table of `capacity` entries and",
+    "   rebuilds the index. */",
+    "static bool lusa_map_rebuild(LusaMap *map, uint32_t capacity) {",
+    "    uint32_t slots = 8u;",
+    "    uint32_t i;",
+    "    uint32_t count = 0u;",
+    "    LusaMapEntry *entries;",
+    "    int32_t *index;",
+    "    while (slots < capacity * 2u) slots = slots * 2u;",
+    "    entries = (LusaMapEntry *)malloc((size_t)capacity * sizeof(LusaMapEntry));",
+    "    index = (int32_t *)malloc((size_t)slots * sizeof(int32_t));",
+    "    if (entries == NULL || index == NULL) {",
+    "        free(entries);",
+    "        free(index);",
+    '        lusa_panic("out of memory");',
+    "        return false;",
+    "    }",
+    "    for (i = 0u; i < slots; i++) index[i] = -1;",
+    "    for (i = 0u; i < map->used; i++) {",
+    "        if (map->entries[i].live) {",
+    "            uint32_t slot = map->entries[i].hash & (slots - 1u);",
+    "            while (index[slot] != -1) slot = (slot + 1u) & (slots - 1u);",
+    "            entries[count] = map->entries[i];",
+    "            index[slot] = (int32_t)count;",
+    "            count = count + 1u;",
+    "        }",
+    "    }",
+    "    free(map->entries);",
+    "    free(map->index);",
+    "    map->entries = entries;",
+    "    map->index = index;",
+    "    map->capacity = capacity;",
+    "    map->slots = slots;",
+    "    map->used = count;",
+    "    map->len = count;",
+    "    return true;",
+    "}",
+    "",
+    "static int32_t lusa_map_lookup(const LusaMap *map, uint64_t key, uint32_t hash) {",
+    "    uint32_t slot;",
+    "    if (map == NULL || map->slots == 0u) return -1;",
+    "    slot = hash & (map->slots - 1u);",
+    "    for (;;) {",
+    "        int32_t at = map->index[slot];",
+    "        if (at == -1) return -1;",
+    "        if (at >= 0 && map->entries[at].live && map->entries[at].hash == hash",
+    "            && lusa_map_same(map->key_kind, map->entries[at].key, key)) {",
+    "            return at;",
+    "        }",
+    "        slot = (slot + 1u) & (map->slots - 1u);",
+    "    }",
+    "}",
+    "",
+    "/* Takes ownership of `key` and `value`. */",
+    "static void lusa_map_insert(LusaMap *map, uint64_t key, uint64_t value) {",
+    "    uint32_t hash;",
+    "    uint32_t slot;",
+    "    int32_t at;",
+    "    if (map == NULL) return;",
+    "    hash = lusa_map_hash(map->key_kind, key);",
+    "    at = lusa_map_lookup(map, key, hash);",
+    "    if (at >= 0) {",
+    "        lusa_map_release(map->value_kind, map->entries[at].value);",
+    "        lusa_map_release(map->key_kind, key);",
+    "        map->entries[at].value = value;",
+    "        return;",
+    "    }",
+    "    if (map->used == map->capacity) {",
+    "        uint32_t capacity = map->capacity == 0u ? 4u : map->capacity;",
+    "        if (map->len + 1u > capacity / 2u) capacity = capacity * 2u;",
+    "        if (!lusa_map_rebuild(map, capacity)) return;",
+    "    }",
+    "    slot = hash & (map->slots - 1u);",
+    "    while (map->index[slot] >= 0) slot = (slot + 1u) & (map->slots - 1u);",
+    "    map->index[slot] = (int32_t)map->used;",
+    "    map->entries[map->used].key = key;",
+    "    map->entries[map->used].value = value;",
+    "    map->entries[map->used].hash = hash;",
+    "    map->entries[map->used].live = 1u;",
+    "    map->used = map->used + 1u;",
+    "    map->len = map->len + 1u;",
+    "}",
+    "",
+    "static bool lusa_map_find(const LusaMap *map, uint64_t key, uint64_t *value) {",
+    "    int32_t at;",
+    "    if (map == NULL) return false;",
+    "    at = lusa_map_lookup(map, key, lusa_map_hash(map->key_kind, key));",
+    "    if (at < 0) return false;",
+    "    if (value != NULL) *value = map->entries[at].value;",
+    "    return true;",
+    "}",
+    "",
+    "static bool lusa_map_contains(LusaMap *map, uint64_t key) {",
+    "    return lusa_map_find(map, key, NULL);",
+    "}",
+    "",
+    "static bool lusa_map_remove(LusaMap *map, uint64_t key) {",
+    "    uint32_t hash;",
+    "    uint32_t slot;",
+    "    int32_t at;",
+    "    if (map == NULL) return false;",
+    "    hash = lusa_map_hash(map->key_kind, key);",
+    "    at = lusa_map_lookup(map, key, hash);",
+    "    if (at < 0) return false;",
+    "    slot = hash & (map->slots - 1u);",
+    "    while (map->index[slot] != at) slot = (slot + 1u) & (map->slots - 1u);",
+    "    map->index[slot] = -2;",
+    "    lusa_map_release(map->key_kind, map->entries[at].key);",
+    "    lusa_map_release(map->value_kind, map->entries[at].value);",
+    "    map->entries[at].live = 0u;",
+    "    map->len = map->len - 1u;",
+    "    return true;",
+    "}",
+    "",
+    "static void lusa_map_clear(LusaMap *map) {",
+    "    uint32_t i;",
+    "    if (map == NULL) return;",
+    "    for (i = 0u; i < map->used; i++) {",
+    "        if (map->entries[i].live) {",
+    "            lusa_map_release(map->key_kind, map->entries[i].key);",
+    "            lusa_map_release(map->value_kind, map->entries[i].value);",
+    "        }",
+    "    }",
+    "    for (i = 0u; i < map->slots; i++) map->index[i] = -1;",
+    "    map->used = 0u;",
+    "    map->len = 0u;",
+    "}",
+    "",
+    "static void lusa_map_drop(LusaMap **place) {",
+    "    LusaMap *map;",
+    "    if (place == NULL || *place == NULL) return;",
+    "    map = *place;",
+    "    lusa_map_clear(map);",
+    "    free(map->entries);",
+    "    free(map->index);",
+    "    free(map);",
+    "    *place = NULL;",
+    "}",
+    "",
+    "static LusaMap *lusa_map_clone(LusaMap *map) {",
+    "    LusaMap *copy;",
+    "    uint32_t i;",
+    "    if (map == NULL) return NULL;",
+    "    copy = lusa_map_new(map->key_kind, map->value_kind);",
+    "    for (i = 0u; i < map->used; i++) {",
+    "        if (map->entries[i].live) {",
+    "            lusa_map_insert(copy, lusa_map_copy(map->key_kind, map->entries[i].key),",
+    "                lusa_map_copy(map->value_kind, map->entries[i].value));",
+    "        }",
+    "    }",
+    "    return copy;",
+    "}",
+    "",
+    "static uint32_t lusa_map_len(LusaMap *map) {",
+    "    return map == NULL ? 0u : map->len;",
+    "}",
+    "",
+    "static uint32_t lusa_map_used(LusaMap *map) {",
+    "    return map == NULL ? 0u : map->used;",
+    "}",
+    "",
+    "/* The first live entry at or after `position` (iteration order). */",
+    "static uint32_t lusa_map_next(LusaMap *map, uint32_t position) {",
+    "    if (map == NULL) return 0u;",
+    "    while (position < map->used && !map->entries[position].live) position = position + 1u;",
+    "    return position;",
+    "}",
+    "",
+    "static uint64_t lusa_map_key_at(LusaMap *map, uint32_t position) {",
+    "    return map->entries[position].key;",
+    "}",
+    "",
+    "static uint64_t lusa_map_value_at(LusaMap *map, uint32_t position) {",
+    "    return map->entries[position].value;",
+    "}",
+    "",
+    "/* `get`: an `Option` whose payload is a copy of the stored value. */",
+    "static LusaOption lusa_map_get_option(LusaMap *map, uint64_t key, uint32_t size, uint32_t align) {",
+    "    LusaOption out;",
+    "    uint64_t payload = 0u;",
+    "    out.is_some = false;",
+    "    out.value = NULL;",
+    "    if (!lusa_map_find(map, key, &payload)) return out;",
+    "    out.value = lusa_heap_alloc(size, align);",
+    '    if (out.value == NULL) { lusa_throw("E9999", "out of memory"); return out; }',
+    "    out.is_some = true;",
+    "    payload = lusa_map_copy(map->value_kind, payload);",
+    "    if (map->value_kind == LUSA_ELEM_I32) *(int32_t *)out.value = (int32_t)(int64_t)payload;",
+    "    else if (map->value_kind == LUSA_ELEM_U32) *(uint32_t *)out.value = (uint32_t)payload;",
+    "    else if (map->value_kind == LUSA_ELEM_F32) *(float *)out.value = lusa_map_f32(payload);",
+    "    else if (map->value_kind == LUSA_ELEM_BOOL) *(bool *)out.value = payload != 0u;",
+    "    else *(LusaString **)out.value = (LusaString *)(uintptr_t)payload;",
+    "    return out;",
+    "}",
+    "",
+    "/* `get_or`: takes ownership of `fallback`, which is returned when the key",
+    "   is missing; otherwise it is released and a copy of the value returned. */",
+    "static uint64_t lusa_map_get_or(LusaMap *map, uint64_t key, uint64_t fallback) {",
+    "    uint64_t payload = 0u;",
+    "    if (map == NULL || !lusa_map_find(map, key, &payload)) return fallback;",
+    "    lusa_map_release(map->value_kind, fallback);",
+    "    return lusa_map_copy(map->value_kind, payload);",
+    "}",
+    ""
+}
+
+-- Host I/O behind `lusa::fs` and `lusa::net`: stdio files and IPv4 sockets
+-- (POSIX or Winsock), numbered from 3 in a fixed handle table.  Every call
+-- records its status for `__io_ok`, `__io_error`, and `__io_eof`.  The
+-- `lusa:net` marker tells the host build to link Winsock with MinGW.
+local HOST_RUNTIME = {
+    "/* lusa:net */",
+    "#if defined(_WIN32)",
+    "#include <winsock2.h>",
+    "#include <ws2tcpip.h>",
+    "#include <direct.h>",
+    "#include <sys/stat.h>",
+    "#if defined(_MSC_VER)",
+    '#pragma comment(lib, "ws2_32.lib")',
+    "#endif",
+    "typedef SOCKET lusa_socket_t;",
+    "#define LUSA_NO_SOCKET INVALID_SOCKET",
+    "#else",
+    "#include <sys/types.h>",
+    "#include <sys/stat.h>",
+    "#include <sys/socket.h>",
+    "#include <netinet/in.h>",
+    "#include <arpa/inet.h>",
+    "#include <netdb.h>",
+    "#include <unistd.h>",
+    "typedef int lusa_socket_t;",
+    "#define LUSA_NO_SOCKET (-1)",
+    "#endif",
+    "#include <errno.h>",
+    "#if defined(MSG_NOSIGNAL)",
+    "#define LUSA_SEND_FLAGS MSG_NOSIGNAL",
+    "#else",
+    "#define LUSA_SEND_FLAGS 0",
+    "#endif",
+    "",
+    "enum {",
+    "    LUSA_HOST_FREE = 0,",
+    "    LUSA_HOST_READER = 1,",
+    "    LUSA_HOST_WRITER = 2,",
+    "    LUSA_HOST_LISTENER = 3,",
+    "    LUSA_HOST_STREAM = 4,",
+    "    LUSA_HOST_UDP = 5",
+    "};",
+    "",
+    "#define LUSA_HOST_HANDLES 64",
+    "",
+    "typedef struct LusaHostHandle {",
+    "    int kind;",
+    "    FILE *file;",
+    "    lusa_socket_t socket;",
+    "    struct sockaddr_in peer;",
+    "    bool has_peer;",
+    "} LusaHostHandle;",
+    "",
+    "static LusaHostHandle lusa_host_table[LUSA_HOST_HANDLES];",
+    "static bool lusa_host_ok_flag = true;",
+    "static bool lusa_host_eof_flag = false;",
+    "static char lusa_host_message[512];",
+    "static bool lusa_host_net_ready = false;",
+    "",
+    "static const char *lusa_host_text(LusaString *value) {",
+    '    return value == NULL ? "" : value->data;',
+    "}",
+    "",
+    "static void lusa_host_succeed(void) {",
+    "    lusa_host_ok_flag = true;",
+    "    lusa_host_eof_flag = false;",
+    "    lusa_host_message[0] = 0;",
+    "}",
+    "",
+    "/* Records a failure; `os` appends the operating system's reason. */",
+    "static void lusa_host_fail(const char *what, const char *subject, bool os, bool socket_error) {",
+    "    char reason[128];",
+    "    reason[0] = 0;",
+    "    if (os) {",
+    "#if defined(_WIN32)",
+    "        if (socket_error) {",
+    '            snprintf(reason, sizeof(reason), "socket error %d", WSAGetLastError());',
+    "        } else {",
+    '            snprintf(reason, sizeof(reason), "%s", strerror(errno));',
+    "        }",
+    "#else",
+    "        (void)socket_error;",
+    '        snprintf(reason, sizeof(reason), "%s", strerror(errno));',
+    "#endif",
+    "    }",
+    "    lusa_host_ok_flag = false;",
+    "    lusa_host_eof_flag = false;",
+    "    if (subject != NULL && os) {",
+    '        snprintf(lusa_host_message, sizeof(lusa_host_message), "%s `%s`: %s", what, subject, reason);',
+    "    } else if (subject != NULL) {",
+    '        snprintf(lusa_host_message, sizeof(lusa_host_message), "%s `%s`", what, subject);',
+    "    } else if (os) {",
+    '        snprintf(lusa_host_message, sizeof(lusa_host_message), "%s: %s", what, reason);',
+    "    } else {",
+    '        snprintf(lusa_host_message, sizeof(lusa_host_message), "%s", what);',
+    "    }",
+    "}",
+    "",
+    "static void lusa_host_bad_handle(int32_t handle) {",
+    "    lusa_host_ok_flag = false;",
+    "    lusa_host_eof_flag = false;",
+    '    snprintf(lusa_host_message, sizeof(lusa_host_message), "handle %d is not open", (int)handle);',
+    "}",
+    "",
+    "static void lusa_host_close_socket(lusa_socket_t socket_value) {",
+    "#if defined(_WIN32)",
+    "    closesocket(socket_value);",
+    "#else",
+    "    close(socket_value);",
+    "#endif",
+    "}",
+    "",
+    "static int32_t lusa_host_add(int kind, FILE *file, lusa_socket_t socket_value) {",
+    "    int32_t i;",
+    "    for (i = 0; i < LUSA_HOST_HANDLES; i++) {",
+    "        if (lusa_host_table[i].kind == LUSA_HOST_FREE) {",
+    "            lusa_host_table[i].kind = kind;",
+    "            lusa_host_table[i].file = file;",
+    "            lusa_host_table[i].socket = socket_value;",
+    "            lusa_host_table[i].has_peer = false;",
+    "            lusa_host_succeed();",
+    "            return i + 3;",
+    "        }",
+    "    }",
+    "    if (file != NULL) fclose(file);",
+    "    if (kind >= LUSA_HOST_LISTENER) lusa_host_close_socket(socket_value);",
+    '    lusa_host_fail("too many open handles", NULL, false, false);',
+    "    return -1;",
+    "}",
+    "",
+    "/* The open handle `handle` of kind `kind` (0 accepts any kind). */",
+    "static LusaHostHandle *lusa_host_get(int32_t handle, int kind) {",
+    "    LusaHostHandle *entry;",
+    "    if (handle < 3 || handle >= LUSA_HOST_HANDLES + 3) return NULL;",
+    "    entry = &lusa_host_table[handle - 3];",
+    "    if (entry->kind == LUSA_HOST_FREE) return NULL;",
+    "    if (kind != 0 && entry->kind != kind) return NULL;",
+    "    return entry;",
+    "}",
+    "",
+    "static bool lusa_host_io_ok(void) {",
+    "    return lusa_host_ok_flag;",
+    "}",
+    "",
+    "static LusaString *lusa_host_io_error(void) {",
+    "    return lusa_string_new(lusa_host_message, (uint64_t)strlen(lusa_host_message));",
+    "}",
+    "",
+    "static bool lusa_host_io_eof(void) {",
+    "    return lusa_host_eof_flag;",
+    "}",
+    "",
+    "/* Reads everything left in `file`. */",
+    "static LusaString *lusa_host_read_rest(FILE *file) {",
+    "    size_t capacity = 4096u;",
+    "    size_t length = 0u;",
+    "    char *buffer = (char *)malloc(capacity);",
+    "    LusaString *out;",
+    '    if (buffer == NULL) { lusa_panic("out of memory"); return lusa_string_new("", 0u); }',
+    "    for (;;) {",
+    "        size_t got;",
+    "        if (capacity - length < 1024u) {",
+    "            char *grown = (char *)realloc(buffer, capacity * 2u);",
+    '            if (grown == NULL) { free(buffer); lusa_panic("out of memory"); return lusa_string_new("", 0u); }',
+    "            buffer = grown;",
+    "            capacity = capacity * 2u;",
+    "        }",
+    "        got = fread(buffer + length, 1u, capacity - length, file);",
+    "        length = length + got;",
+    "        if (got == 0u) break;",
+    "    }",
+    "    out = lusa_string_new(buffer, (uint64_t)length);",
+    "    free(buffer);",
+    "    return out;",
+    "}",
+    "",
+    "static LusaString *lusa_host_fs_read(LusaString *path) {",
+    "    const char *name = lusa_host_text(path);",
+    '    FILE *file = fopen(name, "rb");',
+    "    LusaString *text;",
+    "    if (file == NULL) {",
+    '        lusa_host_fail("cannot read", name, true, false);',
+    '        return lusa_string_new("", 0u);',
+    "    }",
+    "    text = lusa_host_read_rest(file);",
+    "    fclose(file);",
+    "    lusa_host_succeed();",
+    "    return text;",
+    "}",
+    "",
+    "static uint32_t lusa_host_fs_write(LusaString *path, LusaString *text, bool append) {",
+    "    const char *name = lusa_host_text(path);",
+    "    size_t length = text == NULL ? 0u : (size_t)text->obj.length;",
+    '    FILE *file = fopen(name, append ? "ab" : "wb");',
+    "    if (file == NULL) {",
+    '        lusa_host_fail("cannot write", name, true, false);',
+    "        return 0u;",
+    "    }",
+    "    if (length != 0u && fwrite(text->data, 1u, length, file) != length) {",
+    '        lusa_host_fail("cannot write", name, true, false);',
+    "        fclose(file);",
+    "        return 0u;",
+    "    }",
+    "    fclose(file);",
+    "    lusa_host_succeed();",
+    "    return (uint32_t)length;",
+    "}",
+    "",
+    "static bool lusa_host_stat(const char *name, bool *is_dir, uint64_t *size) {",
+    "#if defined(_WIN32)",
+    "    struct _stat info;",
+    "    if (_stat(name, &info) != 0) return false;",
+    "    if (is_dir != NULL) *is_dir = (info.st_mode & _S_IFDIR) != 0;",
+    "#else",
+    "    struct stat info;",
+    "    if (stat(name, &info) != 0) return false;",
+    "    if (is_dir != NULL) *is_dir = S_ISDIR(info.st_mode);",
+    "#endif",
+    "    if (size != NULL) *size = (uint64_t)info.st_size;",
+    "    return true;",
+    "}",
+    "",
+    "static bool lusa_host_fs_exists(LusaString *path) {",
+    "    lusa_host_succeed();",
+    "    return lusa_host_stat(lusa_host_text(path), NULL, NULL);",
+    "}",
+    "",
+    "static bool lusa_host_fs_is_dir(LusaString *path) {",
+    "    bool dir = false;",
+    "    lusa_host_succeed();",
+    "    return lusa_host_stat(lusa_host_text(path), &dir, NULL) && dir;",
+    "}",
+    "",
+    "static uint32_t lusa_host_fs_size(LusaString *path) {",
+    "    uint64_t size = 0u;",
+    "    if (!lusa_host_stat(lusa_host_text(path), NULL, &size)) {",
+    '        lusa_host_fail("cannot inspect", lusa_host_text(path), true, false);',
+    "        return 0u;",
+    "    }",
+    "    lusa_host_succeed();",
+    "    return size > 4294967295u ? 4294967295u : (uint32_t)size;",
+    "}",
+    "",
+    "static int lusa_host_mkdir_one(const char *name) {",
+    "#if defined(_WIN32)",
+    "    return _mkdir(name);",
+    "#else",
+    "    return mkdir(name, 0777);",
+    "#endif",
+    "}",
+    "",
+    "static bool lusa_host_fs_mkdir(LusaString *path, bool all) {",
+    "    const char *name = lusa_host_text(path);",
+    "    bool dir = false;",
+    "    if (all) {",
+    "        size_t length = strlen(name);",
+    "        size_t i;",
+    "        char *partial = (char *)malloc(length + 1u);",
+    '        if (partial == NULL) { lusa_panic("out of memory"); return false; }',
+    "        memcpy(partial, name, length + 1u);",
+    "        for (i = 1u; i < length; i++) {",
+    "            if (partial[i] == 47 || partial[i] == 92) {",
+    "                char separator = partial[i];",
+    "                partial[i] = 0;",
+    "                (void)lusa_host_mkdir_one(partial);",
+    "                partial[i] = separator;",
+    "            }",
+    "        }",
+    "        free(partial);",
+    "        (void)lusa_host_mkdir_one(name);",
+    "        if (!lusa_host_stat(name, &dir, NULL) || !dir) {",
+    '            lusa_host_fail("cannot create directory", name, true, false);',
+    "            return false;",
+    "        }",
+    "    } else if (lusa_host_mkdir_one(name) != 0) {",
+    '        lusa_host_fail("cannot create directory", name, true, false);',
+    "        return false;",
+    "    }",
+    "    lusa_host_succeed();",
+    "    return true;",
+    "}",
+    "",
+    "static bool lusa_host_fs_remove(LusaString *path, bool dir) {",
+    "    const char *name = lusa_host_text(path);",
+    "    int rc;",
+    "#if defined(_WIN32)",
+    "    rc = dir ? _rmdir(name) : remove(name);",
+    "#else",
+    "    rc = dir ? rmdir(name) : remove(name);",
+    "#endif",
+    "    if (rc != 0) {",
+    '        lusa_host_fail("cannot remove", name, true, false);',
+    "        return false;",
+    "    }",
+    "    lusa_host_succeed();",
+    "    return true;",
+    "}",
+    "",
+    "static int32_t lusa_host_fs_open(LusaString *path, uint32_t mode) {",
+    "    const char *name = lusa_host_text(path);",
+    '    FILE *file = fopen(name, mode == 0u ? "rb" : (mode == 1u ? "wb" : "ab"));',
+    "    if (file == NULL) {",
+    '        lusa_host_fail("cannot open", name, true, false);',
+    "        return -1;",
+    "    }",
+    "    return lusa_host_add(mode == 0u ? LUSA_HOST_READER : LUSA_HOST_WRITER, file, LUSA_NO_SOCKET);",
+    "}",
+    "",
+    "/* Accumulates one line; `done` is set when a newline ended it. */",
+    "typedef struct LusaHostLine {",
+    "    char *bytes;",
+    "    size_t length;",
+    "    size_t capacity;",
+    "    bool any;",
+    "} LusaHostLine;",
+    "",
+    "static void lusa_host_line_push(LusaHostLine *line, char byte) {",
+    "    if (line->length + 1u >= line->capacity) {",
+    "        size_t capacity = line->capacity == 0u ? 128u : line->capacity * 2u;",
+    "        char *grown = (char *)realloc(line->bytes, capacity);",
+    '        if (grown == NULL) { lusa_panic("out of memory"); return; }',
+    "        line->bytes = grown;",
+    "        line->capacity = capacity;",
+    "    }",
+    "    line->bytes[line->length] = byte;",
+    "    line->length = line->length + 1u;",
+    "}",
+    "",
+    "/* Finishes a line: drops a carriage return before the newline, records whether the",
+    "   input had ended, and returns the text. */",
+    "static LusaString *lusa_host_line_finish(LusaHostLine *line, bool newline) {",
+    "    LusaString *out;",
+    "    if (newline && line->length > 0u && line->bytes[line->length - 1u] == 13) {",
+    "        line->length = line->length - 1u;",
+    "    }",
+    '    out = lusa_string_new(line->bytes == NULL ? "" : line->bytes, (uint64_t)line->length);',
+    "    free(line->bytes);",
+    "    lusa_host_succeed();",
+    "    lusa_host_eof_flag = !line->any;",
+    "    return out;",
+    "}",
+    "",
+    "static LusaString *lusa_host_fs_read_line(int32_t handle) {",
+    "    LusaHostHandle *entry = lusa_host_get(handle, LUSA_HOST_READER);",
+    "    LusaHostLine line = { NULL, 0u, 0u, false };",
+    "    bool newline = false;",
+    "    if (entry == NULL) {",
+    "        lusa_host_bad_handle(handle);",
+    '        return lusa_string_new("", 0u);',
+    "    }",
+    "    for (;;) {",
+    "        int c = fgetc(entry->file);",
+    "        if (c == EOF) break;",
+    "        line.any = true;",
+    "        if (c == 10) {",
+    "            newline = true;",
+    "            break;",
+    "        }",
+    "        lusa_host_line_push(&line, (char)c);",
+    "    }",
+    "    return lusa_host_line_finish(&line, newline);",
+    "}",
+    "",
+    "static LusaString *lusa_host_fs_read_all(int32_t handle) {",
+    "    LusaHostHandle *entry = lusa_host_get(handle, LUSA_HOST_READER);",
+    "    LusaString *text;",
+    "    if (entry == NULL) {",
+    "        lusa_host_bad_handle(handle);",
+    '        return lusa_string_new("", 0u);',
+    "    }",
+    "    text = lusa_host_read_rest(entry->file);",
+    "    lusa_host_succeed();",
+    "    return text;",
+    "}",
+    "",
+    "static uint32_t lusa_host_fs_write_handle(int32_t handle, LusaString *text) {",
+    "    LusaHostHandle *entry = lusa_host_get(handle, LUSA_HOST_WRITER);",
+    "    size_t length = text == NULL ? 0u : (size_t)text->obj.length;",
+    "    if (entry == NULL) {",
+    "        lusa_host_bad_handle(handle);",
+    "        return 0u;",
+    "    }",
+    "    if (length != 0u && fwrite(text->data, 1u, length, entry->file) != length) {",
+    '        lusa_host_fail("cannot write", NULL, true, false);',
+    "        return 0u;",
+    "    }",
+    "    fflush(entry->file);",
+    "    lusa_host_succeed();",
+    "    return (uint32_t)length;",
+    "}",
+    "",
+    "static void lusa_host_close(int32_t handle) {",
+    "    LusaHostHandle *entry = lusa_host_get(handle, 0);",
+    "    if (entry == NULL) {",
+    "        lusa_host_bad_handle(handle);",
+    "        return;",
+    "    }",
+    "    if (entry->file != NULL) fclose(entry->file);",
+    "    if (entry->kind >= LUSA_HOST_LISTENER) lusa_host_close_socket(entry->socket);",
+    "    entry->kind = LUSA_HOST_FREE;",
+    "    entry->file = NULL;",
+    "    entry->socket = LUSA_NO_SOCKET;",
+    "    lusa_host_succeed();",
+    "}",
+    "",
+    "static void lusa_host_fs_close(int32_t handle) {",
+    "    lusa_host_close(handle);",
+    "}",
+    "",
+    "static void lusa_host_net_close(int32_t handle) {",
+    "    lusa_host_close(handle);",
+    "}",
+    "",
+    "static bool lusa_host_net_start(void) {",
+    "#if defined(_WIN32)",
+    "    if (!lusa_host_net_ready) {",
+    "        WSADATA data;",
+    "        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {",
+    '            lusa_host_fail("cannot start Winsock", NULL, false, false);',
+    "            return false;",
+    "        }",
+    "        lusa_host_net_ready = true;",
+    "    }",
+    "#endif",
+    "    return true;",
+    "}",
+    "",
+    "/* Resolves a host:port address to IPv4. */",
+    "static bool lusa_host_resolve(const char *address, int type, struct sockaddr_in *out) {",
+    "    const char *colon = strrchr(address, 58);",
+    "    struct addrinfo hints;",
+    "    struct addrinfo *found = NULL;",
+    "    char host[256];",
+    "    size_t length;",
+    "    if (colon == NULL) return false;",
+    "    length = (size_t)(colon - address);",
+    "    if (length >= sizeof(host)) return false;",
+    "    memcpy(host, address, length);",
+    "    host[length] = 0;",
+    "    memset(&hints, 0, sizeof(hints));",
+    "    hints.ai_family = AF_INET;",
+    "    hints.ai_socktype = type;",
+    "    hints.ai_flags = length == 0u ? AI_PASSIVE : 0;",
+    "    if (getaddrinfo(length == 0u ? NULL : host, colon + 1, &hints, &found) != 0 || found == NULL) {",
+    "        return false;",
+    "    }",
+    "    memcpy(out, found->ai_addr, sizeof(*out));",
+    "    freeaddrinfo(found);",
+    "    return true;",
+    "}",
+    "",
+    "/* A connected or accepted TCP socket must not raise SIGPIPE on macOS. */",
+    "static void lusa_host_quiet(lusa_socket_t socket_value) {",
+    "#if defined(SO_NOSIGPIPE)",
+    "    int yes = 1;",
+    "    setsockopt(socket_value, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&yes, sizeof(yes));",
+    "#else",
+    "    (void)socket_value;",
+    "#endif",
+    "}",
+    "",
+    "/* Opens a socket of `type` and binds it to `address`. */",
+    "static lusa_socket_t lusa_host_bound(const char *address, int type, const char *what) {",
+    "    struct sockaddr_in addr;",
+    "    lusa_socket_t socket_value;",
+    "    if (!lusa_host_net_start()) return LUSA_NO_SOCKET;",
+    "    if (!lusa_host_resolve(address, type, &addr)) {",
+    '        lusa_host_fail("cannot resolve", address, false, false);',
+    "        return LUSA_NO_SOCKET;",
+    "    }",
+    "    socket_value = socket(AF_INET, type, 0);",
+    "    if (socket_value == LUSA_NO_SOCKET) {",
+    "        lusa_host_fail(what, address, true, true);",
+    "        return LUSA_NO_SOCKET;",
+    "    }",
+    "#if !defined(_WIN32)",
+    "    if (type == SOCK_STREAM) {",
+    "        int yes = 1;",
+    "        setsockopt(socket_value, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));",
+    "    }",
+    "#endif",
+    "    if (bind(socket_value, (struct sockaddr *)&addr, sizeof(addr)) != 0) {",
+    "        lusa_host_fail(what, address, true, true);",
+    "        lusa_host_close_socket(socket_value);",
+    "        return LUSA_NO_SOCKET;",
+    "    }",
+    "    return socket_value;",
+    "}",
+    "",
+    "static int32_t lusa_host_net_listen(LusaString *address) {",
+    "    const char *name = lusa_host_text(address);",
+    '    lusa_socket_t socket_value = lusa_host_bound(name, SOCK_STREAM, "cannot listen on");',
+    "    if (socket_value == LUSA_NO_SOCKET) return -1;",
+    "    if (listen(socket_value, 16) != 0) {",
+    '        lusa_host_fail("cannot listen on", name, true, true);',
+    "        lusa_host_close_socket(socket_value);",
+    "        return -1;",
+    "    }",
+    "    return lusa_host_add(LUSA_HOST_LISTENER, NULL, socket_value);",
+    "}",
+    "",
+    "static int32_t lusa_host_net_accept(int32_t handle) {",
+    "    LusaHostHandle *entry = lusa_host_get(handle, LUSA_HOST_LISTENER);",
+    "    lusa_socket_t socket_value;",
+    "    if (entry == NULL) {",
+    "        lusa_host_bad_handle(handle);",
+    "        return -1;",
+    "    }",
+    "    socket_value = accept(entry->socket, NULL, NULL);",
+    "    if (socket_value == LUSA_NO_SOCKET) {",
+    '        lusa_host_fail("accept failed", NULL, true, true);',
+    "        return -1;",
+    "    }",
+    "    lusa_host_quiet(socket_value);",
+    "    return lusa_host_add(LUSA_HOST_STREAM, NULL, socket_value);",
+    "}",
+    "",
+    "static int32_t lusa_host_net_connect(LusaString *address) {",
+    "    const char *name = lusa_host_text(address);",
+    "    struct sockaddr_in addr;",
+    "    lusa_socket_t socket_value;",
+    "    if (!lusa_host_net_start()) return -1;",
+    "    if (!lusa_host_resolve(name, SOCK_STREAM, &addr)) {",
+    '        lusa_host_fail("cannot resolve", name, false, false);',
+    "        return -1;",
+    "    }",
+    "    socket_value = socket(AF_INET, SOCK_STREAM, 0);",
+    "    if (socket_value == LUSA_NO_SOCKET",
+    "        || connect(socket_value, (struct sockaddr *)&addr, sizeof(addr)) != 0) {",
+    '        lusa_host_fail("cannot connect to", name, true, true);',
+    "        if (socket_value != LUSA_NO_SOCKET) lusa_host_close_socket(socket_value);",
+    "        return -1;",
+    "    }",
+    "    lusa_host_quiet(socket_value);",
+    "    return lusa_host_add(LUSA_HOST_STREAM, NULL, socket_value);",
+    "}",
+    "",
+    "static uint32_t lusa_host_net_port(int32_t handle) {",
+    "    LusaHostHandle *entry = lusa_host_get(handle, 0);",
+    "    struct sockaddr_in addr;",
+    "    socklen_t length = (socklen_t)sizeof(addr);",
+    "    if (entry == NULL || entry->kind < LUSA_HOST_LISTENER) {",
+    "        lusa_host_bad_handle(handle);",
+    "        return 0u;",
+    "    }",
+    "    if (getsockname(entry->socket, (struct sockaddr *)&addr, &length) != 0) {",
+    '        lusa_host_fail("cannot read the local address", NULL, true, true);',
+    "        return 0u;",
+    "    }",
+    "    lusa_host_succeed();",
+    "    return (uint32_t)ntohs(addr.sin_port);",
+    "}",
+    "",
+    "static uint32_t lusa_host_net_send(int32_t handle, LusaString *data) {",
+    "    LusaHostHandle *entry = lusa_host_get(handle, LUSA_HOST_STREAM);",
+    "    size_t length = data == NULL ? 0u : (size_t)data->obj.length;",
+    "    size_t sent = 0u;",
+    "    if (entry == NULL) {",
+    "        lusa_host_bad_handle(handle);",
+    "        return 0u;",
+    "    }",
+    "    while (sent < length) {",
+    "        int count = (int)send(entry->socket, data->data + sent, (int)(length - sent), LUSA_SEND_FLAGS);",
+    "        if (count <= 0) {",
+    '            lusa_host_fail("send failed", NULL, true, true);',
+    "            return (uint32_t)sent;",
+    "        }",
+    "        sent = sent + (size_t)count;",
+    "    }",
+    "    lusa_host_succeed();",
+    "    return (uint32_t)length;",
+    "}",
+    "",
+    "static uint32_t lusa_host_clamp(uint32_t max) {",
+    "    if (max < 1u) return 1u;",
+    "    if (max > 65536u) return 65536u;",
+    "    return max;",
+    "}",
+    "",
+    "static LusaString *lusa_host_net_recv(int32_t handle, uint32_t max) {",
+    "    LusaHostHandle *entry = lusa_host_get(handle, LUSA_HOST_STREAM);",
+    "    char *buffer;",
+    "    int count;",
+    "    LusaString *out;",
+    "    if (entry == NULL) {",
+    "        lusa_host_bad_handle(handle);",
+    '        return lusa_string_new("", 0u);',
+    "    }",
+    "    max = lusa_host_clamp(max);",
+    "    buffer = (char *)malloc((size_t)max);",
+    '    if (buffer == NULL) { lusa_panic("out of memory"); return lusa_string_new("", 0u); }',
+    "    count = (int)recv(entry->socket, buffer, (int)max, 0);",
+    "    if (count < 0) {",
+    "        free(buffer);",
+    '        lusa_host_fail("receive failed", NULL, true, true);',
+    '        return lusa_string_new("", 0u);',
+    "    }",
+    "    out = lusa_string_new(buffer, (uint64_t)count);",
+    "    free(buffer);",
+    "    lusa_host_succeed();",
+    "    lusa_host_eof_flag = count == 0;",
+    "    return out;",
+    "}",
+    "",
+    "static LusaString *lusa_host_net_recv_line(int32_t handle) {",
+    "    LusaHostHandle *entry = lusa_host_get(handle, LUSA_HOST_STREAM);",
+    "    LusaHostLine line = { NULL, 0u, 0u, false };",
+    "    bool newline = false;",
+    "    if (entry == NULL) {",
+    "        lusa_host_bad_handle(handle);",
+    '        return lusa_string_new("", 0u);',
+    "    }",
+    "    for (;;) {",
+    "        char byte = 0;",
+    "        int count = (int)recv(entry->socket, &byte, 1, 0);",
+    "        if (count < 0) {",
+    "            free(line.bytes);",
+    '            lusa_host_fail("receive failed", NULL, true, true);',
+    '            return lusa_string_new("", 0u);',
+    "        }",
+    "        if (count == 0) break;",
+    "        line.any = true;",
+    "        if (byte == 10) {",
+    "            newline = true;",
+    "            break;",
+    "        }",
+    "        lusa_host_line_push(&line, byte);",
+    "    }",
+    "    return lusa_host_line_finish(&line, newline);",
+    "}",
+    "",
+    "static int32_t lusa_host_net_udp_bind(LusaString *address) {",
+    '    lusa_socket_t socket_value = lusa_host_bound(lusa_host_text(address), SOCK_DGRAM, "cannot bind");',
+    "    if (socket_value == LUSA_NO_SOCKET) return -1;",
+    "    return lusa_host_add(LUSA_HOST_UDP, NULL, socket_value);",
+    "}",
+    "",
+    "static uint32_t lusa_host_net_send_to(int32_t handle, LusaString *data, LusaString *address) {",
+    "    LusaHostHandle *entry = lusa_host_get(handle, LUSA_HOST_UDP);",
+    "    const char *name = lusa_host_text(address);",
+    "    size_t length = data == NULL ? 0u : (size_t)data->obj.length;",
+    "    struct sockaddr_in addr;",
+    "    int count;",
+    "    if (entry == NULL) {",
+    "        lusa_host_bad_handle(handle);",
+    "        return 0u;",
+    "    }",
+    "    if (!lusa_host_resolve(name, SOCK_DGRAM, &addr)) {",
+    '        lusa_host_fail("cannot resolve", name, false, false);',
+    "        return 0u;",
+    "    }",
+    '    count = (int)sendto(entry->socket, length == 0u ? "" : data->data, (int)length, 0,',
+    "        (struct sockaddr *)&addr, sizeof(addr));",
+    "    if (count < 0) {",
+    '        lusa_host_fail("cannot send to", name, true, true);',
+    "        return 0u;",
+    "    }",
+    "    lusa_host_succeed();",
+    "    return (uint32_t)count;",
+    "}",
+    "",
+    "static LusaString *lusa_host_net_recv_from(int32_t handle, uint32_t max) {",
+    "    LusaHostHandle *entry = lusa_host_get(handle, LUSA_HOST_UDP);",
+    "    struct sockaddr_in from;",
+    "    socklen_t length = (socklen_t)sizeof(from);",
+    "    char *buffer;",
+    "    int count;",
+    "    LusaString *out;",
+    "    if (entry == NULL) {",
+    "        lusa_host_bad_handle(handle);",
+    '        return lusa_string_new("", 0u);',
+    "    }",
+    "    max = lusa_host_clamp(max);",
+    "    buffer = (char *)malloc((size_t)max);",
+    '    if (buffer == NULL) { lusa_panic("out of memory"); return lusa_string_new("", 0u); }',
+    "    count = (int)recvfrom(entry->socket, buffer, (int)max, 0, (struct sockaddr *)&from, &length);",
+    "    if (count < 0) {",
+    "        free(buffer);",
+    '        lusa_host_fail("receive failed", NULL, true, true);',
+    '        return lusa_string_new("", 0u);',
+    "    }",
+    "    entry->peer = from;",
+    "    entry->has_peer = true;",
+    "    out = lusa_string_new(buffer, (uint64_t)count);",
+    "    free(buffer);",
+    "    lusa_host_succeed();",
+    "    return out;",
+    "}",
+    "",
+    "static LusaString *lusa_host_format_peer(const struct sockaddr_in *addr) {",
+    "    const unsigned char *b = (const unsigned char *)&addr->sin_addr;",
+    "    char text[32];",
+    '    snprintf(text, sizeof(text), "%u.%u.%u.%u:%u", (unsigned)b[0], (unsigned)b[1],',
+    "        (unsigned)b[2], (unsigned)b[3], (unsigned)ntohs(addr->sin_port));",
+    "    return lusa_string_new(text, (uint64_t)strlen(text));",
+    "}",
+    "",
+    "static LusaString *lusa_host_net_peer(int32_t handle) {",
+    "    LusaHostHandle *entry = lusa_host_get(handle, 0);",
+    "    if (entry == NULL) {",
+    "        lusa_host_bad_handle(handle);",
+    '        return lusa_string_new("", 0u);',
+    "    }",
+    "    lusa_host_succeed();",
+    "    if (entry->kind == LUSA_HOST_STREAM) {",
+    "        struct sockaddr_in addr;",
+    "        socklen_t length = (socklen_t)sizeof(addr);",
+    "        if (getpeername(entry->socket, (struct sockaddr *)&addr, &length) == 0) {",
+    "            return lusa_host_format_peer(&addr);",
+    "        }",
+    "    } else if (entry->kind == LUSA_HOST_UDP && entry->has_peer) {",
+    "        return lusa_host_format_peer(&entry->peer);",
+    "    }",
+    '    return lusa_string_new("", 0u);',
+    "}",
+    ""
+}
+
 -- ---- cooperative async task runtime --------------------------------------
 
 -- Every `async function` lowers to a stackless state-machine step function.
@@ -7382,6 +9096,9 @@ local TASK_STATUS_RUNTIME = {
 -- normal drop paths keep every owned local deterministic.
 local COROUTINE_RUNTIME = {
     "#if defined(_WIN32)",
+    "#ifndef WIN32_LEAN_AND_MEAN",
+    "#define WIN32_LEAN_AND_MEAN",
+    "#endif",
     "#include <windows.h>",
     "#else",
     "#include <ucontext.h>",
@@ -7661,7 +9378,7 @@ collect_strings_expr = function(expr)
         end
         return
     end
-    if tag == "BoxNew" then
+    if tag == "BoxNew" or tag == "StrBufNew" then
         collect_strings_expr(expr.value)
         return
     end
@@ -7924,8 +9641,11 @@ local function emit_value_payload(expr, value)
 end
 
 local function emit_clone_heap(type_name, value)
-    if type_name == "string" then
+    if type_name == "string" or type_name == "String" then
         return "lusa_string_clone(" .. value .. ")"
+    end
+    if is_map_type(type_name) then
+        return "lusa_map_clone(" .. value .. ")"
     end
     if is_table_type(type_name) then
         return "lusa_table_clone(" .. value .. ")"
@@ -9031,7 +10751,7 @@ local function emit_sum_ctor(expr)
     if is_heap_type(payload) and arg.own == false then
         rendered = emit_clone_heap(payload, rendered)
     elseif arg.own ~= false then
-        null_moved_source(arg, nil)
+        rendered = hand_over_moved(arg, payload, rendered)
     end
     if expr.sum_kind == "ok" then
         return "lusa_result_new_ok_" .. tag_name .. "(" .. rendered .. ")"
@@ -9063,7 +10783,7 @@ local function emit_sum_method_expr(expr)
             local arg = expr.args[1]
             local fallback = emit_expr(clone arg)
             if arg.own ~= false then
-                null_moved_source(arg, nil)
+                fallback = hand_over_moved(arg, expr.ctype, fallback)
             end
             return "lusa_result_unwrap_or_" .. tag_name .. "("
                 .. receiver .. ", " .. fallback .. ")"
@@ -9104,7 +10824,7 @@ local function emit_sum_method_expr(expr)
             local arg = expr.args[1]
             local fallback = emit_expr(clone arg)
             if arg.own ~= false then
-                null_moved_source(arg, nil)
+                fallback = hand_over_moved(arg, expr.ctype, fallback)
             end
             return "lusa_option_unwrap_or_" .. tag_name .. "("
                 .. receiver .. ", " .. fallback .. ")"
@@ -9202,6 +10922,190 @@ local function emit_try_expr(expr)
         .. tag_name .. "(&" .. temp .. ");")
     emit_drop_place(sum_type, temp)
     return out
+end
+
+-- ---- Module 29 collections and host I/O ----------------------------------
+
+-- `HashMap` keys and values travel as 64-bit payloads: integers, f32 bits,
+-- booleans, or a `LusaString *`.
+local function map_payload(type_name, value)
+    if type_name == "string" then
+        return "(uint64_t)(uintptr_t)(" .. value .. ")"
+    end
+    if type_name == "f32" then
+        return "lusa_f32_payload(" .. value .. ")"
+    end
+    if type_name == "bool" then
+        return "(uint64_t)((" .. value .. ") ? 1u : 0u)"
+    end
+    if type_name == "i32" then
+        return "(uint64_t)(int64_t)(int32_t)(" .. value .. ")"
+    end
+    return "(uint64_t)(uint32_t)(" .. value .. ")"
+end
+
+local function map_value_of(type_name, payload)
+    if type_name == "string" then
+        return "((LusaString *)(uintptr_t)(" .. payload .. "))"
+    end
+    if type_name == "f32" then
+        return "lusa_map_f32(" .. payload .. ")"
+    end
+    if type_name == "bool" then
+        return "((" .. payload .. ") != 0u)"
+    end
+    if type_name == "i32" then
+        return "((int32_t)(int64_t)(" .. payload .. "))"
+    end
+    return "((uint32_t)(" .. payload .. "))"
+end
+
+-- Renders an argument whose heap value the callee takes over: a borrowed
+-- value is cloned, and a moved local stops owning its value.
+local function emit_owned_arg(arg, type_name)
+    local rendered = emit_expr(clone arg)
+    if is_heap_type(type_name) and arg.own == false then
+        rendered = emit_clone_heap(type_name, rendered)
+    elseif arg.own ~= false then
+        rendered = hand_over_moved(arg, type_name, rendered)
+    end
+    return rendered
+end
+
+local function emit_map_method(expr)
+    local key_type, value_type = map_info(expr.obj.ctype)
+    local name = expr.map_method
+    local map_value = emit_expr(expr.obj)
+    if name == "insert" then
+        local key = emit_owned_arg(expr.args[1], key_type)
+        local value = emit_owned_arg(expr.args[2], value_type)
+        return "lusa_map_insert(" .. map_value .. ", "
+            .. map_payload(key_type, key) .. ", "
+            .. map_payload(value_type, value) .. ")"
+    end
+    if name == "len" then
+        return "((int32_t)lusa_map_len(" .. map_value .. "))"
+    end
+    if name == "is_empty" then
+        return "(lusa_map_len(" .. map_value .. ") == 0u)"
+    end
+    if name == "clear" then
+        return "lusa_map_clear(" .. map_value .. ")"
+    end
+    local key = map_payload(key_type, emit_expr(expr.args[1]))
+    if name == "get" then
+        local value_c = c_type(value_type)
+        return "lusa_map_get_option(" .. map_value .. ", " .. key
+            .. ", (uint32_t)sizeof(" .. value_c .. "), (uint32_t)LUSA_ALIGNOF("
+            .. value_c .. "))"
+    end
+    if name == "get_or" then
+        local fallback = emit_owned_arg(expr.args[2], value_type)
+        return map_value_of(value_type, "lusa_map_get_or(" .. map_value
+            .. ", " .. key .. ", " .. map_payload(value_type, fallback) .. ")")
+    end
+    if name == "contains_key" then
+        return "lusa_map_contains(" .. map_value .. ", " .. key .. ")"
+    end
+    if name == "remove" then
+        return "lusa_map_remove(" .. map_value .. ", " .. key .. ")"
+    end
+    fail(expr.line, expr.column,
+        "internal: unsupported HashMap method `" .. tostring(name) .. "`")
+end
+
+local function emit_strbuf_method(expr)
+    local name = expr.strbuf_method
+    local buffer = emit_expr(expr.obj)
+    if name == "push_str" or name == "contains" or name == "starts_with"
+        or name == "ends_with" then
+        return "lusa_strbuf_" .. name .. "(" .. buffer .. ", "
+            .. emit_expr(expr.args[1]) .. ")"
+    end
+    if name == "push" then
+        return "lusa_strbuf_push(" .. buffer .. ", (uint32_t)("
+            .. emit_expr(expr.args[1]) .. "))"
+    end
+    if name == "pop" then
+        return "lusa_strbuf_pop(" .. buffer .. ")"
+    end
+    if name == "len" then
+        return "lusa_strbuf_len(" .. buffer .. ")"
+    end
+    if name == "is_empty" then
+        return "(lusa_strbuf_len(" .. buffer .. ") == 0)"
+    end
+    if name == "clear" then
+        return "lusa_strbuf_clear(" .. buffer .. ")"
+    end
+    if name == "as_str" then
+        return "lusa_string_clone(" .. buffer .. ")"
+    end
+    fail(expr.line, expr.column,
+        "internal: unsupported String method `" .. tostring(name) .. "`")
+end
+
+-- `Vec:get`, `insert`, `remove`, and `contains` (Module 29).  The index
+-- expression is evaluated twice by `get` and `insert`, once for the bounds
+-- check and once for the access.
+local function emit_vec_extra(expr, method, element, vec_value)
+    local tag_name = collection_tag(element)
+    local element_c = c_type(element)
+    if method == "get" then
+        local index = emit_expr(expr.args[1])
+        local option_tag = collection_tag("option<" .. element .. ">")
+        local slot = "(((" .. element_c .. " *)(" .. vec_value .. ").data)[(uint32_t)("
+            .. index .. ")])"
+        if is_heap_type(element) then
+            slot = emit_clone_heap(element, slot)
+        end
+        return "(lusa_vec_has(&(" .. vec_value .. "), (int64_t)(" .. index
+            .. ")) ? lusa_option_new_some_" .. option_tag .. "(" .. slot
+            .. ") : lusa_option_none_" .. option_tag .. "())"
+    end
+    if method == "insert" then
+        local index = emit_expr(expr.args[1])
+        local value = emit_owned_arg(expr.args[2], element)
+        return "(lusa_vec_insert_ok(&(" .. vec_value .. "), (int64_t)(" .. index
+            .. ")) ? (lusa_vec_push_" .. tag_name .. "(&(" .. vec_value .. "), "
+            .. value .. "), lusa_vec_rotate_in(&(" .. vec_value
+            .. "), (uint32_t)sizeof(" .. element_c .. "), (int64_t)(" .. index
+            .. "))) : (void)0)"
+    end
+    if method == "remove" then
+        local index = emit_expr(expr.args[1])
+        return "(lusa_vec_rotate_out(&(" .. vec_value .. "), (uint32_t)sizeof("
+            .. element_c .. "), (int64_t)(" .. index .. ")) ? lusa_vec_pop_"
+            .. tag_name .. "(&(" .. vec_value .. ")) : " .. default_c(element) .. ")"
+    end
+    if method == "contains" then
+        local needle = emit_expr(expr.args[1])
+        if element == "string" then
+            return "lusa_vec_contains_string(&(" .. vec_value .. "), " .. needle .. ")"
+        end
+        return "lusa_vec_contains_bytes(&(" .. vec_value .. "), (uint32_t)sizeof("
+            .. element_c .. "), &(" .. element_c .. "){" .. needle .. "})"
+    end
+    fail(expr.line, expr.column,
+        "internal: unsupported Vec method `" .. tostring(method) .. "`")
+end
+
+-- Host intrinsics lower to `lusa_host_<name>` in the I/O runtime.
+local function emit_host_call(expr)
+    local name = expr.host_name
+    local host = borrow HOST_INTRINSICS[name]
+    local args = {}
+    local i = 1
+    while i <= #expr.args do
+        local param = host.params[i]
+        local rendered = emit_expr(expr.args[i])
+        if param ~= "string" then
+            rendered = "(" .. c_type(param) .. ")(" .. rendered .. ")"
+        end
+        args[i] = rendered
+        i = i + 1
+    end
+    return "lusa_host_" .. string.sub(name, 3) .. "(" .. table.concat(args, ", ") .. ")"
 end
 
 -- True when `await_expr` awaits a fresh `f(...)` call: nothing else holds
@@ -9446,6 +11350,17 @@ emit_expr = function(expr)
                 "`task." .. string.sub(expr.builtin, 6)
                 .. "(...)` must be used as a standalone statement")
         end
+        if expr.builtin == "host" then
+            return emit_host_call(expr)
+        end
+        if expr.builtin == "tostring" then
+            local kind = expr.tostring_type
+            local value = emit_expr(expr.args[1])
+            if kind == "string" or kind == "String" then
+                return "lusa_string_clone(" .. value .. ")"
+            end
+            return "lusa_tostring_" .. kind .. "(" .. value .. ")"
+        end
         if expr.builtin == "task_wake" then
             return "lusa_task_wake((uint32_t)(" .. emit_expr(expr.args[1]) .. "))"
         end
@@ -9505,6 +11420,19 @@ emit_expr = function(expr)
     if tag == "Move" then
         return emit_expr(expr.value)
     end
+    if tag == "StrBufNew" then
+        -- A `String` reallocates its bytes, so it starts from its own heap
+        -- copy unless the initializer is an owned temporary.
+        local inner = expr.value
+        local rendered = emit_expr(clone inner)
+        if inner.own == true then
+            return hand_over_moved(inner, "string", rendered)
+        end
+        return "lusa_string_clone(" .. rendered .. ")"
+    end
+    if tag == "MapNew" then
+        return default_c(expr.ctype)
+    end
     if tag == "BoxNew" then
         local inner = expr.value
         local value_type = box_element(expr.ctype)
@@ -9512,12 +11440,11 @@ emit_expr = function(expr)
         if inner.own == false and is_heap_type(value_type) then
             rendered = emit_clone_heap(value_type, rendered)
         end
-        local boxed = "lusa_box_new_" .. collection_tag(box_element(expr.ctype))
-            .. "(" .. rendered .. ")"
         if inner.own ~= false then
-            null_moved_source(inner, nil)
+            rendered = hand_over_moved(inner, value_type, rendered)
         end
-        return boxed
+        return "lusa_box_new_" .. collection_tag(box_element(expr.ctype))
+            .. "(" .. rendered .. ")"
     end
     if tag == "StructLit" then
         local layout = borrow check_structs[expr.name]
@@ -9574,10 +11501,10 @@ emit_expr = function(expr)
             if is_heap_type(array_element) and item.own == false then
                 value = emit_clone_heap(array_element, clone value)
             end
-            parts[#parts + 1] = emit_cast_to(array_element, value)
             if item.own ~= false then
-                null_moved_source(item, nil)
+                value = hand_over_moved(item, array_element, value)
             end
+            parts[#parts + 1] = emit_cast_to(array_element, value)
             i = i + 1
         end
         return "((" .. c_type(array_element) .. "["
@@ -9703,6 +11630,12 @@ emit_expr = function(expr)
         return "(*(" .. emit_expr(expr.value) .. "))"
     end
     if tag == "MethodCall" then
+        if expr.map_method ~= nil then
+            return emit_map_method(expr)
+        end
+        if expr.strbuf_method ~= nil then
+            return emit_strbuf_method(expr)
+        end
         if expr.vec_method ~= nil then
             -- Capture the receiver type first: `emit_expr` moves heap values.
             local obj_type = expr.obj.ctype
@@ -9710,6 +11643,10 @@ emit_expr = function(expr)
             local tag_name = collection_tag(element)
             local method = expr.vec_method
             local vec_value = emit_expr(expr.obj)
+            if method == "get" or method == "insert" or method == "remove"
+                or method == "contains" then
+                return emit_vec_extra(expr, method, element, vec_value)
+            end
             if method == "push" then
                 local value = emit_expr(expr.args[1])
                 return "(lusa_vec_push_" .. tag_name .. "(&(" .. vec_value
@@ -9863,7 +11800,7 @@ local function emit_print_call(call)
         local arg_column = arg.column
         local arg_builtin = arg.builtin
         local value = emit_expr(arg)
-        if type_name == "string" then
+        if type_name == "string" or type_name == "String" then
             local owned_temp = nil
             if arg_builtin == "string_match" or arg_builtin == "string_gsub" then
                 owned_temp = fresh("print_text")
@@ -10293,6 +12230,58 @@ local function table_getter_for_type(type_name)
 end
 
 local function emit_for_in(stmt)
+    if stmt.iter_kind == "vec_iter" or stmt.iter_kind == "map_iter" then
+        -- Module 29: walk the elements in place; the loop variables are
+        -- borrowed views, so nothing is cloned or dropped per iteration.
+        local key_type = stmt.key_type
+        local value_type = stmt.value_type
+        local receiver = emit_expr(stmt.iter.obj)
+        local position = fresh("it")
+        emit_scope_enter()
+        local loop_scope = emit_scope_count
+        emit_loop_stack[#emit_loop_stack + 1] = loop_scope
+        if stmt.iter_kind == "vec_iter" then
+            line("for (uint32_t " .. position .. " = 0u; !lusa_error_pending && "
+                .. position .. " < (" .. receiver .. ").len; " .. position
+                .. "++) {")
+        else
+            line("for (uint32_t " .. position .. " = lusa_map_next(" .. receiver
+                .. ", 0u); !lusa_error_pending && " .. position
+                .. " < lusa_map_used(" .. receiver .. "); " .. position
+                .. " = lusa_map_next(" .. receiver .. ", " .. position
+                .. " + 1u)) {")
+        end
+        emit_indent = emit_indent + 1
+        emit_scope_enter()
+        local key_entry = emit_scope_declare(stmt.vars[1], key_type, false, false)
+        if stmt.iter_kind == "vec_iter" then
+            line("int32_t " .. key_entry.cname .. " = (int32_t)" .. position .. ";")
+        else
+            line(c_type(key_type) .. " " .. key_entry.cname .. " = "
+                .. map_value_of(key_type, "lusa_map_key_at(" .. receiver .. ", "
+                .. position .. ")") .. ";")
+        end
+        if #stmt.vars >= 2 then
+            local value_entry = emit_scope_declare(stmt.vars[2], value_type,
+                false, false)
+            if stmt.iter_kind == "vec_iter" then
+                line(c_type(value_type) .. " " .. value_entry.cname .. " = (("
+                    .. c_type(value_type) .. " *)(" .. receiver .. ").data)["
+                    .. position .. "];")
+            else
+                line(c_type(value_type) .. " " .. value_entry.cname .. " = "
+                    .. map_value_of(value_type, "lusa_map_value_at(" .. receiver
+                    .. ", " .. position .. ")") .. ";")
+            end
+        end
+        emit_block_statements(stmt.body)
+        emit_leave_scope()
+        emit_indent = emit_indent - 1
+        line("}")
+        emit_loop_stack[#emit_loop_stack] = nil
+        emit_leave_scope()
+        return
+    end
     if stmt.iter_kind == "gmatch" then
         local call = stmt.iter
         local source = emit_expr(call.string_source)
@@ -11483,6 +13472,34 @@ local function emit_c_impl(ast)
     while i <= #HEAP_RUNTIME do
         put(HEAP_RUNTIME[i])
         i = i + 1
+    end
+    -- Module 29 runtimes, only when the program uses them.  `String`,
+    -- `HashMap`, and host I/O need the hosted runtime; the checker rejects
+    -- them in `#[no_std]` programs.
+    local extras = {}
+    if uses_vec_extra_runtime then
+        extras[#extras + 1] = VEC_EXTRA_RUNTIME
+    end
+    if not ast.no_std then
+        if uses_strbuf_runtime or uses_vec_extra_runtime then
+            extras[#extras + 1] = STRBUF_RUNTIME
+        end
+        if uses_map_runtime then
+            extras[#extras + 1] = MAP_RUNTIME
+        end
+        if uses_host_runtime then
+            extras[#extras + 1] = HOST_RUNTIME
+        end
+    end
+    local e = 1
+    while e <= #extras do
+        local chunk = extras[e]
+        i = 1
+        while i <= #chunk do
+            put(chunk[i])
+            i = i + 1
+        end
+        e = e + 1
     end
     if emit_async_has or check_uses_tasks then
         local task_alloc = TASK_ALLOC_HOSTED

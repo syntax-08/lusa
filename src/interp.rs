@@ -81,6 +81,9 @@ pub struct Interp {
     pub task_queue: std::collections::VecDeque<Rc<RefCell<crate::value::TaskObj>>>,
     /// parked tasks, the tick clock, and the wake stamps of the executor
     pub executor: crate::task::Executor,
+    /// open files and sockets of `lusa::fs` / `lusa::net` and the status of
+    /// the last host call
+    pub host: crate::host::HostState,
     /// simulated global interrupt mask used by `interrupts_disable` and
     /// friends.  Native builds lower the same calls to CPUI/PRIMASK or
     /// `mstatus.MIE`; the sandbox only needs to return the previous state.
@@ -135,6 +138,7 @@ impl Interp {
             coroutine_captures: Vec::new(),
             task_queue: std::collections::VecDeque::new(),
             executor: crate::task::Executor::default(),
+            host: crate::host::HostState::default(),
             interrupts_enabled: true,
         }
     }
@@ -870,12 +874,23 @@ impl Interp {
                     if box_annotation(ann).is_some() {
                         let current = vals[i].clone();
                         vals[i] = crate::builtins::box_value(current);
+                    } else if let Some(kind) = crate::ast::collection_wrap(ann) {
+                        let current = vals[i].clone();
+                        vals[i] = crate::collections::wrap(kind, current, span)?;
                     }
                 }
                 continue;
             }
             if let Some(ann) = annotations.get(i).and_then(|a| a.as_deref()) {
-                if ann.starts_with('*') {
+                if let Some(kind) = crate::ast::collection_wrap(ann) {
+                    // An uninitialized `String` is empty, a `HashMap` has no
+                    // entries.
+                    vals[i] = if kind == 0 {
+                        crate::collections::string_value(Arc::from(""))
+                    } else {
+                        crate::collections::map_value()
+                    };
+                } else if ann.starts_with('*') {
                     // raw pointer: a cell index into the simulated address space
                     vals[i] = Value::Number(0.0);
                 } else if let Some((element, length)) = array_annotation(ann) {

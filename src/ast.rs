@@ -21,6 +21,19 @@ pub fn vec_annotation(ann: &str) -> Option<&str> {
     ann.strip_prefix("vec<")?.strip_suffix('>')
 }
 
+/// The wrapper an annotation asks the dynamic engines to build around a
+/// local's initializer: 0 for `String`, 1 for `HashMap<K, V>` (canonical
+/// `map<K,V>`).  Both are tagged tables (`crate::collections`).
+pub fn collection_wrap(ann: &str) -> Option<u8> {
+    if ann == "String" {
+        Some(0)
+    } else if ann.starts_with("map<") && ann.ends_with('>') {
+        Some(1)
+    } else {
+        None
+    }
+}
+
 /// Splits a canonical `box<T>` annotation into its element spelling.  The
 /// dynamic engines tag boxed values so `*b` can read and write the pointee
 /// without the raw-pointer `unsafe` gate.

@@ -1171,6 +1171,14 @@ fn exec_instr(ins: &Instr, interp: &mut Interp) -> LResult<StepOutcome> {
             interp.vm.last_ret = 1;
             StepOutcome::Continue
         }
+        Instr::Wrap(kind) => {
+            let v = pop1(interp);
+            let span = current_span(interp);
+            let wrapped = crate::collections::wrap(*kind, v, span)?;
+            interp.vm.stack.push(wrapped);
+            interp.vm.last_ret = 1;
+            StepOutcome::Continue
+        }
         Instr::BorrowErr => {
             return Err(err(
                 E_RUNTIME,
@@ -1777,7 +1785,7 @@ fn call_method(
     if let (Value::Table(table), Value::Str(name)) = (obj_value.base_value(), &key) {
         let is_sum = Interp::is_sum_method(name)
             && Value::Table(Rc::clone(table)).sum_parts().is_some();
-        if table.get(&key).is_none() && (is_sum || Interp::is_vec_method(name)) {
+        if table.get(&key).is_none() && (is_sum || crate::collections::handles(table, name)) {
             if n_takes != 0 {
                 finalize_args(interp, false, n_takes)?;
             }
@@ -1789,7 +1797,7 @@ fn call_method(
             let results = if is_sum {
                 interp.sum_method_call(&Rc::clone(table), name, values, span)?
             } else {
-                interp.vec_method_call(&Rc::clone(table), name, values, span)?
+                crate::collections::call(interp, &Rc::clone(table), name, values, span)?
             };
             let n = results.len();
             interp.vm.stack.reserve(n);

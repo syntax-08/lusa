@@ -173,6 +173,9 @@ pub enum Instr {
     AwaitPoll(i32),
     /// Wraps TOS in a dynamic-engine `Box<T>` (idempotent for existing boxes).
     MakeBox,
+    /// Wraps TOS in a dynamic-engine `String` (0) or `HashMap` (1) for an
+    /// annotated local (`crate::collections::wrap`).
+    Wrap(u8),
     BorrowErr, // borrow is rejected in bytecode mode
     // calls — `nt` = number of journaled argument takes finalized by this call
     // (builtins restore them, matching the interpreter's `is_builtin()` rules)
@@ -1610,6 +1613,9 @@ fn compile_local(
                 if box_annotation(ann).is_some() {
                     c.set_line(v.span);
                     c.em(Instr::MakeBox);
+                } else if let Some(kind) = crate::ast::collection_wrap(ann) {
+                    c.set_line(v.span);
+                    c.em(Instr::Wrap(kind));
                 }
             }
         }
@@ -1627,6 +1633,16 @@ fn compile_local(
             }
             Some(ann) if vec_annotation(ann).is_some() => {
                 c.em(Instr::NewTable);
+            }
+            Some(ann) if crate::ast::collection_wrap(ann).is_some() => {
+                let kind = crate::ast::collection_wrap(ann).unwrap();
+                if kind == 0 {
+                    let k = c.konst(&ConstKey::of(&Value::Str(Arc::from(""))));
+                    c.em(Instr::LoadConst(k));
+                } else {
+                    c.em(Instr::NewTable);
+                }
+                c.em(Instr::Wrap(kind));
             }
             Some(ann) if array_annotation(ann).is_some() => {
                 let (element, length) = array_annotation(ann).unwrap();
