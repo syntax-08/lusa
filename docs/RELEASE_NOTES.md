@@ -63,7 +63,15 @@ Download `lusa-setup.zip` or the platform tarball.
 
 ## Current release
 
-The v2.5.0 body is [`.github/release-notes/v2.5.0.md`](../.github/release-notes/v2.5.0.md).
+The v2.5.1 body is [`.github/release-notes/v2.5.1.md`](../.github/release-notes/v2.5.1.md).
+It follows this structure and documents a fix release: validated package
+names in `lusalang install`/`uninstall`, streaming `print` in the
+interpreter, the VM, and the REPL, `SHA256SUMS` checked by `self-update` with
+automatic rollback, defined `i32` overflow in native code, and the
+`tests/cli.rs` and `tests/parity.rs` suites.
+
+The v2.5.0 body remains at
+[`.github/release-notes/v2.5.0.md`](../.github/release-notes/v2.5.0.md).
 It follows this structure and documents the host software ecosystem: the
 built-in `HashMap<K, V>` and growable `String`, the new `Vec<T>` methods
 (`get`, `insert`, `remove`, `contains`, `iter`), `lusa::collections`,

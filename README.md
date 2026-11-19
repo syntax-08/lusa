@@ -1864,6 +1864,10 @@ Near-term milestones:
   `Vec<T>` `get`/`insert`/`remove`/`contains`/`iter`, `lusa::fs` files,
   directories, and handles, `lusa::net` TCP and UDP sockets, native
   `tostring`, and an HTTP server example.
+- **v2.5.1 (shipped):** fix release — validated package names in
+  `install`/`uninstall`, streaming `print` in the interpreter, VM, and REPL,
+  SHA-256-verified `self-update` with rollback, defined `i32` overflow in
+  native code, and an engine parity test suite.
 
 Also planned: expand bytecode VM coverage (`borrow` is interpreter-only
 today), make the VM the default engine, and complete native self-hosting of
