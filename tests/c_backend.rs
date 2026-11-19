@@ -25,13 +25,16 @@ fn typed_locals_and_default_inference() {
     let c = emit(
         "local n = 42\n\
          local amount = 2.5\n\
+         local ratio: f32 = 0.5\n\
          local id: u32 = 1\n\
          local signed: i32 = -5\n\
          local big: i128 = 1234567890123\n\
-         print(n, amount, id, signed, big)\n\
+         print(n, amount, ratio, id, signed, big)\n\
          return 0\n",
     );
     assert_has(&c, "int32_t init");
+    // untyped decimals are f64 (`double`); `: f32` still selects `float`
+    assert_has(&c, "double init");
     assert_has(&c, "float init");
     assert_has(&c, "uint32_t init");
     assert_has(&c, "lusa_i128 init");

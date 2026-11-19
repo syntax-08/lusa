@@ -12,9 +12,12 @@
 -- portable C11 translation unit.  The generated file uses the host C
 -- toolchain for the final native executable.
 --
--- Supported scalar types: i32, u32, i128 and f32.  `bool`, `string` and
+-- Supported scalar types: i32, u32, i128, f32 and f64.  `bool`, `string` and
 -- homogeneous array tables are supported as helper types.  Untyped integer
--- literals default to i32 and untyped decimal literals default to f32.
+-- literals default to i32 and untyped decimal literals default to f64, like
+-- the dynamic engines.  `/` always divides in floating point: integer
+-- operands are widened to f64 (two f32 operands stay f32).  Use `//` for
+-- integer division.
 --
 -- Ownership remains static: owned heap locals receive a drop at lexical
 -- scope exit, before return/break, and before assignment overwrites a value.
@@ -54,6 +57,10 @@ local function type_fail(code, line, column, message, expected, found)
     end
     if found ~= nil then
         parts[#parts + 1] = "   = found    `" .. tostring(found) .. "`"
+    end
+    if found == "f64" and (expected == "i32" or expected == "u32"
+        or expected == "i128") then
+        parts[#parts + 1] = "   = help: `/` always produces a float; use `//` for integer division"
     end
     error(table.concat(parts, "\n"))
 end
@@ -495,7 +502,7 @@ end
 -- Cargo-style `error[E....]` diagnostics and abort the compilation.
 
 local TYPE_NAMES = {
-    i32 = true, u32 = true, i128 = true, f32 = true,
+    i32 = true, u32 = true, i128 = true, f32 = true, f64 = true,
     bool = true, string = true, table = true, String = true,
     ["nil"] = true, void = true, auto = true
 }
@@ -781,9 +788,9 @@ local function canonical_type(name, line, column)
                 .. tostring(key) .. "`")
         end
         if value ~= "string" and value ~= "i32" and value ~= "u32"
-            and value ~= "f32" and value ~= "bool" then
+            and value ~= "f32" and value ~= "f64" and value ~= "bool" then
             type_fail("E0301", line, column,
-                "HashMap values must be `string`, `i32`, `u32`, `f32`, or `bool`, found `"
+                "HashMap values must be `string`, `i32`, `u32`, `f32`, `f64`, or `bool`, found `"
                 .. tostring(value) .. "`")
         end
         uses_map_runtime = true
@@ -916,11 +923,27 @@ end
 
 local function is_numeric(type_name)
     return type_name == "i32" or type_name == "u32"
-        or type_name == "i128" or type_name == "f32"
+        or type_name == "i128" or type_name == "f32" or type_name == "f64"
 end
 
 local function is_integer_type(type_name)
     return type_name == "i32" or type_name == "u32" or type_name == "i128"
+end
+
+local function is_float_type(type_name)
+    return type_name == "f32" or type_name == "f64"
+end
+
+-- Mixed arithmetic and comparisons widen exactly to f64: every i32, u32 and
+-- f32 value is representable, so `n + 0.5` or `total / count` behave like the
+-- dynamic engines.  i128 never widens implicitly (it would lose precision).
+local function widens_to_f64(lhs_type, rhs_type)
+    local function exact(type_name)
+        return type_name == "i32" or type_name == "u32"
+            or type_name == "f32" or type_name == "f64"
+    end
+    return (lhs_type == "f64" or rhs_type == "f64")
+        and exact(lhs_type) and exact(rhs_type)
 end
 
 local function struct_owns_heap(type_name)
@@ -1055,6 +1078,27 @@ local function literal_int(expr)
     return nil
 end
 
+-- Any numeric literal, integer or decimal, may take a float annotation.
+local function literal_number(expr)
+    if expr == nil then
+        return nil
+    end
+    if expr.tag == "Paren" then
+        return literal_number(expr.value)
+    end
+    if expr.tag == "Unary" and expr.op == "-" then
+        local value = literal_number(expr.value)
+        if value ~= nil then
+            return -value
+        end
+        return nil
+    end
+    if expr.tag == "Number" then
+        return expr.value
+    end
+    return nil
+end
+
 local function integer_fits(type_name, value)
     if type_name == "i32" then
         return value >= -2147483648 and value <= 2147483647
@@ -1163,8 +1207,8 @@ local function assignable(target, source, expr)
             return true
         end
     end
-    if target == "f32" then
-        local value = literal_int(expr)
+    if target == "f32" or target == "f64" then
+        local value = literal_number(expr)
         if value ~= nil then
             return true
         end
@@ -1208,7 +1252,7 @@ local function coerce_literal(expr, target)
     end
     if expr.tag == "Number" and is_numeric(target) then
         expr.ctype = target
-        if target == "f32" then
+        if target == "f32" or target == "f64" then
             expr.float = true
         end
         return expr
@@ -2370,7 +2414,7 @@ end
 -- here instead of failing while the helper is generated.
 local function sum_printable_payload(type_name)
     if type_name == "nil" or type_name == "i32" or type_name == "u32"
-        or type_name == "i128" or type_name == "f32"
+        or type_name == "i128" or type_name == "f32" or type_name == "f64"
         or type_name == "bool" or type_name == "string"
         or type_name == "table" or type_name == "value"
         or table_element(type_name) ~= nil then
@@ -2923,10 +2967,10 @@ local function check_call(expr)
         end
         local checked_arg, arg_type = check_expr(args[1])
         if arg_type ~= "i32" and arg_type ~= "u32" and arg_type ~= "f32"
-            and arg_type ~= "bool" and arg_type ~= "string"
-            and arg_type ~= "String" then
+            and arg_type ~= "f64" and arg_type ~= "bool"
+            and arg_type ~= "string" and arg_type ~= "String" then
             type_fail("E0308", checked_arg.line, checked_arg.column,
-                "native `tostring` converts `i32`, `u32`, `f32`, `bool`, or string values, not `"
+                "native `tostring` converts `i32`, `u32`, `f32`, `f64`, `bool`, or string values, not `"
                 .. tostring(arg_type) .. "`")
         end
         if check_no_std then
@@ -3128,7 +3172,7 @@ local function check_vec_method(expr, receiver, vec_type)
                 "`Vec:contains` takes one value, found " .. tostring(#args))
         end
         if element ~= "i32" and element ~= "u32" and element ~= "i128"
-            and element ~= "f32" and element ~= "bool"
+            and element ~= "f32" and element ~= "f64" and element ~= "bool"
             and element ~= "string" then
             type_fail("E0312", expr.line, expr.column,
                 "`Vec:contains` compares scalar or string elements, not `"
@@ -3719,7 +3763,7 @@ check_expr = function(expr)
             is_float = is_float or not is_integer(numeric_value)
         end
         if is_float then
-            expr.ctype = "f32"
+            expr.ctype = "f64"
         else
             if not integer_fits("i32", numeric_value) then
                 expr.ctype = "i128"
@@ -3808,7 +3852,7 @@ check_expr = function(expr)
             if not is_numeric(operand) or operand == "u32" then
                 type_fail("E0308", line, column,
                     "unary `-` requires a signed numeric value",
-                    "i32 | i128 | f32", operand)
+                    "i32 | i128 | f32 | f64", operand)
             end
             result.ctype = operand
             return result, operand
@@ -3881,6 +3925,10 @@ check_expr = function(expr)
                 elseif assignable(rhs_type, lhs_type, clone checked_lhs) then
                     common = rhs_type
                     checked_lhs = coerce_literal(checked_lhs, rhs_type)
+                elseif widens_to_f64(lhs_type, rhs_type) then
+                    common = "f64"
+                    if lhs_type ~= "f64" then expr.lhs_cast = "f64" end
+                    if rhs_type ~= "f64" then expr.rhs_cast = "f64" end
                 else
                     check_mismatch(line, column, "comparison",
                         lhs_type, rhs_type)
@@ -3910,14 +3958,25 @@ check_expr = function(expr)
                 elseif assignable(rhs_type, lhs_type, clone checked_lhs) then
                     common = rhs_type
                     checked_lhs = coerce_literal(checked_lhs, rhs_type)
+                elseif widens_to_f64(lhs_type, rhs_type) then
+                    common = "f64"
+                    if lhs_type ~= "f64" then expr.lhs_cast = "f64" end
+                    if rhs_type ~= "f64" then expr.rhs_cast = "f64" end
                 else
                     check_mismatch(line, column, "arithmetic",
                         lhs_type, rhs_type)
                 end
             end
+            if op == "/" and not is_float_type(common) then
+                -- `/` is floating-point division in every engine; integer
+                -- operands are converted to f64 first (`7 / 2` is 3.5).
+                expr.lhs_cast = "f64"
+                expr.rhs_cast = "f64"
+                common = "f64"
+            end
             if op == "^" and common == "u32" then
                 type_fail("E0312", line, column,
-                    "integer exponentiation for `u32` is not supported; use i32, i128 or f32")
+                    "integer exponentiation for `u32` is not supported; use i32, i128, f32 or f64")
             end
             result_type = common
         else
@@ -4953,7 +5012,7 @@ local function check_struct_decl(stmt)
         local field = clone stmt.fields[i]
         local field_type = canonical_type(field.type, field.line, field.column)
         local valid = field_type == "u32" or field_type == "i32"
-            or field_type == "i128" or field_type == "f32"
+            or field_type == "i128" or field_type == "f32" or field_type == "f64"
             or field_type == "bool" or field_type == "string"
             or is_table_type(field_type) or is_array_type(field_type)
             or is_vec_type(field_type) or is_box_type(field_type)
@@ -5870,6 +5929,7 @@ local function c_type(type_name)
     if type_name == "u32" then return "uint32_t" end
     if type_name == "i128" then return "lusa_i128" end
     if type_name == "f32" then return "float" end
+    if type_name == "f64" then return "double" end
     if type_name == "bool" then return "bool" end
     if type_name == "string" or type_name == "String" then return "LusaString *" end
     if is_map_type(type_name) then return "LusaMap *" end
@@ -5917,6 +5977,7 @@ local function map_elem_kind(type_name)
     if type_name == "i32" then return "LUSA_ELEM_I32" end
     if type_name == "u32" then return "LUSA_ELEM_U32" end
     if type_name == "f32" then return "LUSA_ELEM_F32" end
+    if type_name == "f64" then return "LUSA_ELEM_F64" end
     if type_name == "bool" then return "LUSA_ELEM_BOOL" end
     return "LUSA_ELEM_STRING"
 end
@@ -5934,6 +5995,7 @@ local function default_c(type_name)
             .. map_elem_kind(value_type) .. ")"
     end
     if type_name == "f32" then return "0.0f" end
+    if type_name == "f64" then return "0.0" end
     if type_name == "bool" then return "false" end
     if type_name == "i32" or type_name == "u32" or type_name == "i128" then
         return "0"
@@ -5984,6 +6046,7 @@ local function elem_kind(type_name)
     if type_name == "u32" then return "LUSA_ELEM_U32" end
     if type_name == "i128" then return "LUSA_ELEM_I128" end
     if type_name == "f32" then return "LUSA_ELEM_F32" end
+    if type_name == "f64" then return "LUSA_ELEM_F64" end
     if type_name == "bool" then return "LUSA_ELEM_BOOL" end
     if type_name == "string" then return "LUSA_ELEM_STRING" end
     if type_name == "table" or table_element(type_name) ~= nil then
@@ -6538,6 +6601,7 @@ local RUNTIME = {
     "#define LUSA_ELEM_BOOL    5u",
     "#define LUSA_ELEM_STRING  6u",
     "#define LUSA_ELEM_TABLE   7u",
+    "#define LUSA_ELEM_F64     8u",
     "",
     "typedef struct LusaObj {",
     "    uint64_t type;",
@@ -6823,6 +6887,12 @@ local RUNTIME = {
     "    if (value.kind == LUSA_ELEM_F32) memcpy(&out, &bits, sizeof(out));",
     "    return out;",
     "}",
+    "static double lusa_table_get_f64_key(LusaTable *table, LusaString *key) {",
+    "    LusaValue value = lusa_table_get_value(table, key);",
+    "    double out = 0.0;",
+    "    if (value.kind == LUSA_ELEM_F64) memcpy(&out, &value.payload, sizeof(out));",
+    "    return out;",
+    "}",
     "static LusaTable *lusa_table_get_table_key(LusaTable *table, LusaString *key) {",
     "    LusaValue value = lusa_table_get_value(table, key);",
     "    return value.kind == LUSA_ELEM_TABLE ? (LusaTable *)(uintptr_t)value.payload : NULL;",
@@ -6987,6 +7057,15 @@ local RUNTIME = {
     "    memcpy(&value, &bits, sizeof(value));",
     "    return value;",
     "}",
+    "static double lusa_table_get_f64_at(LusaTable *table, int64_t index) {",
+    "    uint64_t position;",
+    "    double value = 0.0;",
+    "    if (table == NULL) return 0.0;",
+    "    position = lusa_index(table->obj.length, index);",
+    "    if (lusa_error_pending) return 0.0;",
+    "    memcpy(&value, &table->items[position], sizeof(value));",
+    "    return value;",
+    "}",
     "static LusaValue lusa_table_get_value_at(LusaTable *table, int64_t index) {",
     "    LusaValue out = { table == NULL ? LUSA_ELEM_UNKNOWN : table->elem_kind, 0u };",
     "    uint64_t position;",
@@ -7006,12 +7085,79 @@ local RUNTIME = {
     "    memcpy(&bits, &value, sizeof(bits));",
     "    return (uint64_t)bits;",
     "}",
+    "static void lusa_table_set_f64(LusaTable *table, uint64_t position, double value) {",
+    "    memcpy(&table->items[position], &value, sizeof(value));",
+    "}",
+    "static uint64_t lusa_f64_payload(double value) {",
+    "    uint64_t bits = 0u;",
+    "    memcpy(&bits, &value, sizeof(bits));",
+    "    return bits;",
+    "}",
+    "",
+    "/* Formats an f64 exactly like the interpreter and VM: integral values",
+    "   below 1e15 without a fraction, everything else as the shortest",
+    "   decimal that round-trips, written out without an exponent. */",
+    "static void lusa_format_f64(double value, char *out, size_t size) {",
+    "    char sci[40];",
+    "    char digits[24];",
+    "    int precision;",
+    "    int count = 0;",
+    "    int exponent;",
+    "    size_t at = 0u;",
+    "    const char *p;",
+    '    if (value != value) { snprintf(out, size, "nan"); return; }',
+    '    if (value > 1.7976931348623157e308) { snprintf(out, size, "inf"); return; }',
+    '    if (value < -1.7976931348623157e308) { snprintf(out, size, "-inf"); return; }',
+    "    if (value == floor(value) && fabs(value) < 1e15) {",
+    '        snprintf(out, size, "%.0f", value);',
+    "        return;",
+    "    }",
+    "    for (precision = 1; precision <= 17; precision++) {",
+    '        snprintf(sci, sizeof(sci), "%.*e", precision - 1, value);',
+    "        if (strtod(sci, NULL) == value) break;",
+    "    }",
+    "    p = sci;",
+    "    if (*p == 45) { if (at + 1u < size) out[at++] = 45; p++; }",
+    "    while (*p != 0 && *p != 101 && *p != 69) {",
+    "        if (*p >= 48 && *p <= 57 && count < 23) digits[count++] = *p;",
+    "        p++;",
+    "    }",
+    "    exponent = (*p != 0) ? atoi(p + 1) : 0;",
+    "    while (count > 1 && digits[count - 1] == 48) count--;",
+    "    if (exponent < 0) {",
+    "        int i;",
+    "        if (at + 1u < size) out[at++] = 48;",
+    "        if (at + 1u < size) out[at++] = 46;",
+    "        for (i = 0; i < -exponent - 1; i++) if (at + 1u < size) out[at++] = 48;",
+    "        for (i = 0; i < count; i++) if (at + 1u < size) out[at++] = digits[i];",
+    "    } else {",
+    "        int i;",
+    "        for (i = 0; i <= exponent; i++) {",
+    "            if (at + 1u < size) out[at++] = i < count ? digits[i] : (char)48;",
+    "        }",
+    "        if (count > exponent + 1) {",
+    "            if (at + 1u < size) out[at++] = 46;",
+    "            for (i = exponent + 1; i < count; i++) if (at + 1u < size) out[at++] = digits[i];",
+    "        }",
+    "    }",
+    "    out[at < size ? at : size - 1u] = 0;",
+    "}",
+    "static double lusa_mod_f64(double a, double b) {",
+    "    double r = fmod(a, b);",
+    "    if (r != 0.0 && ((r < 0.0) != (b < 0.0))) r += b;",
+    "    return r;",
+    "}",
     "",
     'static void lusa_print_nil(void) { fputs("nil", stdout); }',
     'static void lusa_print_bool(bool value) { fputs(value ? "true" : "false", stdout); }',
     'static void lusa_print_i32(int32_t value) { printf("%" PRId32, value); }',
     'static void lusa_print_u32(uint32_t value) { printf("%" PRIu32, value); }',
     'static void lusa_print_f32(float value) { printf("%.9g", (double)value); }',
+    "static void lusa_print_f64(double value) {",
+    "    char text[400];",
+    "    lusa_format_f64(value, text, sizeof(text));",
+    "    fputs(text, stdout);",
+    "}",
     "static void lusa_print_string(LusaString *value) {",
     '    if (value == NULL) { fputs("nil", stdout); return; }',
     "    if (value->obj.length != 0u) fwrite(value->data, 1u, (size_t)value->obj.length, stdout);",
@@ -7029,6 +7175,12 @@ local RUNTIME = {
     "            float number = 0.0f;",
     "            memcpy(&number, &bits, sizeof(number));",
     "            lusa_print_f32(number);",
+    "            break;",
+    "        }",
+    "        case LUSA_ELEM_F64: {",
+    "            double number = 0.0;",
+    "            memcpy(&number, &value.payload, sizeof(number));",
+    "            lusa_print_f64(number);",
     "            break;",
     "        }",
     "        case LUSA_ELEM_BOOL: lusa_print_bool(value.payload != 0u); break;",
@@ -7532,6 +7684,12 @@ local STRBUF_RUNTIME = {
     "    return lusa_tostring_text(text);",
     "}",
     "",
+    "static LusaString *lusa_tostring_f64(double value) {",
+    "    char text[400];",
+    "    lusa_format_f64(value, text, sizeof(text));",
+    "    return lusa_tostring_text(text);",
+    "}",
+    "",
     "static LusaString *lusa_tostring_bool(bool value) {",
     '    return lusa_tostring_text(value ? "true" : "false");',
     "}",
@@ -7670,6 +7828,12 @@ local MAP_RUNTIME = {
     "    uint32_t bits = (uint32_t)payload;",
     "    float value;",
     "    memcpy(&value, &bits, sizeof(value));",
+    "    return value;",
+    "}",
+    "",
+    "static double lusa_map_f64(uint64_t payload) {",
+    "    double value;",
+    "    memcpy(&value, &payload, sizeof(value));",
     "    return value;",
     "}",
     "",
@@ -7913,6 +8077,7 @@ local MAP_RUNTIME = {
     "    if (map->value_kind == LUSA_ELEM_I32) *(int32_t *)out.value = (int32_t)(int64_t)payload;",
     "    else if (map->value_kind == LUSA_ELEM_U32) *(uint32_t *)out.value = (uint32_t)payload;",
     "    else if (map->value_kind == LUSA_ELEM_F32) *(float *)out.value = lusa_map_f32(payload);",
+    "    else if (map->value_kind == LUSA_ELEM_F64) *(double *)out.value = lusa_map_f64(payload);",
     "    else if (map->value_kind == LUSA_ELEM_BOOL) *(bool *)out.value = payload != 0u;",
     "    else *(LusaString **)out.value = (LusaString *)(uintptr_t)payload;",
     "    return out;",
@@ -8720,6 +8885,7 @@ local TASK_RUNTIME = {
     "        int32_t i32;",
     "        uint32_t u32;",
     "        float f32;",
+    "        double f64;",
     "        bool boolean;",
     "        lusa_i128 i128;",
     "        void *ptr;",
@@ -8850,6 +9016,10 @@ local TASK_RUNTIME = {
     "",
     "static float lusa_task_result_f32(LusaTask *task) {",
     "    return task == NULL ? 0.0f : task->value.f32;",
+    "}",
+    "",
+    "static double lusa_task_result_f64(LusaTask *task) {",
+    "    return task == NULL ? 0.0 : task->value.f64;",
     "}",
     "",
     "static bool lusa_task_result_bool(LusaTask *task) {",
@@ -9609,6 +9779,26 @@ local function format_float(value)
     return text .. "f"
 end
 
+-- f64 literals use `tostring`, which (unlike `string.format("%.17g")`)
+-- yields the shortest decimal that round-trips, written without an
+-- exponent, so the C literal is exactly the value the checker folded.
+local function format_double(value)
+    if value ~= value then
+        return "NAN"
+    end
+    if value == math.huge then
+        return "HUGE_VAL"
+    end
+    if value == -math.huge then
+        return "(-HUGE_VAL)"
+    end
+    local text = tostring(value)
+    if string.find(text, ".", 1, true) == nil then
+        text = text .. ".0"
+    end
+    return text
+end
+
 local emit_expr
 
 -- Native async tasks carry one typed result in a union.  Scalars use their
@@ -9619,6 +9809,7 @@ local function task_result_suffix(type_name)
     if type_name == "u32" then return "u32" end
     if type_name == "i128" then return "i128" end
     if type_name == "f32" then return "f32" end
+    if type_name == "f64" then return "f64" end
     if type_name == "bool" then return "bool" end
     return "ptr"
 end
@@ -9632,6 +9823,9 @@ local function emit_value_payload(expr, value)
     local type_name = expr.ctype
     if type_name == "f32" then
         return "lusa_f32_payload(" .. value .. ")", "LUSA_ELEM_F32"
+    end
+    if type_name == "f64" then
+        return "lusa_f64_payload(" .. value .. ")", "LUSA_ELEM_F64"
     end
     if type_name == "string" then
         return "(uint64_t)(uintptr_t)(" .. value .. ")", "LUSA_ELEM_STRING"
@@ -9804,6 +9998,8 @@ local function emit_sum_print_payload(type_name, access)
         line("lusa_print_i128(" .. access .. ");")
     elseif type_name == "f32" then
         line("lusa_print_f32(" .. access .. ");")
+    elseif type_name == "f64" then
+        line("lusa_print_f64(" .. access .. ");")
     elseif type_name == "bool" then
         line("lusa_print_bool(" .. access .. ");")
     elseif type_name == "string" then
@@ -10577,7 +10773,7 @@ local function emit_cast_to(type_name, value)
         return "(" .. c_type(type_name) .. ")(uintptr_t)(" .. value .. ")"
     end
     if type_name == "u32" or type_name == "i32"
-        or type_name == "f32" or type_name == "bool" then
+        or type_name == "f32" or type_name == "f64" or type_name == "bool" then
         return "(" .. c_type(type_name) .. ")(" .. value .. ")"
     end
     return value
@@ -10595,6 +10791,9 @@ local function emit_number(expr)
             return "((float)" .. format_integer(value) .. ")"
         end
         return format_float(value)
+    end
+    if type_name == "f64" then
+        return format_double(value)
     end
     if type_name == "u32" then
         return "((uint32_t)" .. format_integer(value) .. ")"
@@ -10651,6 +10850,9 @@ local function emit_arithmetic(expr, lhs, rhs)
         if type_name == "f32" then
             return "lusa_pow_f32(" .. lhs .. ", " .. rhs .. ")"
         end
+        if type_name == "f64" then
+            return "pow(" .. lhs .. ", " .. rhs .. ")"
+        end
         if type_name == "i128" then
             return "lusa_pow_i128(" .. lhs .. ", " .. rhs .. ")"
         end
@@ -10663,7 +10865,7 @@ local function emit_arithmetic(expr, lhs, rhs)
         if type_name == "i128" then
             return "lusa_div_i128(" .. lhs .. ", " .. rhs .. ")"
         end
-        if type_name == "f32" then
+        if type_name == "f32" or type_name == "f64" then
             return "((" .. lhs .. ") / (" .. rhs .. "))"
         end
         return "lusa_div_i32(" .. lhs .. ", " .. rhs .. ")"
@@ -10678,6 +10880,9 @@ local function emit_arithmetic(expr, lhs, rhs)
         if type_name == "f32" then
             return "floorf((" .. lhs .. ") / (" .. rhs .. "))"
         end
+        if type_name == "f64" then
+            return "floor((" .. lhs .. ") / (" .. rhs .. "))"
+        end
         return "lusa_floor_div_i32(" .. lhs .. ", " .. rhs .. ")"
     end
     if op == "%" then
@@ -10689,6 +10894,9 @@ local function emit_arithmetic(expr, lhs, rhs)
         end
         if type_name == "f32" then
             return "fmodf(" .. lhs .. ", " .. rhs .. ")"
+        end
+        if type_name == "f64" then
+            return "lusa_mod_f64(" .. lhs .. ", " .. rhs .. ")"
         end
         return "lusa_mod_i32(" .. lhs .. ", " .. rhs .. ")"
     end
@@ -10955,6 +11163,9 @@ local function map_payload(type_name, value)
     if type_name == "f32" then
         return "lusa_f32_payload(" .. value .. ")"
     end
+    if type_name == "f64" then
+        return "lusa_f64_payload(" .. value .. ")"
+    end
     if type_name == "bool" then
         return "(uint64_t)((" .. value .. ") ? 1u : 0u)"
     end
@@ -10970,6 +11181,9 @@ local function map_value_of(type_name, payload)
     end
     if type_name == "f32" then
         return "lusa_map_f32(" .. payload .. ")"
+    end
+    if type_name == "f64" then
+        return "lusa_map_f64(" .. payload .. ")"
     end
     if type_name == "bool" then
         return "((" .. payload .. ") != 0u)"
@@ -11231,6 +11445,12 @@ emit_expr = function(expr)
         local lhs = emit_expr(expr.lhs)
         local rhs = emit_expr(expr.rhs)
         local op = expr.op
+        if expr.lhs_cast == "f64" then
+            lhs = "((double)(" .. lhs .. "))"
+        end
+        if expr.rhs_cast == "f64" then
+            rhs = "((double)(" .. rhs .. "))"
+        end
         if expr.ptr_math then
             -- Raw pointer arithmetic: C scales by the element size.
             return "((" .. lhs .. ") " .. op .. " (" .. rhs .. "))"
@@ -11604,6 +11824,9 @@ emit_expr = function(expr)
                 if item_type == "f32" then
                     line("lusa_table_set_f32(" .. table_name .. ", "
                         .. pos_text .. ", " .. value .. ");")
+                elseif item_type == "f64" then
+                    line("lusa_table_set_f64(" .. table_name .. ", "
+                        .. pos_text .. ", " .. value .. ");")
                 elseif is_heap_type(item_type) then
                     line(table_name .. "->items[" .. pos_text
                         .. "] = (uint64_t)(uintptr_t)(" .. value .. ");")
@@ -11640,6 +11863,8 @@ emit_expr = function(expr)
             return "lusa_table_get_u32_key(" .. table_value .. ", " .. key .. ")"
         elseif field_type == "f32" then
             return "lusa_table_get_f32_key(" .. table_value .. ", " .. key .. ")"
+        elseif field_type == "f64" then
+            return "lusa_table_get_f64_key(" .. table_value .. ", " .. key .. ")"
         elseif field_type == "bool" then
             return "lusa_table_get_bool_key(" .. table_value .. ", " .. key .. ")"
         elseif field_type == "table" or table_element(field_type) ~= nil then
@@ -11767,6 +11992,8 @@ emit_expr = function(expr)
                 return "lusa_table_get_u32_key(" .. table_value .. ", " .. key .. ")"
             elseif field_type == "f32" then
                 return "lusa_table_get_f32_key(" .. table_value .. ", " .. key .. ")"
+            elseif field_type == "f64" then
+                return "lusa_table_get_f64_key(" .. table_value .. ", " .. key .. ")"
             elseif field_type == "bool" then
                 return "lusa_table_get_bool_key(" .. table_value .. ", " .. key .. ")"
             elseif field_type == "table" or table_element(field_type) ~= nil then
@@ -11790,6 +12017,8 @@ emit_expr = function(expr)
             call = "lusa_table_get_u32_at"
         elseif element == "f32" then
             call = "lusa_table_get_f32_at"
+        elseif element == "f64" then
+            call = "lusa_table_get_f64_at"
         elseif element == "bool" then
             call = "lusa_table_get_bool_at"
         elseif element == "string" then
@@ -11843,6 +12072,8 @@ local function emit_print_call(call)
             line("lusa_print_i128(" .. value .. ");")
         elseif type_name == "f32" then
             line("lusa_print_f32(" .. value .. ");")
+        elseif type_name == "f64" then
+            line("lusa_print_f64(" .. value .. ");")
         elseif type_name == "bool" then
             line("lusa_print_bool(" .. value .. ");")
         elseif type_name == "table" or table_element(type_name) ~= nil then
@@ -12245,6 +12476,7 @@ local function table_getter_for_type(type_name)
     if type_name == "i32" then return "lusa_table_get_i32_at" end
     if type_name == "u32" then return "lusa_table_get_u32_at" end
     if type_name == "f32" then return "lusa_table_get_f32_at" end
+    if type_name == "f64" then return "lusa_table_get_f64_at" end
     if type_name == "bool" then return "lusa_table_get_bool_at" end
     if type_name == "string" then return "lusa_table_get_string_at" end
     if type_name == "table" or table_element(type_name) ~= nil then
@@ -13593,6 +13825,7 @@ function Compiler.memory_layout()
             i32 = "int32_t",
             i128 = "lusa_i128 (__int128 when the C compiler provides it)",
             f32 = "float",
+            f64 = "double",
             bool = "bool (<stdbool.h>)",
             string = "LusaString * (LusaObj length + NUL-terminated data)",
             table = "LusaTable *",
@@ -13619,7 +13852,7 @@ function Compiler.memory_layout()
         intrinsics = "asm!/unsafe_asm/unsafe_nop lower to LUSA_ASM(text)/LUSA_NOP() - `__asm__ __volatile__ (text : : );` on GCC/Clang, no-ops elsewhere; interrupts_disable/interrupts_enable/interrupts_restore lower to CPUI/PRIMASK on Arm and mstatus.MIE on RISC-V",
         table_kinds = {
             unknown = 0, i32 = 1, u32 = 2, i128 = 3,
-            f32 = 4, bool = 5, string = 6, table = 7
+            f32 = 4, bool = 5, string = 6, table = 7, f64 = 8
         },
         allocator = {
             create = "malloc/calloc/realloc",

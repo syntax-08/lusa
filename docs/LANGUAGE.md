@@ -837,15 +837,32 @@ end
 | `i32` | `int32_t` |
 | `i128` | `lusa_i128` (`__int128`, or `long long` on MSVC) |
 | `f32` | `float` |
+| `f64` | `double` |
 | `bool` | `bool` (`<stdbool.h>`) |
 | `string` | `LusaString *` (length + NUL-terminated `.data`) |
 | `[T]` / `[[T]]` | `LusaTable *` with a homogeneous element kind |
 | `struct S` | native `S` typedef with fields in declaration order |
 | untyped integer literal | inferred as `i32` |
-| untyped decimal literal | inferred as `f32` |
+| untyped decimal literal | inferred as `f64` |
 
-Unannotated locals use this static native inference (`i32` for integers, `f32`
-for decimals); there is no dynamic `double` fallback in generated C. Pure
+Unannotated locals use this static native inference (`i32` for integers, `f64`
+for decimals). Numeric literals of either kind satisfy an `f32` or `f64`
+annotation. `f64` values print like the interpreter: integral values below
+10^15 without a fraction, everything else as the shortest decimal that
+round-trips, never in exponent notation (`1e20` prints
+`100000000000000000000`, `1 / 3` prints `0.3333333333333333`). `f32` keeps
+its own `%.9g` formatting.
+
+`/` is floating-point division in every engine. Two `f32` operands divide as
+`f32`; any other pair (including two `i32` values) is converted to `f64`
+first, so `7 / 2` is `3.5` and `x / 0` is `inf`. Use `//` for floor division
+of integers. Assigning a `/` result to an integer slot is `E0308` with the
+hint `` `/` always produces a float; use `//` for integer division ``.
+
+Arithmetic and comparisons that mix an `f64` with an `i32`, `u32`, or `f32`
+value widen the other operand to `f64`, which is exact for all three. `i128`
+never widens implicitly. `%` on `f64` follows the dynamic engines' floor
+semantics (`-7.5 % 2` is `0.5`). Pure
 integer literals keep their original decimal or hexadecimal spelling in the
 token/AST stream. The C11 backend passes that text to
 `lusa_i128_parse("...")`, so constants above 2^53 retain all bits up to
@@ -855,18 +872,18 @@ literals matter.
 
 `i32` arithmetic in generated C (`+`, `-`, `*`, `^`, unary `-`, and
 `INT32_MIN // -1`) wraps in two's complement through `uint32_t`, so it is
-never signed overflow (undefined behaviour in C). Division and modulo by zero
-still raise `E2001`.
+never signed overflow (undefined behaviour in C). Integer `//` and `%` by zero
+still raise `E2001`; `/` produces `inf`, `-inf`, or `nan` like the dynamic
+engines.
 
-Known differences from the dynamic engines, tracked as ignored tests in
-`tests/parity.rs`:
+`tests/parity.rs` runs the same programs in all three engines. One difference
+is kept by design and tracked there as an ignored test:
 
-- `/` on two `i32` values truncates natively (`7 / 2` with variables is `3`),
-  while the interpreter, the VM, and native constant folding give `3.5`.
-- Untyped decimals are `f32` natively (`0.1 + 0.2` prints `0.300000012`) and
-  `f64` in the interpreter and VM.
 - Untyped integers are `i32` natively and wrap at 2^31; the interpreter and VM
-  use `f64` and do not wrap there.
+  use `f64` and do not wrap there. Integers stay `i32` because firmware loops,
+  indexes, and register values must stay cheap on MCUs without an FPU.
+  Annotate `: i128`, or write a decimal (`2147483647.0`), when a value can
+  exceed 2^31.
 
 The checker runs before emission. Incompatible assignments, returns, calls,
 conditions and table elements stop compilation with Cargo-style diagnostics:

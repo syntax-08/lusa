@@ -62,7 +62,7 @@ fn emit_error(source: &str, code: &str) {
 fn native_pcall_reports_success_failure_and_assert_errors() {
     let source = r#"
 function divide(a: i32, b: i32): i32
-    return a / b
+    return a // b
 end
 
 function boom(): i32
