@@ -142,9 +142,12 @@ mygame\
 └── README.md    ← how to run
 ```
 
-**Multi-file:** Lusa does **not have `require`/`dofile` yet** (roadmap).
-Organize modules as blocks/files run one at a time, or keep a single
-well-structured `main.lusa`. Large data can be generated at boot
+**Multi-file:** split a project into modules with `mod name;`, which loads
+`name/mod.lusa` (or else `name.lusa`) next to the importing file, and bring names
+into scope with `use`. Mark exported items `pub`. Every engine supports this
+(interpreter, VM, and `--native`). See `examples/modules_project` and the
+modules section of `docs/LANGUAGE.md`. Packages installed with
+`lusalang install` load at runtime with `require("name")`. Large data can be generated at boot
 ("asset bake") or embedded as tables at the end of the file.
 
 ---

@@ -6,5 +6,5 @@ pub struct Reading {
 }
 
 pub function sample(raw: i32): Reading
-    return Reading{kpa: raw / 10, valid: raw > 100}
+    return Reading{kpa: raw // 10, valid: raw > 100}
 end

@@ -340,13 +340,18 @@ self-hosted parser. Supported types map to C11 as follows:
 | `i32` | `int32_t` |
 | `i128` | `lusa_i128` (`__int128`, or `long long` on MSVC) |
 | `f32` | `float` |
+| `f64` | `double` |
 | `bool` | `bool` (`<stdbool.h>`) |
 | `string` | `LusaString *` (`.data` is NUL-terminated for C/FFI) |
 | `[T]` / `[[T]]` | `LusaTable *` with a homogeneous element kind |
 
-Untyped integer literals infer `i32`; untyped decimal literals infer `f32`.
-Unannotated locals keep this static native inference; the interpreter and
-bytecode VM continue to represent every number as `f64`. The checker runs
+Untyped integer literals infer `i32`; untyped decimal literals infer `f64`,
+the same precision the interpreter and bytecode VM use for every number, so
+`0.1 + 0.2` prints `0.30000000000000004` in all three engines. `/` always
+divides in floating point (`7 / 2` is `3.5`); use `//` for integer division.
+Mixing an `i32`, `u32`, or `f32` value with an `f64` widens it to `f64`.
+Annotate `: f32` where single precision matters, such as firmware on an MCU
+with a single-precision FPU. The checker runs
 before emission and aborts with Cargo-style diagnostics such as
 `error[E0308]: mismatched types ... --> lusa:1:16`.
 

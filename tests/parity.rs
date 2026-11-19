@@ -144,26 +144,98 @@ fn native_i32_overflow_wraps_without_undefined_behaviour() {
     );
 }
 
-// ===== known divergences (open design decisions) =====
+// ===== f64 numbers and floating-point `/` (closed divergences) =====
 
 #[test]
-#[ignore = "open: native `/` on i32 variables truncates (3), the dynamic engines and native constant folding give 3.5"]
-fn divergence_integer_division() {
-    assert_parity("int_div", "local a = 7\nlocal b = 2\nprint(a / b)\n", "3.5");
-}
-
-#[test]
-#[ignore = "open: untyped decimals are f32 in native code (0.300000012) but f64 in the dynamic engines"]
-fn divergence_decimal_precision() {
+fn slash_is_float_division_on_integer_variables() {
+    // Native used to truncate `7 / 2` to 3 when both operands were i32
+    // variables; `/` now widens integer operands to f64 everywhere.
     assert_parity(
-        "f32_precision",
-        "local c = 0.1\nlocal d = 0.2\nprint(c + d)\n",
-        "0.30000000000000004",
+        "int_div",
+        "local a = 7\n\
+         local b = 2\n\
+         print(a / b)\n\
+         print(-a / b, a / 7, 1 / 8)\n\
+         print(a // b, a % b)\n",
+        "3.5\n-3.5 1 0.125\n3 1",
     );
 }
 
 #[test]
-#[ignore = "open: untyped integers are i32 in native code (wraps at 2^31) but f64 in the dynamic engines"]
+fn untyped_decimals_are_f64() {
+    // Native used to give untyped decimals the f32 type (0.300000012).
+    assert_parity(
+        "f64_precision",
+        "local c = 0.1\n\
+         local d = 0.2\n\
+         print(c + d)\n\
+         print(1 / 3, 2 ^ 0.5)\n\
+         print(tostring(c + d))\n",
+        "0.30000000000000004\n0.3333333333333333 1.4142135623730951\n0.30000000000000004",
+    );
+}
+
+#[test]
+fn f64_formatting_matches_the_dynamic_engines() {
+    // Shortest round-trip digits, never an exponent, integral values
+    // without a fraction.
+    assert_parity(
+        "f64_format",
+        "print(1e20, 1.5e-7, 123456.789)\n\
+         print(2.0, -0.5, 1e15 + 0.5)\n\
+         local x = 7\n\
+         print(x / 0, -x / 0)\n",
+        "100000000000000000000 0.00000015 123456.789\n2 -0.5 1000000000000000.5\ninf -inf",
+    );
+}
+
+#[test]
+fn mixed_integer_and_float_operands_widen_to_f64() {
+    assert_parity(
+        "f64_widen",
+        "local n = 3\n\
+         local half = 0.5\n\
+         print(n + half, n * half, n - 0.25)\n\
+         print(n < half, half <= n)\n\
+         local avg = (n + 4) / 2\n\
+         print(avg + n)\n\
+         print(-7.5 % 2, 7.5 % -2, 7.5 // 2)\n",
+        "3.5 1.5 2.75\nfalse true\n6.5\n0.5 -0.5 3",
+    );
+}
+
+#[test]
+fn f64_values_in_tables_and_structs() {
+    assert_parity(
+        "f64_containers",
+        "struct Point { x: f64, y: f64 }\n\
+         local p = Point{x: 0.1, y: 0.2}\n\
+         print(p.x + p.y)\n\
+         local t = {1.5, 2.25}\n\
+         print(t[1] + t[2])\n\
+         function mid(a: f64, b: f64): f64\n\
+             return (a + b) / 2\n\
+         end\n\
+         print(mid(1, 2))\n",
+        "0.30000000000000004\n3.75\n1.5",
+    );
+}
+
+#[test]
+fn assigning_a_float_division_to_an_integer_suggests_floor_division() {
+    let err = cbackend::emit_c("local n: i32 = 7\nlocal half: i32 = n / 2\n")
+        .expect_err("`/` yields f64, which is not an i32");
+    assert!(
+        err.contains("expected `i32`") && err.contains("found    `f64`")
+            && err.contains("use `//` for integer division"),
+        "{err}"
+    );
+}
+
+// ===== documented differences (by design) =====
+
+#[test]
+#[ignore = "by design: untyped integers stay i32 in native code (they wrap at 2^31; firmware needs cheap integers) while the dynamic engines use f64; annotate `: i128` or use a decimal for larger values"]
 fn divergence_i32_overflow() {
     assert_parity(
         "i32_overflow",
