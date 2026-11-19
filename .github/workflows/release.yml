@@ -106,6 +106,15 @@ jobs:
           grep -Fq "## Impact Introduction" "$notes"
           grep -Fq "## Feature Highlights" "$notes"
           grep -Fq "## How to Use" "$notes"
+      - name: Generate SHA256SUMS
+        # `lusalang self-update` refuses to install a release whose zip does
+        # not match its line in this file.
+        shell: bash
+        run: |
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
       - name: List assets
         run: ls -lh dist
       - name: Create or update release

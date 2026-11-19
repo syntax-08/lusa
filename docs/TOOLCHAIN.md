@@ -79,9 +79,17 @@ lusalang self-update --check  # only reports the newest release
 lusalang self-update --force  # reinstall even if versions match
 ```
 
-The update never bricks your install: the running exe is first renamed to
-`lusa.exe.old`, the new one takes its place, and the backup is removed on
-success — if something interrupts it, just rename `lusa.exe.old` back.
+The downloaded `lusa-setup.zip` is checked against the release's
+`SHA256SUMS` before anything is unpacked; a missing or mismatching checksum
+aborts the update without touching your install. The running exe is then
+renamed to `lusa.exe.old`, the new one takes its place, and the backup is
+removed on success. If the new exe cannot be placed, the backup is renamed
+back automatically; if even that fails, the error tells you to rename
+`lusa.exe.old` back yourself.
+
+Installing updates is automated on Windows only. On Linux and macOS,
+`lusalang self-update --check` still reports whether a newer release exists;
+download the tarball for your system from the releases page to update.
 
 ---
 
