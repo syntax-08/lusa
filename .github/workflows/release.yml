@@ -120,6 +120,9 @@ jobs:
       - name: Create or update release
         uses: softprops/action-gh-release@v2
         with:
+          # Releases are titled with the bare tag (v2.5.0, v2.5.1, ...), even
+          # when the release was first created by hand with another title.
+          name: ${{ github.ref_name }}
           body_path: .github/release-notes/${{ github.ref_name }}.md
           files: dist/*
           fail_on_unmatched_files: true
