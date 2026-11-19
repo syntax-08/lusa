@@ -635,6 +635,24 @@ pub fn run_source_vm(src: &str) -> LResult<Vec<String>> {
 /// Compiles and runs a program in bytecode mode, resolving imports relative
 /// to `base`.
 pub fn run_source_vm_with_base(src: &str, base: Option<&std::path::Path>) -> LResult<Vec<String>> {
+    run_vm_on_big_stack(src, base, false)
+}
+
+/// Like [`run_source_vm_with_base`], but `print` writes straight to stdout as
+/// the program runs (used by the CLI), so output printed before a runtime
+/// error is not lost.
+pub fn run_source_vm_streaming_with_base(
+    src: &str,
+    base: Option<&std::path::Path>,
+) -> LResult<()> {
+    run_vm_on_big_stack(src, base, true).map(|_| ())
+}
+
+fn run_vm_on_big_stack(
+    src: &str,
+    base: Option<&std::path::Path>,
+    stream: bool,
+) -> LResult<Vec<String>> {
     let joined = std::thread::scope(|s| {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -642,6 +660,7 @@ pub fn run_source_vm_with_base(src: &str, base: Option<&std::path::Path>) -> LRe
                 let compiled = crate::compiler::compile_program_with_base(src, base)?;
                 debug_dump(&compiled);
                 let mut interp = Interp::new();
+                interp.stream_stdout = stream;
                 interp.install_stdlib();
                 for def in &compiled.structs {
                     interp.struct_defs.insert(def.name.clone(), def.clone());

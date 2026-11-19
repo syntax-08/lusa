@@ -37,6 +37,17 @@ pub fn run_source(src: &str) -> LResult<Vec<String>> {
 
 /// Parses and runs a source file, resolving imports relative to `base`.
 pub fn run_source_with_base(src: &str, base: Option<&Path>) -> LResult<Vec<String>> {
+    run_on_big_stack(src, base, false)
+}
+
+/// Like [`run_source_with_base`], but `print` writes straight to stdout as the
+/// program runs (used by the CLI).  Output printed before a runtime error is
+/// therefore already visible when the error is reported.
+pub fn run_source_streaming_with_base(src: &str, base: Option<&Path>) -> LResult<()> {
+    run_on_big_stack(src, base, true).map(|_| ())
+}
+
+fn run_on_big_stack(src: &str, base: Option<&Path>, stream: bool) -> LResult<Vec<String>> {
     // The evaluator recurses in Rust frames (one call level ≈ several
     // thousand stack bytes), and the logical `MAX_CALL_DEPTH` guard only
     // kicks in after those frames accumulate. Hosts run `run_source` from
@@ -48,6 +59,7 @@ pub fn run_source_with_base(src: &str, base: Option<&Path>) -> LResult<Vec<Strin
             .spawn_scoped(s, move || {
                 let ast = parser::parse_with_base(src, base)?;
                 let mut interp = interp::Interp::new();
+                interp.stream_stdout = stream;
                 interp.install_stdlib();
                 let result = interp.run(&ast, "<source>");
                 let out = std::mem::take(&mut interp.out);

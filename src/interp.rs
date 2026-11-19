@@ -43,7 +43,14 @@ pub struct SlotLoc {
 
 pub struct Interp {
     pub globals: ScopeRef,
+    /// Lines produced by `print` when output is captured (tests, embedding
+    /// hosts).  Unused while `stream_stdout` is on.
     pub out: Vec<String>,
+    /// When true, `print` writes straight to the process stdout (and flushes)
+    /// instead of collecting into `out`.  The CLI turns this on so long-running
+    /// programs show output as it happens and lines printed before a runtime
+    /// error are not lost.
+    pub stream_stdout: bool,
     pub depth: usize,
     /// bytecode VM state (`--vm` runs compile + execute here)
     pub vm: crate::vm::Vm,
@@ -124,6 +131,7 @@ impl Interp {
         Interp {
             globals: scope::new_scope(true),
             out: Vec::new(),
+            stream_stdout: false,
             depth: 0,
             vm: crate::vm::Vm::new(),
             unsafe_mem: HashMap::new(),
@@ -140,6 +148,22 @@ impl Interp {
             executor: crate::task::Executor::default(),
             host: crate::host::HostState::default(),
             interrupts_enabled: true,
+        }
+    }
+
+    /// Emits one line of program output: straight to stdout when
+    /// `stream_stdout` is on, otherwise into the `out` buffer.
+    pub fn emit_line(&mut self, line: String) {
+        if self.stream_stdout {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            // A closed pipe (`lusa x.lusa | head`) must not abort the program
+            // with a panic the way `println!` would.
+            let _ = writeln!(lock, "{}", line);
+            let _ = lock.flush();
+        } else {
+            self.out.push(line);
         }
     }
 

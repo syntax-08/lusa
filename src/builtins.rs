@@ -203,7 +203,7 @@ fn match_values(m: &pattern::Match, source: &[char]) -> Vec<Value> {
 
 fn b_print(i: &mut Interp, args: Vec<Value>, _span: Span) -> LResult<Vec<Value>> {
     let line: Vec<String> = args.iter().map(to_str).collect();
-    i.out.push(line.join(" "));
+    i.emit_line(line.join(" "));
     Ok(Vec::new())
 }
 
@@ -823,6 +823,7 @@ fn b_require(parent: &mut Interp, args: Vec<Value>, span: Span) -> LResult<Vec<V
 
     MODULE_STACK.with(|s| s.borrow_mut().push(canon.clone()));
     let mut module_interp = Interp::new();
+    module_interp.stream_stdout = parent.stream_stdout;
     module_interp.install_stdlib();
     let result = module_interp.run(&block, &path.display().to_string());
     MODULE_STACK.with(|s| {

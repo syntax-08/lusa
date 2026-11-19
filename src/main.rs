@@ -212,11 +212,8 @@ fn cmd_run(args: &[String]) -> i32 {
         };
     }
     if want_vm {
-        match lusa::vm::run_source_vm_with_base(&src, Path::new(&path).parent()) {
-            Ok(lines) => {
-                for line in lines {
-                    println!("{}", line);
-                }
+        match lusa::vm::run_source_vm_streaming_with_base(&src, Path::new(&path).parent()) {
+            Ok(()) => {
                 let _ = std::io::stdout().flush();
                 println!("[bytecode vm] {} finished", path);
                 return 0;
@@ -540,6 +537,55 @@ fn manifest_value(dir: &std::path::Path, key: &str) -> Option<String> {
     None
 }
 
+/// A package name becomes a folder directly under `packages_dir()`, so it must
+/// never be able to point anywhere else: no path separators, no drive prefix,
+/// no `.`/`..`, no leading dot.  The name comes from the downloaded
+/// `lusa.toml`, i.e. from whoever published the package — a name such as
+/// `../bin` or `C:\Users\me\Documents` would otherwise make `install` delete
+/// and overwrite an arbitrary folder.
+fn is_safe_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !is_windows_device_name(name)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// `CON`, `NUL`, `COM1`, … (also with an extension, e.g. `nul.txt`) name
+/// devices on Windows, not folders.
+fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit())
+}
+
+/// `<user>` and `<repo>` components of an install spec (GitHub's own rules:
+/// ASCII letters, digits, `-`, `_`, `.`).
+fn is_safe_repo_part(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Git tag after `#` in `<user>/<repo>#<tag>`.
+fn is_safe_git_ref(tag: &str) -> bool {
+    !tag.is_empty()
+        && !tag.contains("..")
+        && !tag.starts_with('/')
+        && !tag.ends_with('/')
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '+'))
+}
+
 fn download(zip: &std::path::Path, url: &str) -> bool {
     std::process::Command::new("curl")
         .args(["-fsSL", "--retry", "3", "-o"])
@@ -570,9 +616,19 @@ fn pkg_install(spec: &str) -> i32 {
         Some((r, t)) => (r, Some(t)),
         None => (spec, None),
     };
-    if repo.split('/').count() != 2 || repo.starts_with('/') || repo.ends_with('/') {
+    let repo_ok = match repo.split_once('/') {
+        Some((user, name)) => is_safe_repo_part(user) && is_safe_repo_part(name),
+        None => false,
+    };
+    if !repo_ok {
         eprintln!("lusa: expected `<user>/<repo>`, got \"{}\"", spec);
         return 2;
+    }
+    if let Some(tag) = git_ref {
+        if !is_safe_git_ref(tag) {
+            eprintln!("lusa: invalid tag \"{}\" in \"{}\"", tag, spec);
+            return 2;
+        }
     }
     let branch_ref = match git_ref {
         Some(t) => format!("refs/tags/{}", t),
@@ -639,6 +695,15 @@ fn pkg_install(spec: &str) -> i32 {
     // The resident package name comes from lusa.toml `name` (require("name")
     // resolves against package folder names); falls back to the repo name.
     let name = manifest_value(&top, "name").unwrap_or_else(|| repo_name.clone());
+    if !is_safe_package_name(&name) {
+        eprintln!(
+            "lusa: refusing to install: package name \"{}\" (from lusa.toml) is not a plain \
+             folder name — use only letters, digits, `-`, `_` and `.`",
+            name
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+        return 1;
+    }
     let dir = packages_dir().join(&name);
 
     if dir.exists() {
@@ -717,6 +782,13 @@ fn pkg_list() -> i32 {
 
 /// `lusalang uninstall <name>`.
 fn pkg_uninstall(name: &str) -> i32 {
+    if !is_safe_package_name(name) {
+        eprintln!(
+            "lusa: \"{}\" is not a package name (expected letters, digits, `-`, `_`, `.`)",
+            name
+        );
+        return 2;
+    }
     let dir = packages_dir().join(name);
     if !dir.is_dir() {
         eprintln!(
@@ -736,11 +808,8 @@ fn pkg_uninstall(name: &str) -> i32 {
 
 /// Runs a complete program in bytecode mode; 0 on success, 1 on error.
 pub fn run_vm_source(src: &str, filename: &str) -> i32 {
-    match lusa::vm::run_source_vm(src) {
-        Ok(lines) => {
-            for line in lines {
-                println!("{}", line);
-            }
+    match lusa::vm::run_source_vm_streaming_with_base(src, None) {
+        Ok(()) => {
             let _ = std::io::stdout().flush();
             0
         }
@@ -766,11 +835,8 @@ pub fn run_source(src: &str, filename: &str) -> i32 {
 
 /// Runs a complete program with imports resolved relative to `base`.
 pub fn run_source_with_base(src: &str, filename: &str, base: Option<&Path>) -> i32 {
-    match lusa::run_source_with_base(src, base) {
-        Ok(lines) => {
-            for line in lines {
-                println!("{}", line);
-            }
+    match lusa::run_source_streaming_with_base(src, base) {
+        Ok(()) => {
             let _ = std::io::stdout().flush();
             0
         }
@@ -796,6 +862,7 @@ fn looks_incomplete(e: &LusaError, buf: &str) -> bool {
 fn repl() -> i32 {
     println!("{}", BANNER);
     let mut interp = Interp::new();
+    interp.stream_stdout = true;
     interp.install_stdlib();
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
@@ -847,11 +914,8 @@ fn repl() -> i32 {
             }
             Ok(block) => {
                 let mut frame = Frame::new(None, Vec::new());
+                // `print` streams to stdout as the chunk runs.
                 let run = interp.exec_block(&mut frame, &block);
-                let out = std::mem::take(&mut interp.out);
-                for line in out {
-                    println!("{}", line);
-                }
                 if let Err(e) = run {
                     let _ = std::io::stdout().flush();
                     let _ = std::io::stderr().flush();
@@ -862,4 +926,48 @@ fn repl() -> i32 {
     }
     println!("bye!");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_safe_git_ref, is_safe_package_name, is_safe_repo_part};
+
+    #[test]
+    fn package_names_from_manifests_cannot_escape_the_packages_folder() {
+        for ok in ["lusa-ui", "my_pkg", "pkg.v2", "A1", "console", "com10"] {
+            assert!(is_safe_package_name(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "../bin",
+            "a/b",
+            "a\\b",
+            "C:\\Users\\me\\Documents",
+            "/etc",
+            "C:",
+            "name with space",
+            "pkg.",
+            "CON",
+            "nul.txt",
+            "com1",
+            &"x".repeat(65),
+        ] {
+            assert!(!is_safe_package_name(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn install_spec_parts_are_validated() {
+        assert!(is_safe_repo_part("syntax-08"));
+        assert!(is_safe_repo_part("lusa.ui"));
+        assert!(!is_safe_repo_part(".."));
+        assert!(!is_safe_repo_part("a b"));
+        assert!(is_safe_git_ref("v1.2.0"));
+        assert!(is_safe_git_ref("release/1.0"));
+        assert!(!is_safe_git_ref("../../x"));
+        assert!(!is_safe_git_ref("v1?x=1"));
+    }
 }
