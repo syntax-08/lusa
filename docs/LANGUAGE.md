@@ -853,6 +853,21 @@ token/AST stream. The C11 backend passes that text to
 Lua-compatible arithmetic; use `build`/`run --native` when exact 128-bit
 literals matter.
 
+`i32` arithmetic in generated C (`+`, `-`, `*`, `^`, unary `-`, and
+`INT32_MIN // -1`) wraps in two's complement through `uint32_t`, so it is
+never signed overflow (undefined behaviour in C). Division and modulo by zero
+still raise `E2001`.
+
+Known differences from the dynamic engines, tracked as ignored tests in
+`tests/parity.rs`:
+
+- `/` on two `i32` values truncates natively (`7 / 2` with variables is `3`),
+  while the interpreter, the VM, and native constant folding give `3.5`.
+- Untyped decimals are `f32` natively (`0.1 + 0.2` prints `0.300000012`) and
+  `f64` in the interpreter and VM.
+- Untyped integers are `i32` natively and wrap at 2^31; the interpreter and VM
+  use `f64` and do not wrap there.
+
 The checker runs before emission. Incompatible assignments, returns, calls,
 conditions and table elements stop compilation with Cargo-style diagnostics:
 

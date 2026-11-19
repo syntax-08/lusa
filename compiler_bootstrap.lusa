@@ -7062,6 +7062,7 @@ local RUNTIME = {
     'static void lusa_require_nonzero_i128(lusa_i128 value) { if (value == 0) lusa_throw("E2001", "division by zero"); }',
     "static int32_t lusa_div_i32(int32_t a, int32_t b) {",
     '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
+    "    if (b == -1) return (int32_t)(0u - (uint32_t)a);",
     "    return a / b;",
     "}",
     "static uint32_t lusa_div_u32(uint32_t a, uint32_t b) {",
@@ -7076,13 +7077,18 @@ local RUNTIME = {
     "    int32_t q;",
     "    int32_t r;",
     '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
+    "    if (b == -1) return (int32_t)(0u - (uint32_t)a);",
     "    q = a / b; r = a % b;",
     "    if (r != 0 && ((r < 0) != (b < 0))) q -= 1;",
     "    return q;",
     "}",
     "static int32_t lusa_mod_i32(int32_t a, int32_t b) {",
+    "    int32_t r;",
     '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
-    "    return a - lusa_floor_div_i32(a, b) * b;",
+    "    if (b == -1) return 0;",
+    "    r = a % b;",
+    "    if (r != 0 && ((r < 0) != (b < 0))) r += b;",
+    "    return r;",
     "}",
     "static uint32_t lusa_floor_div_u32(uint32_t a, uint32_t b) {",
     '    if (b == 0u) { lusa_throw("E2001", "division by zero"); return 0u; }',
@@ -7105,14 +7111,15 @@ local RUNTIME = {
     "    return a - lusa_floor_div_i128(a, b) * b;",
     "}",
     "static int32_t lusa_pow_i32(int32_t base, int32_t exponent) {",
-    "    int32_t result = 1;",
+    "    uint32_t result = 1u;",
+    "    uint32_t factor = (uint32_t)base;",
     "    if (exponent < 0) return 0;",
     "    while (exponent > 0) {",
-    "        if ((exponent & 1) != 0) result *= base;",
-    "        base *= base;",
+    "        if ((exponent & 1) != 0) result *= factor;",
+    "        factor *= factor;",
     "        exponent >>= 1;",
     "    }",
-    "    return result;",
+    "    return (int32_t)result;",
     "}",
     "static lusa_i128 lusa_pow_i128(lusa_i128 base, lusa_i128 exponent) {",
     "    lusa_i128 result = 1;",
@@ -7221,6 +7228,7 @@ local NO_STD_RUNTIME = {
     "",
     "static int32_t lusa_div_i32(int32_t a, int32_t b) {",
     '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
+    "    if (b == -1) return (int32_t)(0u - (uint32_t)a);",
     "    return a / b;",
     "}",
     "static uint32_t lusa_div_u32(uint32_t a, uint32_t b) {",
@@ -7235,13 +7243,18 @@ local NO_STD_RUNTIME = {
     "    int32_t q;",
     "    int32_t r;",
     '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
+    "    if (b == -1) return (int32_t)(0u - (uint32_t)a);",
     "    q = a / b; r = a % b;",
     "    if (r != 0 && ((r < 0) != (b < 0))) q -= 1;",
     "    return q;",
     "}",
     "static int32_t lusa_mod_i32(int32_t a, int32_t b) {",
+    "    int32_t r;",
     '    if (b == 0) { lusa_throw("E2001", "division by zero"); return 0; }',
-    "    return a - lusa_floor_div_i32(a, b) * b;",
+    "    if (b == -1) return 0;",
+    "    r = a % b;",
+    "    if (r != 0 && ((r < 0) != (b < 0))) r += b;",
+    "    return r;",
     "}",
     "static uint32_t lusa_floor_div_u32(uint32_t a, uint32_t b) {",
     '    if (b == 0u) { lusa_throw("E2001", "division by zero"); return 0u; }',
@@ -7264,14 +7277,15 @@ local NO_STD_RUNTIME = {
     "    return a - lusa_floor_div_i128(a, b) * b;",
     "}",
     "static int32_t lusa_pow_i32(int32_t base, int32_t exponent) {",
-    "    int32_t result = 1;",
+    "    uint32_t result = 1u;",
+    "    uint32_t factor = (uint32_t)base;",
     "    if (exponent < 0) return 0;",
     "    while (exponent > 0) {",
-    "        if ((exponent & 1) != 0) result *= base;",
-    "        base *= base;",
+    "        if ((exponent & 1) != 0) result *= factor;",
+    "        factor *= factor;",
     "        exponent >>= 1;",
     "    }",
-    "    return result;",
+    "    return (int32_t)result;",
     "}",
     "static lusa_i128 lusa_pow_i128(lusa_i128 base, lusa_i128 exponent) {",
     "    lusa_i128 result = 1;",
@@ -10678,6 +10692,12 @@ local function emit_arithmetic(expr, lhs, rhs)
         end
         return "lusa_mod_i32(" .. lhs .. ", " .. rhs .. ")"
     end
+    if type_name == "i32" and (op == "+" or op == "-" or op == "*") then
+        -- Signed overflow is undefined behaviour in C; wrap explicitly
+        -- through uint32_t so optimizers cannot exploit it.
+        return "((int32_t)((uint32_t)(" .. lhs .. ") " .. op
+            .. " (uint32_t)(" .. rhs .. ")))"
+    end
     return "((" .. lhs .. ") " .. op .. " (" .. rhs .. "))"
 end
 
@@ -11200,6 +11220,10 @@ emit_expr = function(expr)
             return "((int32_t)(((const LusaObj *)(" .. inner .. "))->length))"
         end
         if expr.op == "-" then
+            if expr.ctype == "i32" then
+                -- `-INT32_MIN` would be signed overflow (undefined in C)
+                return "((int32_t)(0u - (uint32_t)(" .. emit_expr(expr.value) .. ")))"
+            end
             return "(-(" .. emit_expr(expr.value) .. "))"
         end
     end
